@@ -379,10 +379,19 @@ from it. The creator-supplied name a listing entry carries for reconciliation is
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-ownership-addressing`
 
 The system **MUST** treat a `client_id` as addressable, for rotate-secret and revoke, only when it resolves
-within the explicit target tenant. An address that does not resolve within that tenant **MUST** return not-found
-without disclosing whether the id exists under a different tenant.
+within the explicit target tenant. An address that does not resolve within that tenant **MUST NOT** act on any
+principal, and **MUST NOT** disclose whether that id exists under a different tenant.
 
-- **Rationale**: Tenant-qualified addressing prevents cross-tenant object access and information leakage.
+Authorization for the explicit target tenant is evaluated before any address lookup, so a caller without
+permission on that tenant is refused without learning any addressing outcome at all. Past that gate the two
+operations express the non-disclosure obligation differently, and both satisfy it: rotate-secret reports
+not-found (`cpt-cf-service-principal-fr-rotate-complete-state`), while revoke reports the same indistinguishable
+success it reports for an already-absent principal (`cpt-cf-service-principal-fr-revoke-idempotent`). In neither
+case can a caller separate "never existed" from "already removed" from "exists under another tenant".
+
+- **Rationale**: Tenant-qualified addressing prevents cross-tenant object access and information leakage. Stating
+  the per-operation outcome keeps the non-disclosure rule and the idempotent-revocation rule from reading as
+  competing requirements.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
 
 ### 5.3 Credential Rotation and Revocation
@@ -427,10 +436,13 @@ report the outcome as a success that carries no principal state and no credentia
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-revoke-idempotent`
 
 The system **MUST** treat revocation of an already-absent principal (a provider not-found outcome) as
-indistinguishable from revocation of a present one, not as a failure.
+indistinguishable from revocation of a present one, not as a failure. That indistinguishability also carries the
+non-disclosure obligation of `cpt-cf-service-principal-fr-ownership-addressing`: an address that does not resolve
+within the target tenant is reported exactly as one that never existed, so revoke never becomes a probe for
+principals owned elsewhere.
 
 - **Rationale**: Cleanup and reconciliation must converge without requiring callers to distinguish concurrent
-  deletion from prior success.
+  deletion from prior success, and the same outcome denies a caller any signal about other tenants' principals.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
 - **Acceptance Evidence**: `service-principal/src/domain/service_tests.rs::revoke_is_idempotent_on_not_found`
 
