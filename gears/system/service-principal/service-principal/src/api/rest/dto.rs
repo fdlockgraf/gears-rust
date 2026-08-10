@@ -12,8 +12,10 @@ use uuid::Uuid;
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateServicePrincipalRequestDto {
-    /// Short caller-chosen suffix (lowercase alnum + '-', max 40 chars). The
-    /// adapter builds the final client id as `svc-<tenant_id>-<name>`.
+    /// Short caller-chosen suffix (lowercase alnum + '-', max 40 chars).
+    /// Adapters commonly derive the client id as `svc-<tenant_id>-<name>`, but
+    /// that format is a convention, not a contract; the listing echoes this
+    /// `name` back so callers correlate without parsing client ids.
     pub name: String,
     /// Client scopes to attach; validated against the adapter allowlist.
     #[serde(default)]
@@ -25,7 +27,8 @@ pub struct CreateServicePrincipalRequestDto {
 #[derive(Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub struct ServicePrincipalCredentialsDto {
-    /// The service principal's client id (`svc-<tenant_id>-<name>`).
+    /// The adapter-assigned client id. Opaque to callers: `svc-<tenant_id>-<name>`
+    /// is a common adapter convention, not a format callers may rely on.
     pub client_id: String,
     /// The `client_credentials` secret. Returned exactly once by create/rotate —
     /// persist it immediately; recovery from loss is `rotate_secret`.
@@ -62,8 +65,13 @@ impl From<ServicePrincipalCredentials> for ServicePrincipalCredentialsDto {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub struct ServicePrincipalSummaryDto {
-    /// The service principal's client id (`svc-<tenant_id>-<name>`).
+    /// The adapter-assigned client id, used to address rotate-secret and revoke.
     pub client_id: String,
+    /// The caller-supplied `name` this principal was created with, reported
+    /// verbatim by the adapter. This is how a caller correlates a name it
+    /// submitted with an opaque `client_id` — notably to reconcile a create
+    /// that returned an ambiguous outcome.
+    pub name: String,
     /// Whether the client can currently authenticate.
     pub enabled: bool,
     /// Attached client scopes as reported by the `IdP` — includes realm-default
@@ -75,6 +83,7 @@ impl From<ServicePrincipalSummary> for ServicePrincipalSummaryDto {
     fn from(s: ServicePrincipalSummary) -> Self {
         Self {
             client_id: s.client_id,
+            name: s.name,
             enabled: s.enabled,
             scopes: s.scopes,
         }

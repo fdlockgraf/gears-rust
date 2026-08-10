@@ -210,7 +210,8 @@ boundaries: the caller, the Policy Decision Point, and the pluggable provider.
 
 - Tenant-scoped creation of a confidential `client_credentials` service principal via REST, returning a client
   identifier, one-time plaintext secret, token endpoint, and subject identifier.
-- Secret-free listing of a tenant's service principals in upstream order (no pagination).
+- Secret-free listing of a tenant's service principals in upstream order (no pagination), identifying each
+  principal by the name its creator supplied as well as by its provider-assigned client identifier.
 - Secret rotation returning a new one-time secret through a non-cacheable response.
 - Idempotent revocation: an already-absent principal is treated as a successful revoke.
 - Independent authorization of the `create`, `read`, `rotate_secret`, and `revoke` actions against the explicit
@@ -236,8 +237,10 @@ boundaries: the caller, the Policy Decision Point, and the pluggable provider.
 - Provider migration or credential portability.
 - A dedicated CLI or graphical management interface.
 - A Service Principal-owned principal database, provider-state replica, or retry/reconciliation worker.
-- Idempotency-key or operation-key based retry of ambiguous create/rotate outcomes; the gear surfaces an
-  ambiguous outcome as its own distinct failure and leaves recovery to the caller.
+- Automatic, idempotency-key or operation-key based retry of ambiguous create/rotate outcomes; the gear surfaces
+  an ambiguous outcome as its own distinct failure and leaves recovery to the caller, who reconciles it by
+  matching the submitted name in the listing. Correlating an ambiguous create with its principal is in scope
+  (§5.2, §5.5); only performing the retry on the caller's behalf is not.
 - Name-syntax, scope-allowlist, and quota validation performed by this gear; these are delegated entirely to the
   registered provider adapter.
 - Tenant-deprovision cleanup orchestration. Deleting a tenant's principals when that tenant is deprovisioned is
@@ -327,11 +330,17 @@ and reject creation once that maximum is reached. The gear neither counts nor en
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-create-collision`
 
-The system **MUST** reject a creation request as invalid input when the provider reports its target identifier
-is already occupied, and **MUST NOT** resume, reveal, or modify the existing principal as part of that request.
+The system **MUST** reject a creation request as invalid input when the requested name is already live for the
+target tenant, and **MUST NOT** resume, reveal, or modify the existing principal as part of that request. This
+holds however the provider derives its own target identifier, and it applies equally to a half-created principal
+left behind by an earlier ambiguous outcome. Consequently a tenant and a name together identify at most one live
+principal, which is what makes the name a unique correlation key during ambiguous-outcome recovery. Concurrent
+creation requests for the same tenant and name **MUST NOT** both succeed.
 
 - **Rationale**: Reusing an existing identity could disclose credentials or attach privileges to the wrong
-  workload.
+  workload, and a name that could match more than one live principal would leave a recovering caller unable to
+  tell which identity its request produced. Allowing concurrent requests to both succeed would reintroduce that
+  same ambiguity by race instead of by sequence.
 - **Actors**: `cpt-cf-service-principal-actor-provider-adapter`
 
 ### 5.2 Principal Discovery
@@ -341,21 +350,29 @@ is already occupied, and **MUST NOT** resume, reveal, or modify the existing pri
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-list`
 
 The system **MUST** list the service principals owned by an authorized target tenant, returning each principal's
-client id, enabled state, and attached scopes in upstream order.
+client id, enabled state, and attached scopes in upstream order. Each listed principal **MUST** additionally be
+identified by the name its creator supplied, reported unchanged, so a caller can recognize a principal it asked
+for without interpreting the provider-assigned client identifier — including when a creation outcome was
+uncertain and the caller must reconcile it.
 
-- **Rationale**: Administrators need inventory for audit, rotation, and revocation workflows.
+- **Rationale**: Administrators need inventory for audit, rotation, and revocation workflows, and a caller whose
+  creation outcome was uncertain needs a provider-independent way to tell whether its principal exists.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
-- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::list_returns_200_with_summaries`
+- **Acceptance Evidence**: `service-principal/src/api/rest/routes_tests.rs::list_returns_200_with_summaries`,
+  `service-principal/src/api/rest/routes_tests.rs::list_reports_caller_supplied_name_so_opaque_client_ids_stay_correlatable`
 
 #### Secret-Free Discovery
 
 - [ ] `p1` - **ID**: `cpt-cf-service-principal-fr-secret-free-listing`
 
 The system **MUST NOT** include a client secret field in the listing model or in any future read model derived
-from it.
+from it. The creator-supplied name a listing entry carries for reconciliation is non-secret caller input and
+**MUST NOT** be treated as, or replaced by, credential material.
 
-- **Rationale**: Inventory access must not grant credential access.
+- **Rationale**: Inventory access must not grant credential access, and the field that makes a principal
+  recognizable must not become a way to reach its secret.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`
+- **Acceptance Evidence**: `service-principal/src/api/rest/dto_tests.rs::summary_dto_serializes_caller_supplied_name_verbatim`
 
 #### Ownership-Checked Addressing
 
@@ -508,9 +525,12 @@ failed provider, and an ambiguous outcome from one another without parsing free 
 The system **MUST** report a provider outcome the adapter classifies as ambiguous (state may have been retained)
 as its own distinct outcome — never as success and never as the same outcome used for a safely retryable
 provider failure — so a caller does not blindly retry a request that may have already mutated provider state.
+After such an outcome the caller **MUST** be able to determine, against any conforming provider, whether the
+principal it asked for now exists: it lists the tenant and looks for the entry bearing the name it submitted, and
+then either rotates that principal's secret or revokes it and creates again.
 
 - **Rationale**: A half-applied create or rotation must not be indistinguishable from a transient, safely
-  retryable failure.
+  retryable failure, and signaling the uncertainty is only useful if the caller can then resolve it.
 - **Actors**: `cpt-cf-service-principal-actor-tenant-automation-admin`, `cpt-cf-service-principal-actor-provider-adapter`
 
 ## 6. Non-Functional Requirements
@@ -667,7 +687,8 @@ change requires a new major version rather than an in-place change to the existi
   via `ClientHub`.
 - **Stability**: Stable within a major version.
 - **Description**: Provides the four lifecycle methods (`create`, `list`, `rotate_secret`, `revoke`), a one-time
-  credentials model, a secret-free summary model, an explicit `TenantId`, and a closed four-variant failure
+  credentials model, a secret-free summary model that carries the creator-supplied name alongside the
+  provider-assigned client identifier, an explicit `TenantId`, and a closed four-variant failure
   taxonomy (`InvalidInput`, `NotFound`, `CleanFailure`, `Ambiguous`). It is not a public authorization boundary:
   every caller is a trusted platform module that must satisfy the SPI's documented authorization precondition
   before invocation; `SecurityContext` is carried for audit, not enforcement.
@@ -695,8 +716,10 @@ change requires a new major version rather than an in-place change to the existi
 - **Protocol/Format**: The `ServicePrincipalClientV1` Rust trait.
 - **Compatibility**: An adapter must implement all four methods, address `(tenant_id, client_id)` as the scoped
   resource, return `NotFound` for an address that does not resolve within the tenant, return the secret only
-  from `create`/`rotate_secret`, delete a tenant's principals when that tenant is deprovisioned, and report
-  transport uncertainty as `Ambiguous` rather than as success.
+  from `create`/`rotate_secret`, report on every listed principal the creator-supplied name unchanged, delete a
+  tenant's principals when that tenant is deprovisioned, and report transport uncertainty as `Ambiguous` rather
+  than as success. The name obligation keeps reconciliation of an ambiguous create possible for adapters whose
+  provider assigns client identifiers the caller cannot predict.
 
 #### Authorization Contract
 
@@ -732,11 +755,11 @@ change requires a new major version rather than an in-place change to the existi
 - The principal can authenticate as a service subject owned by the target tenant.
 
 **Alternative Flows**:
-- **Invalid input** (bad name, disallowed scope, quota exceeded, or a taken identifier): the request is rejected
+- **Invalid input** (bad name, disallowed scope, quota exceeded, or a name already live in the tenant): the request is rejected
   as invalid input and no provider state is created.
-- **Ambiguous provider outcome**: the system reports the outcome as ambiguous; the caller must investigate
-  through `list` and resolve manually (for example, revoke and retry) since the gear performs no automatic
-  reconciliation.
+- **Ambiguous provider outcome**: the system reports the outcome as ambiguous; the caller resolves it manually,
+  since the gear performs no automatic reconciliation — it lists the tenant, looks for the principal bearing the
+  name it submitted, and then either rotates that principal's secret or revokes it and creates again.
 
 ### 8.2 Inventory Tenant Principals
 
@@ -749,11 +772,13 @@ change requires a new major version rather than an in-place change to the existi
 
 **Main Flow**:
 1. The administrator requests the tenant's service-principal inventory.
-2. The system returns every principal the registered provider reports for that tenant.
+2. The system returns every principal the registered provider reports for that tenant, each identified by the name
+   its creator supplied as well as by its client identifier.
 3. The response contains no client secrets.
 
 **Postconditions**:
-- The administrator has current non-secret state for audit and lifecycle management.
+- The administrator has current non-secret state for audit and lifecycle management, and can recognize a principal
+  from the name it was created with even when the client identifier was not predictable.
 
 ### 8.3 Rotate a Credential
 
@@ -851,7 +876,7 @@ change requires a new major version rather than an in-place change to the existi
 | Risk | Impact | Mitigation |
 |---|---|---|
 | No provider adapter ships with this repository | Lifecycle operations report the capability as unavailable until a deployment registers one | Treat provider absence as an explicit `ProviderUnavailable` failure rather than a simulated success; document the `ClientHub` registration requirement. |
-| Ambiguous provider outcomes require manual recovery | Operators may be uncertain whether a principal exists after an ambiguous outcome | Report `Ambiguous` as its own distinct outcome, separate from a safely retryable provider failure, so callers know to inspect state via `list` rather than retry blindly. |
+| Ambiguous provider outcomes require manual recovery | Recovery costs the caller extra calls, and it reconciles cleanly only while the provider upholds the name-uniqueness obligation; an adapter that admits two live principals under one name leaves the caller with a conflict it must escalate instead of resolve | Report `Ambiguous` as its own distinct outcome, separate from a safely retryable provider failure, so callers inspect state via `list` rather than retry blindly; require every provider to report the creator-supplied name on that listing and to reject an already-live name, so the caller can identify its principal unambiguously. Residual gaps: no conformance harness validates that a registered adapter actually enforces the uniqueness obligation, and there is no automatic idempotency-key retry. |
 | Secret leaks through logs, `Debug`, or caching | An attacker can impersonate a workload | Enforce redacting `Debug` on credential types and ensure every credential-bearing response must not be cached or stored by intermediaries; verified by DTO and router tests. |
 | Cross-tenant object access | A caller can manage another tenant's credentials | Authorize the explicit tenant and verify the returned PDP scope actually covers it before any provider call. |
 | Name, scope, and quota policy are fully delegated to the provider | Enforcement can vary by adapter implementation | Document the delegation explicitly in the SPI contract so future adapters implement it consistently. |
@@ -866,8 +891,10 @@ change requires a new major version rather than an in-place change to the existi
    - **Owner**: Gears Architecture.
    - **Resolution target**: Before this gear is relied upon for tenant offboarding.
 
-2. **Should create and rotate-secret gain an idempotency or operation-key mechanism to let a caller safely retry
-   after an ambiguous outcome?**
+2. **Should create and rotate-secret gain an idempotency or operation-key mechanism to let a caller retry
+   automatically after an ambiguous outcome?** Reconciling the outcome by hand is already possible against any
+   conforming provider, because a listing identifies each principal by the name its creator supplied; the open
+   part is only whether the system should perform the retry on the caller's behalf.
    - **Owner**: Gears Architecture.
    - **Resolution target**: Before a stronger consistency guarantee is offered to callers.
 

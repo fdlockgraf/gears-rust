@@ -151,9 +151,97 @@ impl ServicePrincipalClientV1 for MockSp {
     ) -> Result<Vec<ServicePrincipalSummary>, ServicePrincipalFailure> {
         Ok(vec![ServicePrincipalSummary {
             client_id: "svc-x".to_owned(),
+            name: "ci".to_owned(),
             enabled: true,
             scopes: vec!["openid".to_owned()],
         }])
+    }
+}
+
+/// An adapter whose `IdP` assigns OPAQUE client ids (think Azure AD app
+/// registration object ids) instead of following the `svc-<tenant>-<name>`
+/// convention. It is a legitimate, fully conforming adapter, so the
+/// correlation path a caller uses after an ambiguous create must work for it
+/// too: the only bridge from a submitted `name` to the assigned `client_id` is
+/// the `name` the listing reports back.
+///
+/// It also upholds the SPI uniqueness obligation — a `create` for a name already
+/// live in the tenant is rejected as `InvalidInput` — so at most one live entry
+/// ever carries a given `name`. That is what makes the correlation match in
+/// `list_reports_caller_supplied_name_so_opaque_client_ids_stay_correlatable`
+/// provably unique rather than merely the first of several candidates. A double
+/// that accepted duplicate names would model a NON-conforming adapter.
+struct OpaqueIdSp {
+    /// Principals the adapter has accepted so far, in creation order.
+    created: std::sync::Mutex<Vec<ServicePrincipalSummary>>,
+}
+
+impl OpaqueIdSp {
+    fn new() -> Self {
+        Self {
+            created: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ServicePrincipalClientV1 for OpaqueIdSp {
+    async fn create(
+        &self,
+        _ctx: &SecurityContext,
+        req: &CreateServicePrincipalRequest,
+    ) -> Result<ServicePrincipalCredentials, ServicePrincipalFailure> {
+        let mut created = self.created.lock().expect("mock lock");
+        // The contract's uniqueness obligation: a name already live in this
+        // tenant is a collision, never a second principal.
+        if created.iter().any(|sp| sp.name == req.name) {
+            return Err(ServicePrincipalFailure::InvalidInput {
+                detail: "name already taken".to_owned(),
+                field: Some("name".to_owned()),
+            });
+        }
+        // Deliberately unrelated to tenant and name: a bare UUID.
+        let client_id = Uuid::new_v4().to_string();
+        created.push(ServicePrincipalSummary {
+            client_id: client_id.clone(),
+            name: req.name.clone(),
+            enabled: true,
+            scopes: req.scopes.clone(),
+        });
+        Ok(ServicePrincipalCredentials {
+            client_id,
+            client_secret: SecretString::from("s3cr3t".to_owned()),
+            token_url: "https://idp/token".to_owned(),
+            subject_id: Uuid::new_v4(),
+        })
+    }
+    async fn rotate_secret(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: TenantId,
+        client_id: &str,
+    ) -> Result<ServicePrincipalCredentials, ServicePrincipalFailure> {
+        Ok(ServicePrincipalCredentials {
+            client_id: client_id.to_owned(),
+            client_secret: SecretString::from("rotated".to_owned()),
+            token_url: "https://idp/token".to_owned(),
+            subject_id: Uuid::new_v4(),
+        })
+    }
+    async fn revoke(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: TenantId,
+        _client_id: &str,
+    ) -> Result<(), ServicePrincipalFailure> {
+        Ok(())
+    }
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: TenantId,
+    ) -> Result<Vec<ServicePrincipalSummary>, ServicePrincipalFailure> {
+        Ok(self.created.lock().expect("mock lock").clone())
     }
 }
 
@@ -192,6 +280,19 @@ fn router_with_pdp_and_sp(
     let openapi = Arc::new(OpenApiRegistryImpl::new());
     let router = register_routes(Router::new(), openapi.as_ref(), svc);
     (router, openapi)
+}
+
+/// Build an authorized router over an arbitrary SPI implementation, for the
+/// tests that need an adapter other than `MockSp`.
+fn router_with_sp_client(sp: Arc<dyn ServicePrincipalClientV1>) -> Router {
+    let hub = Arc::new(ClientHub::default());
+    hub.register::<dyn ServicePrincipalClientV1>(sp);
+    let svc = Arc::new(Service::new(
+        PolicyEnforcer::new(Arc::new(AllowTenantPdp)),
+        hub,
+    ));
+    let openapi = OpenApiRegistryImpl::new();
+    register_routes(Router::new(), &openapi, svc)
 }
 
 /// Build a router wired to a `Service` backed by the given PDP, with a
@@ -310,8 +411,123 @@ async fn list_returns_200_with_summaries() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["service_principals"][0]["client_id"], "svc-x");
+    // Every entry MUST echo the caller-supplied name; it is the correlation key
+    // callers rely on, so its absence from the wire shape is a contract break.
+    assert_eq!(body["service_principals"][0]["name"], "ci");
     assert_eq!(body["service_principals"][0]["enabled"], true);
     assert_eq!(body["service_principals"][0]["scopes"][0], "openid");
+}
+
+/// Regression guard for the correlation contract: a caller that receives an
+/// uncertain (`Ambiguous`) create outcome recovers by listing the tenant and
+/// matching on the `name` it submitted. That recovery must not depend on the
+/// `svc-<tenant>-<name>` client-id convention, so this test drives a conforming
+/// adapter that assigns fully opaque client ids and proves the caller can still
+/// reach the created principal's `client_id` from nothing but the name.
+#[tokio::test]
+async fn list_reports_caller_supplied_name_so_opaque_client_ids_stay_correlatable() {
+    let sp = Arc::new(OpaqueIdSp::new());
+    let router = router_with_sp_client(sp);
+    let uri = format!("/service-principal/v1/tenants/{TENANT}/service-principals");
+
+    // The create response is what an ambiguous outcome would have withheld, so
+    // the assertions below never use it as the caller's source of truth; it is
+    // read only to prove the assigned id really is opaque.
+    let create = router
+        .clone()
+        .oneshot(request_with_ctx(
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "name": "ci" })),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let assigned_id = body_json(create).await["client_id"]
+        .as_str()
+        .expect("client_id")
+        .to_owned();
+    assert!(
+        !assigned_id.contains("ci") && !assigned_id.contains(TENANT),
+        "this adapter must assign an id unrelated to tenant and name, got {assigned_id:?}"
+    );
+
+    let resp = router
+        .oneshot(request_with_ctx("GET", &uri, None))
+        .await
+        .expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let entries = body["service_principals"]
+        .as_array()
+        .expect("listing array");
+    let correlated = entries
+        .iter()
+        .find(|e| e["name"] == "ci")
+        .expect("the submitted name must identify its entry in the listing");
+    assert_eq!(
+        correlated["client_id"], assigned_id,
+        "correlating by name must yield the address rotate-secret and revoke take"
+    );
+}
+
+/// The other half of the correlation contract: the name is only a usable
+/// correlation key because it stays unique per tenant. A conforming adapter
+/// therefore rejects a second `create` for an already-live name instead of
+/// minting a rival principal, and that rejection surfaces as `400` (the same
+/// `InvalidInput` mapping `create_invalid_input_renders_400` pins). Without
+/// this, the `find` in the sibling regression test above could match several
+/// entries and the caller could rotate or revoke the wrong identity.
+#[tokio::test]
+async fn create_with_already_live_name_is_rejected_so_correlation_stays_unique() {
+    let sp = Arc::new(OpaqueIdSp::new());
+    let router = router_with_sp_client(sp);
+    let uri = format!("/service-principal/v1/tenants/{TENANT}/service-principals");
+
+    let first = router
+        .clone()
+        .oneshot(request_with_ctx(
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "name": "ci" })),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = router
+        .clone()
+        .oneshot(request_with_ctx(
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "name": "ci" })),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(
+        second.status(),
+        StatusCode::BAD_REQUEST,
+        "a name already live in the tenant must be a collision, not a second principal"
+    );
+
+    // And the rejected attempt left no trace: exactly one live entry carries
+    // the name, so the recovery match cannot be ambiguous.
+    let resp = router
+        .oneshot(request_with_ctx("GET", &uri, None))
+        .await
+        .expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let matches = body["service_principals"]
+        .as_array()
+        .expect("listing array")
+        .iter()
+        .filter(|e| e["name"] == "ci")
+        .count();
+    assert_eq!(
+        matches, 1,
+        "the correlation key must match exactly one entry"
+    );
 }
 
 #[tokio::test]

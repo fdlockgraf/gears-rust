@@ -67,7 +67,9 @@ delegating. The adapter's four-category failure taxonomy
 (`InvalidInput`/`NotFound`/`CleanFailure`/`Ambiguous`) is mapped, together with the gear's own
 `AccessDenied` and `ProviderUnavailable` outcomes, onto canonical RFC-9457 problem responses at
 the REST boundary. An ambiguous provider outcome is surfaced as its own distinct failure; the gear
-performs no idempotency-key or operation-key based reconciliation of it.
+performs no idempotency-key or operation-key based reconciliation of it, but the listing contract
+gives the caller the correlation key needed to reconcile it: every listed principal reports the
+`name` its creator supplied.
 
 The component and sequence diagrams in this document are warranted because create, list, rotate,
 and revoke each cross three independent trust boundaries — the caller, the PDP, and the pluggable
@@ -85,9 +87,9 @@ provider — and the diagrams make that boundary crossing explicit.
 | `cpt-cf-service-principal-fr-name-policy` | The gear forwards `name` unmodified; the registered adapter enforces bounded syntax and reports a violation as `ServicePrincipalFailure::InvalidInput`. |
 | `cpt-cf-service-principal-fr-scope-allowlist` | The gear forwards `scopes` unmodified; the registered adapter enforces its deployment-controlled allowlist and reports a violation as `InvalidInput`. |
 | `cpt-cf-service-principal-fr-tenant-quota` | The registered adapter may apply a best-effort maximum-per-tenant check; `Service` performs no counting of its own. |
-| `cpt-cf-service-principal-fr-create-collision` | A taken client identifier is reported by the adapter as `InvalidInput`; `Service` never resumes or modifies an existing principal. |
-| `cpt-cf-service-principal-fr-list` | `Service::list` authorizes `read` and returns `ServicePrincipalSummary` values in the adapter's own order; the REST handler wraps them in `ListServicePrincipalsResponseDto`. |
-| `cpt-cf-service-principal-fr-secret-free-listing` | `ServicePrincipalSummary` and `ServicePrincipalSummaryDto` declare no secret field. |
+| `cpt-cf-service-principal-fr-create-collision` | A name already live in the target tenant is reported by the adapter as `InvalidInput`; `Service` never resumes or modifies an existing principal. |
+| `cpt-cf-service-principal-fr-list` | `Service::list` authorizes `read` and returns `ServicePrincipalSummary` values in the adapter's own order; each entry carries the caller-supplied `name` the adapter must report verbatim, and the REST handler wraps them in `ListServicePrincipalsResponseDto`. |
+| `cpt-cf-service-principal-fr-secret-free-listing` | `ServicePrincipalSummary` and `ServicePrincipalSummaryDto` declare no secret field; the only creator-supplied value they carry is the non-secret `name` used for correlation. |
 | `cpt-cf-service-principal-fr-ownership-addressing` | `rotate_secret` and `revoke` take `(tenant_id, client_id)`; the adapter returns `NotFound` for an id that does not resolve within that tenant, without revealing whether it exists under another tenant. |
 | `cpt-cf-service-principal-fr-rotate-secret` | `Service::rotate_secret` authorizes `rotate_secret` and returns one new `ServicePrincipalCredentials`; the REST handler returns `200 OK` with `Cache-Control: no-store`. |
 | `cpt-cf-service-principal-fr-rotate-complete-state` | An unresolved `client_id` at rotation time is mapped from the adapter's `NotFound` to a `404` canonical problem, never a success. |
@@ -183,7 +185,9 @@ subtree never substitutes for a check against the requested tenant.
 Name syntax, scope allowlisting, and per-tenant quota are enforced entirely by the registered
 provider adapter. Service Principal performs no independent validation of those fields and
 performs no automatic recovery when the adapter reports an ambiguous outcome; recovery is left to
-the caller.
+the caller. Delegation stops short of the information the caller needs to recover: the listing
+contract obliges every adapter to report the creator-supplied `name` verbatim, so a caller can
+always identify the principal an ambiguous create may have produced.
 
 #### Stable Contracts, Replaceable Providers
 
@@ -242,13 +246,17 @@ is unpaginated; the collection size is bounded by whatever quota the registered 
 |--------|-------------|--------------------------|
 | `CreateServicePrincipalRequest` | Explicit `tenant_id`, caller-chosen `name`, and `scopes` for a create call | Security-sensitive control-plane metadata |
 | `ServicePrincipalCredentials` | `client_id`, `client_secret` (`SecretString`), `token_url`, `subject_id` | `client_secret` is restricted; other fields are security-sensitive |
-| `ServicePrincipalSummary` | `client_id`, `enabled`, `scopes`; no secret field | Security-sensitive; never contains a secret |
+| `ServicePrincipalSummary` | `client_id`, the creator-supplied `name` (reported verbatim), `enabled`, `scopes`; no secret field | Security-sensitive; never contains a secret |
 | `ServicePrincipalFailure` | Closed four-variant adapter failure taxonomy: `InvalidInput`, `NotFound`, `CleanFailure`, `Ambiguous` | Security-sensitive operational metadata |
 | `DomainError` | Gear-level error enum: `InvalidInput`, `NotFound`, `AccessDenied`, `ProviderUnavailable`, `Upstream`, `Ambiguous` | Security-sensitive operational metadata |
 
 Relationships are bounded as follows:
 
 - `ServicePrincipalCredentials` is produced only by `create` and `rotate_secret`.
+- `ServicePrincipalSummary.name` is the only contractual bridge from a
+  `CreateServicePrincipalRequest.name` to the adapter-assigned `client_id`. Client-id shapes such as
+  `svc-<tenant_id>-<name>` are adapter conventions that callers must not parse; an adapter whose
+  identity provider assigns opaque client ids conforms equally.
 - `DomainError` is derived from `ServicePrincipalFailure` (via `From<ServicePrincipalFailure>`) for
   every operation except `revoke`, which treats `NotFound` as success before that conversion runs.
 - `DomainError::AccessDenied` and `DomainError::ProviderUnavailable` originate in the gear, not in
@@ -336,6 +344,9 @@ without an authoritative adapter lookup, and exposes no PDP diagnostics on the w
 - Enforce name syntax, the scope allowlist, and a best-effort per-tenant quota before mutation.
 - Return `NotFound` for an address that does not resolve within the given tenant.
 - Return the secret only from `create`/`rotate_secret`.
+- Report, on every `list` entry, the caller-supplied `name` the principal was created with, verbatim
+  (byte-identical to the submitted value), so a caller can correlate a name it submitted with the
+  adapter-assigned `client_id` without parsing that id.
 - Report transport uncertainty as `Ambiguous`, never as success.
 - Delete a tenant's principals as part of that tenant's deprovisioning (a documented obligation of
   the SPI contract, not an operation Service Principal exposes or verifies).
@@ -387,6 +398,11 @@ The item path registers `rotate-secret` and `DELETE` only; there is deliberately
 the SPI exposes none either. `Location` on `create` identifies the created resource without
 promising that it answers `GET` (rationale: [Appendix A](#appendix-a-decision-rationale)).
 
+The `GET` response wraps `ServicePrincipalSummaryDto` entries carrying `client_id`, `name`,
+`enabled`, and `scopes`, where `name` is the creator-supplied name echoed verbatim from the adapter.
+Because the collection listing is the only read surface, that field is what a caller matches on to
+find a principal whose `client_id` it does not already know.
+
 Errors render as canonical RFC-9457 problems: `400` (`InvalidInput`, with a field violation when
 the adapter attributes one), `403` (`AccessDenied`), `404` (`NotFound`, rotate-secret only), `409`
 (`Ambiguous`, reason `AMBIGUOUS_OUTCOME`), and `503` (`ProviderUnavailable` or `Upstream`). No
@@ -422,8 +438,12 @@ no `Serialize` implementation.
 
 The trait defines `create`, `rotate_secret`, `revoke`, and `list`. An implementation must address
 `(tenant_id, client_id)` as the scoped resource, return `NotFound` for an address outside the
-tenant, return the secret only from `create`/`rotate_secret`, and classify transport uncertainty as
-`Ambiguous` rather than success. `ServicePrincipalFailure::{CleanFailure, Ambiguous}.detail` is
+tenant, return the secret only from `create`/`rotate_secret`, report the caller-supplied `name`
+verbatim on every `list` entry, and classify transport uncertainty as `Ambiguous` rather than
+success. The `name` obligation is what keeps ambiguous-create recovery adapter-independent: the trait
+addresses principals by `client_id` only, so without a name on the listing an adapter that assigns
+opaque client ids would leave the caller unable to tell which listed principal is the one it asked
+for. `ServicePrincipalFailure::{CleanFailure, Ambiguous}.detail` is
 contractually caller-safe operator text — a short summary an API caller may legitimately see, never
 a secret, hostname, connection string, or stack trace. As a defense-in-depth guardrail, the gear
 additionally sanitizes that `detail` (stripping control characters, collapsing whitespace, and
@@ -536,8 +556,10 @@ sequenceDiagram
 ```
 
 `Service` holds only request-local state. No credential or operation record is written by the
-gear; recovery from an ambiguous outcome (for example, `list` then revoke-and-retry) is the
-caller's responsibility.
+gear; recovery from an ambiguous outcome is the caller's responsibility, and the sequence is
+executable because the listing is correlatable: the caller calls `list`, matches the entry whose
+`name` equals the name it submitted, and then either rotates that entry's secret or revokes it and
+creates again (see §4.2).
 
 #### Inventory Tenant Principals
 
@@ -562,6 +584,9 @@ sequenceDiagram
     P-->>S: Secret-free summaries
     S-->>C: 200, secret-free list
 ```
+
+Each summary carries the creator-supplied `name` alongside the `client_id`, so this operation is
+also the correlation step of ambiguous-outcome recovery, not only an inventory read.
 
 #### Rotate Credential
 
@@ -701,11 +726,29 @@ adapter-internal diagnostics cross the wire.
 
 The gear defines no idempotency-key or operation-key mechanism. When the registered adapter
 reports `Ambiguous`, `Service` forwards it unchanged as `DomainError::Ambiguous`, and the REST
-layer renders `409` with reason `AMBIGUOUS_OUTCOME`. The caller is expected to inspect state
-through `list` and resolve manually — for example, `revoke` followed by a fresh `create` — since
-neither `Service` nor any adapter contract defined here performs automatic reconciliation.
-Introducing a caller-supplied key to make an ambiguous create or rotate safely retryable is target
-work tracked as an open question in the PRD, not part of the current contract.
+layer renders `409` with reason `AMBIGUOUS_OUTCOME`. Neither `Service` nor any adapter contract
+defined here performs automatic reconciliation, so the caller resolves the outcome itself in three
+steps:
+
+1. `list` the target tenant.
+2. Match the entry whose `name` equals the `name` the ambiguous create submitted. Its presence
+   means the create did land; its absence means it did not, and a plain `create` retry is safe.
+   The match is unique because `create` rejects a name already live in the tenant
+   (`cpt-cf-service-principal-fr-create-collision`), so a name resolves to one entry or none.
+3. For a landed create, act on that entry's `client_id`: `rotate_secret` to obtain usable
+   credentials without deleting the principal, or `revoke` followed by a fresh `create`.
+
+If step 2 finds more than one matching entry, the registered adapter has violated the uniqueness
+obligation and the caller cannot tell which principal its request produced. The caller **MUST**
+then treat the outcome as an unresolved conflict and escalate to an operator, and **MUST NOT**
+rotate or revoke any of the matches: acting on the wrong one would either hand out credentials for
+a foreign workload or destroy a live identity.
+
+Step 2 depends on the listing contract (§3.3: the adapter reports the caller-supplied `name`
+verbatim) and on no client-id format convention, so the procedure holds for an adapter whose
+identity provider assigns opaque client ids. Introducing a caller-supplied key to make an ambiguous
+create or rotate automatically retryable is target work tracked as an open question in the PRD, not
+part of the current contract.
 
 ### 4.3 Configuration
 
@@ -781,7 +824,10 @@ The current test suite, aligned with the repository's unit/service/router split:
 - DTO tests (`api/rest/dto_tests.rs`) verify secret redaction in `Debug`, unknown-field rejection,
   and the default-empty `scopes` field.
 - Router tests (`api/rest/routes_tests.rs`) verify all four operations register in the OpenAPI
-  registry and exercise their success and error responses end-to-end through the router.
+  registry and exercise their success and error responses end-to-end through the router. One of them
+  drives an adapter that assigns opaque client ids and asserts that a caller can still reach a
+  principal's `client_id` from nothing but the `name` it submitted, pinning the correlation contract
+  §4.2 relies on.
 - Error-mapping tests (`api/rest/error.rs`) verify every `DomainError` variant maps to its expected
   HTTP status and that the resource-error literal matches the SDK's `SERVICE_PRINCIPAL_RESOURCE_TYPE`
   constant.
@@ -830,7 +876,8 @@ state of this codebase):
 - There is no single-item `GET`; the collection listing and the `Location` header from `create` are
   the only ways to learn a principal's non-secret state (PRD open question 4).
 - There is no idempotency-key or operation-key retry mechanism for an ambiguous create or rotate
-  outcome; the caller must resolve it manually (PRD open question 2).
+  outcome; the caller must resolve it manually, using the name-correlated listing described in §4.2
+  (PRD open question 2).
 - No cross-adapter conformance harness exists to validate a second adapter (PRD open question 3).
 - Nothing in this repository demonstrates that a registered adapter actually deletes a tenant's
   principals on tenant deprovisioning; the obligation is stated in the SPI contract only (PRD open
@@ -905,9 +952,10 @@ that the identified URI answer `GET`. Whether to add a by-id read is tracked as 
 `Ambiguous` is mapped to `409` rather than to the `503` used for `Upstream` and
 `ProviderUnavailable` because `503` invites a naive same-request retry, and a retried create after
 an ambiguous create can hit `InvalidInput` ("name taken") when the first attempt in fact succeeded.
-`409` signals instead that recovery is caller-driven — `revoke` followed by a fresh `create` — not a
-blind retry. Automating that recovery behind a caller-supplied idempotency key is tracked as PRD
-open question 2 (see §4.2 and §4.10).
+`409` signals instead that recovery is caller-driven: `list` the tenant, correlate the entry whose
+`name` matches the submitted name, then rotate that principal's secret or revoke it and create
+again — not a blind retry. Automating that recovery behind a caller-supplied idempotency key is
+tracked as PRD open question 2 (see §4.2 and §4.10).
 
 ### Supersession of pre-port drafts
 

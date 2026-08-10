@@ -1,7 +1,7 @@
 //! DTO tests: secret redaction + request deserialization.
 
 use secrecy::SecretString;
-use service_principal_sdk::ServicePrincipalCredentials;
+use service_principal_sdk::{ServicePrincipalCredentials, ServicePrincipalSummary};
 use uuid::Uuid;
 
 use super::*;
@@ -21,6 +21,22 @@ fn credentials_debug_redacts_secret() {
     );
     // The value still round-trips into JSON (that is the whole point of the DTO).
     assert_eq!(dto.client_secret, "super-secret");
+}
+
+/// The summary DTO must carry the caller-supplied name verbatim onto the wire:
+/// with adapter-assigned (possibly opaque) client ids, that name is the only
+/// contractual way a caller correlates a principal it asked for.
+#[test]
+fn summary_dto_serializes_caller_supplied_name_verbatim() {
+    let dto = ServicePrincipalSummaryDto::from(ServicePrincipalSummary {
+        client_id: "9f1c0b3e-object-id".to_owned(),
+        name: "ci".to_owned(),
+        enabled: true,
+        scopes: vec!["openid".to_owned()],
+    });
+    assert_eq!(dto.name, "ci");
+    let json = serde_json::to_value(&dto).expect("summary serializes");
+    assert_eq!(json["name"], "ci");
 }
 
 #[test]

@@ -168,6 +168,7 @@ impl ServicePrincipalClientV1 for MockSp {
     ) -> Result<Vec<ServicePrincipalSummary>, ServicePrincipalFailure> {
         Ok(vec![ServicePrincipalSummary {
             client_id: "svc-x".to_owned(),
+            name: "ci".to_owned(),
             enabled: true,
             scopes: vec!["openid".to_owned()],
         }])
@@ -312,4 +313,7 @@ async fn list_authorized_returns_sp_summaries() {
         .expect("authorized list");
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].client_id, "svc-x");
+    // The caller-supplied name reaches the service unchanged: it is the key a
+    // caller matches on to reconcile an ambiguous create.
+    assert_eq!(summaries[0].name, "ci");
 }
