@@ -605,7 +605,7 @@ The release-qualification query matrix for the PRD latency NFR covers unfiltered
 - [`ServicePrincipalClientV1` contract](../../../../service-principal/service-principal-sdk/src/api.rs)
 - [Service-principal product PRD](../../../../service-principal/docs/PRD.md) and [DESIGN](../../../../service-principal/docs/DESIGN.md) — the owning contract for machine identities; this plugin is its registered adapter
 - [Unified ToolKit architecture](../../../../../../docs/toolkit_unified_system/README.md)
-- Implementation: crate `cf-gears-keycloak-idp-plugin` — delivered separately, see the [implementation branch](https://github.com/fdlockgraf/gears-rust/tree/feat/keycloak-idp-plugin-implementation/gears/system/account-management/plugins/keycloak-idp-plugin)
+- Implementation: crate `cf-gears-keycloak-idp-plugin`, delivered in a separate change
 
 ### 5.2 P1 Requirement Allocation
 
