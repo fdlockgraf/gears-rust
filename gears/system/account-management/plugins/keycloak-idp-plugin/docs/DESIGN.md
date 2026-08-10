@@ -13,7 +13,7 @@ refs:
 
 **Owners:** @platform-iam-team
 
-**Scope:** Architecture of the shipped plugin implementation (crate `cf-gears-keycloak-idp-plugin`). The implementation is authoritative; this document describes what the code does, deliberately mirroring implementation-level constants and behaviors (an implementation-mirror altitude) — a change to those constants in code owns the matching edit here. In-code comments citing `DESIGN §N` refer to the implementation specification this crate lineage descends from, not to section numbers in this document.
+**Scope:** Architecture of the Keycloak IdP plugin (crate `cf-gears-keycloak-idp-plugin`), which is delivered in a separate change; this document and the adjacent PRD ship first. The implementation is authoritative; this document describes what the code does, deliberately mirroring implementation-level constants and behaviors (an implementation-mirror altitude) — a change to those constants in code owns the matching edit here. In-code comments citing `DESIGN §N` refer to the implementation specification this crate lineage descends from, not to section numbers in this document.
 
 <!-- toc -->
 
@@ -280,7 +280,7 @@ Keycloak does not guarantee stable ordering across group-member offset pages, so
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-entity-tenant-idp-metadata`
 
-The provider metadata is the versioned, non-secret routing envelope `TenantIdpMetadataV1` (Rust type and serde shape defined in [`domain/metadata_codec.rs`](../src/domain/metadata_codec.rs)), owned by the plugin and persisted opaquely by Account Management:
+The provider metadata is the versioned, non-secret routing envelope `TenantIdpMetadataV1` (Rust type and serde shape defined in the crate's `domain/metadata_codec.rs`), owned by the plugin and persisted opaquely by Account Management:
 
 | Field | Meaning |
 |---|---|
@@ -605,7 +605,7 @@ The release-qualification query matrix for the PRD latency NFR covers unfiltered
 - [`ServicePrincipalClientV1` contract](../../../../service-principal/service-principal-sdk/src/api.rs)
 - [Service-principal product PRD](../../../../service-principal/docs/PRD.md) and [DESIGN](../../../../service-principal/docs/DESIGN.md) — the owning contract for machine identities; this plugin is its registered adapter
 - [Unified ToolKit architecture](../../../../../../docs/toolkit_unified_system/README.md)
-- Implementation: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`)
+- Implementation: crate `cf-gears-keycloak-idp-plugin` — delivered separately, see the [implementation branch](https://github.com/fdlockgraf/gears-rust/tree/feat/keycloak-idp-plugin-implementation/gears/system/account-management/plugins/keycloak-idp-plugin)
 
 ### 5.2 P1 Requirement Allocation
 

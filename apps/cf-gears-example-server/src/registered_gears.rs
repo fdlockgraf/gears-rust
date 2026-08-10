@@ -71,9 +71,6 @@ use calculator as _;
 #[cfg(feature = "static-idp")]
 use static_idp_plugin as _;
 
-#[cfg(feature = "keycloak-idp")]
-use keycloak_idp_plugin as _;
-
 #[cfg(feature = "account-management")]
 use account_management as _;
 

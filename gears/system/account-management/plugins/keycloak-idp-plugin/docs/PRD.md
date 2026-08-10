@@ -962,7 +962,7 @@ The following questions gate only p2 promotion:
 - **Identity Provider SDK**: [`idp.rs`](../../../account-management-sdk/src/idp.rs) and [`idp_user.rs`](../../../account-management-sdk/src/idp_user.rs)
 - **Service-Principal SDK**: [`service-principal-sdk`](../../../../service-principal/service-principal-sdk/src/api.rs)
 - **Service-Principal product (owning contract)**: [PRD](../../../../service-principal/docs/PRD.md) and [DESIGN](../../../../service-principal/docs/DESIGN.md)
-- **Implementation**: [`plugins/keycloak-idp-plugin`](../src/lib.rs) (crate `cf-gears-keycloak-idp-plugin`)
+- **Implementation**: crate `cf-gears-keycloak-idp-plugin` — delivered separately, see the [implementation branch](https://github.com/fdlockgraf/gears-rust/tree/feat/keycloak-idp-plugin-implementation/gears/system/account-management/plugins/keycloak-idp-plugin)
 - **OIDC AuthN contract**: [OIDC AuthN Resolver Plugin PRD](../../../../authn-resolver/plugins/oidc-authn-plugin/docs/PRD.md)
 - **Realm-strategy relationship**: V1 supports explicit `shared` (default, parent-inherited for children), `adopted`, and `created` provisioning intent with fail-closed parsing.
 - **Migration requirements**: Tenant hard deprovisioning requires the service-principal purge barrier and boundary teardown ordering; user removal happens through per-user deprovisioning before tenant retirement.
