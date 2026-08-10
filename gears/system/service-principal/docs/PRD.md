@@ -633,7 +633,8 @@ change requires a new major version rather than an in-place change to the existi
   actuation.
 - **End-user accessibility and internationalization**: Not applicable to this server/API-only capability.
 - **Personal-data privacy**: No gear-specific privacy regime applies because the capability processes machine
-  identities rather than human profiles.
+  identities rather than human profiles. This exclusion ceases to apply in deployments where tenant or account
+  identifiers can identify natural persons; such deployments must apply their deployment-specific privacy controls.
 - **Data retention and residency**: The identity provider owns principal-record retention and residency;
   Service Principal owns no durable record of its own.
 - **Dedicated deployment and release process**: Not applicable; the capability uses the project-wide release

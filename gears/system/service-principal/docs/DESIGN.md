@@ -423,8 +423,13 @@ no `Serialize` implementation.
 The trait defines `create`, `rotate_secret`, `revoke`, and `list`. An implementation must address
 `(tenant_id, client_id)` as the scoped resource, return `NotFound` for an address outside the
 tenant, return the secret only from `create`/`rotate_secret`, and classify transport uncertainty as
-`Ambiguous` rather than success. Provider-specific diagnostics never cross into
-`ServicePrincipalFailure`.
+`Ambiguous` rather than success. `ServicePrincipalFailure::{CleanFailure, Ambiguous}.detail` is
+contractually caller-safe operator text — a short summary an API caller may legitimately see, never
+a secret, hostname, connection string, or stack trace. As a defense-in-depth guardrail, the gear
+additionally sanitizes that `detail` (stripping control characters, collapsing whitespace, and
+capping length) at the `DomainError` conversion boundary before it can reach the wire; the
+sanitized text and the original length are logged server-side, so operators keep a diagnostic
+signal without exposing raw adapter text.
 
 #### Managed Resource and Permissions
 
@@ -682,8 +687,13 @@ The taxonomy on both sides of the boundary (`ServicePrincipalFailure` and `Domai
 neither type is `#[non_exhaustive]`, so every match is compile-checked to cover every variant.
 `Ambiguous` carries `409`, a status distinct from the `503` used for `Upstream` and
 `ProviderUnavailable` (rationale: [Appendix A](#appendix-a-decision-rationale)).
-Provider-specific diagnostic detail stays in the `detail` string surfaced by canonical error
-rendering; no adapter-internal state crosses the wire.
+Adapter-supplied `detail` is contractually caller-safe operator text (see §3.3, Provider Adapter
+Contract V1); the gear additionally sanitizes it — keeping only ASCII graphic characters, collapsing
+whitespace runs, and capping length — at the `DomainError` conversion boundary before it reaches
+canonical error rendering, for `InvalidInput` (`detail` and `field`), `CleanFailure`, and
+`Ambiguous` alike. For `CleanFailure` and `Ambiguous`, the conversion also emits a `tracing::warn!`
+carrying the sanitized text plus the original length (never the raw adapter text — see §4.5). No
+adapter-internal diagnostics cross the wire.
 
 ### 4.2 Ambiguous Outcome Handling
 
@@ -731,9 +741,15 @@ ships here.
 
 The gear emits one `tracing::info!` at successful `init` and one `tracing::warn!` when
 `Service::sp_client` fails to resolve the provider, logging the underlying `ClientHubError` for
-diagnosis. Beyond platform-wide request tracing and canonical-error correlation, the gear defines
-no dedicated audit trail, metric, or alert of its own; this matches the PRD's explicit NFR
-exclusion for bespoke auditability and observability.
+diagnosis. It additionally emits one `tracing::warn!` at each of the `CleanFailure` → `Upstream`
+and `Ambiguous` → `Ambiguous` `DomainError` conversion boundaries (see §4.1); both carry the
+sanitized `provider_detail` (never the raw adapter text) plus the `original_len` of the
+unsanitized detail, so operators retain a bounded diagnostic without secrets or control bytes ever
+reaching the logs. The `InvalidInput` conversion sanitizes `detail` and `field` the same way but
+emits no `warn!`, since a `400` is caller-attributable input rejection rather than an upstream or
+provider-side condition worth flagging. Beyond platform-wide request tracing and canonical-error
+correlation, the gear defines no dedicated audit trail, metric, or alert of its own; this matches
+the PRD's explicit NFR exclusion for bespoke auditability and observability.
 
 ### 4.6 Fault Tolerance
 
@@ -780,7 +796,9 @@ both are tracked as open PRD questions rather than as claims of this design.
 The gear models machine identities and collects no human profile attributes. Client id, subject
 id, tenant id, and scope values remain security-sensitive control-plane metadata; the registered
 provider owns any residency or backup posture for the principal records it stores. No
-gear-specific regulatory claim is made.
+gear-specific regulatory claim is made. This exclusion ceases to apply in deployments where tenant
+or account identifiers can identify natural persons; such deployments must apply their
+deployment-specific privacy controls.
 
 ### 4.9 Migration Impact
 

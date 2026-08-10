@@ -99,6 +99,7 @@ impl AuthZResolverClient for DenyPdp {
 /// through the real HTTP stack (mirrors `domain::service_tests::MockSp`).
 #[derive(Default)]
 struct MockSp {
+    create_result: Option<ServicePrincipalFailure>,
     rotate_result: Option<ServicePrincipalFailure>,
 }
 
@@ -109,6 +110,9 @@ impl ServicePrincipalClientV1 for MockSp {
         _ctx: &SecurityContext,
         req: &CreateServicePrincipalRequest,
     ) -> Result<ServicePrincipalCredentials, ServicePrincipalFailure> {
+        if let Some(e) = &self.create_result {
+            return Err(clone_failure(e));
+        }
         Ok(ServicePrincipalCredentials {
             client_id: format!("svc-{}-{}", req.tenant_id.0, req.name),
             client_secret: SecretString::from("s3cr3t".to_owned()),
@@ -198,6 +202,19 @@ fn router_with_pdp(pdp: Arc<dyn AuthZResolverClient>) -> (Router, Arc<OpenApiReg
 
 fn authorized_router() -> Router {
     router_with_pdp(Arc::new(AllowTenantPdp)).0
+}
+
+/// Build a router whose `ClientHub` has no `ServicePrincipalClientV1`
+/// registered at all — the `503 ProviderUnavailable` path never reaches the
+/// SPI, so there is no `MockSp` to configure.
+fn router_with_no_provider() -> Router {
+    let hub = Arc::new(ClientHub::default());
+    let svc = Arc::new(Service::new(
+        PolicyEnforcer::new(Arc::new(AllowTenantPdp)),
+        hub,
+    ));
+    let openapi = OpenApiRegistryImpl::new();
+    register_routes(Router::new(), &openapi, svc)
 }
 
 /// Inject the `SecurityContext` extension the way the real auth middleware would.
@@ -345,6 +362,7 @@ async fn rotate_secret_not_found_renders_canonical_problem() {
         rotate_result: Some(ServicePrincipalFailure::NotFound {
             detail: "no such client".to_owned(),
         }),
+        ..Default::default()
     };
     let router = router_with_pdp_and_sp(Arc::new(AllowTenantPdp), sp).0;
     let uri = format!(
@@ -375,4 +393,78 @@ async fn rotate_secret_not_found_renders_canonical_problem() {
         body["title"].as_str().is_some_and(|t| !t.is_empty()),
         "problem envelope must carry a `title`, got {body:?}"
     );
+}
+
+/// A provider `InvalidInput` failure on `create` must render as a `400`
+/// canonical problem, driven through the full HTTP stack.
+#[tokio::test]
+async fn create_invalid_input_renders_400() {
+    let sp = MockSp {
+        create_result: Some(ServicePrincipalFailure::InvalidInput {
+            detail: "name already taken".to_owned(),
+            field: Some("name".to_owned()),
+        }),
+        ..Default::default()
+    };
+    let router = router_with_pdp_and_sp(Arc::new(AllowTenantPdp), sp).0;
+    let uri = format!("/service-principal/v1/tenants/{TENANT}/service-principals");
+    let req = request_with_ctx("POST", &uri, Some(serde_json::json!({ "name": "ci" })));
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], 400);
+}
+
+/// A provider `Ambiguous` failure on `create` must render as `409`, and the
+/// `detail` reaching the wire must be the SANITIZED text: control characters
+/// stripped and the overlong mock detail truncated. This is the guardrail
+/// this test suite exists to prove — a raw provider diagnostic must never
+/// reach the client.
+#[tokio::test]
+async fn create_ambiguous_renders_409_with_sanitized_detail() {
+    // Deliberately dirty: an embedded ANSI escape (\u{1b}) plus far more than
+    // the 200-char cap the domain boundary enforces.
+    let dirty_detail = format!("conn\u{1b}[31mreset{}", "z".repeat(500));
+    let sp = MockSp {
+        create_result: Some(ServicePrincipalFailure::Ambiguous {
+            detail: dirty_detail.clone(),
+        }),
+        ..Default::default()
+    };
+    let router = router_with_pdp_and_sp(Arc::new(AllowTenantPdp), sp).0;
+    let uri = format!("/service-principal/v1/tenants/{TENANT}/service-principals");
+    let req = request_with_ctx("POST", &uri, Some(serde_json::json!({ "name": "ci" })));
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], 409);
+    let detail = body["detail"].as_str().expect("detail present");
+    assert!(
+        !detail.contains('\u{1b}'),
+        "sanitized detail must not carry the raw ANSI escape, got {detail:?}"
+    );
+    assert!(
+        detail.len() < dirty_detail.len(),
+        "sanitized detail must be shorter than the raw provider text, got {detail:?}"
+    );
+    assert!(
+        detail.ends_with("...(truncated)"),
+        "overlong detail must carry the truncation marker, got {detail:?}"
+    );
+}
+
+/// With no `ServicePrincipalClientV1` registered in the `ClientHub`, `create`
+/// must fail closed with `503` rather than panicking or hanging.
+#[tokio::test]
+async fn create_with_no_provider_registered_returns_503() {
+    let router = router_with_no_provider();
+    let uri = format!("/service-principal/v1/tenants/{TENANT}/service-principals");
+    let req = request_with_ctx("POST", &uri, Some(serde_json::json!({ "name": "ci" })));
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], 503);
 }

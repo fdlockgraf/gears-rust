@@ -18,9 +18,23 @@ pub enum ServicePrincipalFailure {
     /// by the addressed tenant. Success-equivalent for revoke.
     NotFound { detail: String },
     /// Vendor call failed cleanly — no state retained. Retry is harmless, though not necessarily productive.
+    ///
+    /// `detail` must be caller-safe operator text: a short, human-readable
+    /// summary an API caller could legitimately see (e.g. "vendor quota
+    /// exceeded"). Adapters MUST NOT place secrets, credentials, hostnames,
+    /// connection strings, or internal stack traces here — the gear
+    /// additionally sanitizes `detail` (stripping control characters and
+    /// capping length) at the domain boundary before it can reach the wire,
+    /// but that sanitization is a last-resort guardrail, not a substitute
+    /// for adapters choosing safe text in the first place.
     CleanFailure { detail: String },
     /// Transport uncertainty — vendor may have retained state. Never
     /// reported as success.
+    ///
+    /// `detail` is held to the same caller-safe contract as
+    /// [`ServicePrincipalFailure::CleanFailure`]: no secrets or internal
+    /// diagnostics, since it is sanitized and then surfaced in the RFC-9457
+    /// error response.
     Ambiguous { detail: String },
 }
 
