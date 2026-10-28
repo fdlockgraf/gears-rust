@@ -26,3 +26,5 @@ pub mod contributions;
 pub mod guards;
 pub mod state_table;
 pub mod transition;
+/// Amendment (S4-03): the delta merge onto committed version N and the five versioning guards.
+pub mod versioning;
