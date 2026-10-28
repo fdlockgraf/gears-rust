@@ -139,6 +139,8 @@ pub struct SubmitService {
     budget: AcceptanceBudget,
     /// Whether the missing-port warning was logged (once per process).
     warned: AtomicBool,
+    /// The policy election store (S4-08a consent requirement).
+    policy: Option<toolkit_db::Db>,
 }
 
 impl std::fmt::Debug for SubmitService {
@@ -148,6 +150,7 @@ impl std::fmt::Debug for SubmitService {
             .field("line_cap", &self.line_cap)
             .field("acceptance", &self.acceptance.is_some())
             .field("budget", &self.budget)
+            .field("policy", &self.policy.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -207,6 +210,7 @@ impl SubmitService {
             hub: None,
             budget: AcceptanceBudget::with_deadline(ACCEPTANCE_DEADLINE),
             warned: AtomicBool::new(false),
+            policy: None,
         }
     }
 
@@ -221,6 +225,14 @@ impl SubmitService {
     #[must_use]
     pub fn with_acceptance_hub(mut self, hub: Arc<toolkit::ClientHub>) -> Self {
         self.hub = Some(hub);
+        self
+    }
+
+    /// The policy election store the commit reads the consent requirement from (S4-08a,
+    /// D-251). Without one a self-service commit that needs an election answers unavailable.
+    #[must_use]
+    pub fn with_policy_store(mut self, db: toolkit_db::Db) -> Self {
+        self.policy = Some(db);
         self
     }
 
@@ -429,6 +441,23 @@ impl SubmitService {
                 "a passing run without the actual evaluation request",
             )
         })?;
+        // S4-08a (D-251): a passing run resolved the order contract (`orders.contract-active`
+        // passes only over an answered, active contract), so its requirement is known.
+        let contract_acceptance_required = match view.order.contract_id {
+            Some(contract) => {
+                resolved
+                    .contracts
+                    .get(&contract)
+                    .ok_or_else(|| {
+                        integration(
+                            Ids::order(order_id),
+                            "a passing run without its order contract's facts",
+                        )
+                    })?
+                    .acceptance_required
+            }
+            None => None,
+        };
         let order = FrozenOrder {
             assessment_id: run_id,
             assessed_at: evaluated_at,
@@ -438,6 +467,7 @@ impl SubmitService {
             report,
             correlation_id: meta.correlation_id,
             vector: assessment.vector.clone(),
+            contract_acceptance_required,
         };
         let frozen = FrozenLineInputs::capture(
             order_id,
@@ -511,6 +541,7 @@ impl SubmitService {
             line_requests: attempt.line_requests.clone(),
             requests,
             line_cap: self.line_cap,
+            policy: self.policy.clone(),
         };
         let outcome = engine
             .transition(

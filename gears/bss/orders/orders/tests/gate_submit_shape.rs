@@ -754,7 +754,43 @@ fn frozen_order(lines: &[BasketLine]) -> FrozenOrder {
         report: frozen_report(),
         correlation_id: Some(Uuid::from_u128(71)),
         vector: frozen_vector(lines),
+        contract_acceptance_required: None,
     }
+}
+
+/// S4-08a (D-251): the contract's requirement is frozen with the order member when stated, and
+/// an attempt that predates it (no member) decodes as unstated.
+#[test]
+fn the_frozen_contract_requirement_round_trips_and_is_absent_on_legacy_attempts() {
+    let inputs = two_lines();
+    let requests = build_line_requests(&inputs.facts(), CANDIDATE).unwrap();
+    let legacy = line_requests_value(&requests, &frozen_order(&inputs.lines)).unwrap();
+    assert!(
+        legacy[ORDER_MEMBER]
+            .get("contract_acceptance_required")
+            .is_none()
+    );
+    assert_eq!(
+        decode_line_requests(&legacy)
+            .unwrap()
+            .order
+            .contract_acceptance_required,
+        None
+    );
+    let mut order = frozen_order(&inputs.lines);
+    order.contract_acceptance_required = Some(false);
+    let value = line_requests_value(&requests, &order).unwrap();
+    assert_eq!(
+        value[ORDER_MEMBER]["contract_acceptance_required"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        decode_line_requests(&value)
+            .unwrap()
+            .order
+            .contract_acceptance_required,
+        Some(false)
+    );
 }
 
 #[test]

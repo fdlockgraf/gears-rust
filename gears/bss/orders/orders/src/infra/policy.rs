@@ -353,14 +353,6 @@ pub async fn install(db: &Db, plan: Option<&PolicyPlan>) -> anyhow::Result<()> {
 ///
 /// # Errors
 /// No connection, or a failed scoped read.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the read port has no caller until consent (S4-08) and the begin-fulfillment \
-                  money guard (S4-10) are delivered"
-    )
-)]
 pub async fn election(
     db: &Db,
     election: Election,

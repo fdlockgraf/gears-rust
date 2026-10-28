@@ -188,6 +188,15 @@ This process is **owned by Workflow and must be implemented there**, not a new L
 
 A declined instrument's only automatic exit is the `approved` TTL, provisionally 30 days and never unset in production (D-181). Only provision-then-collect is expressible; payment capture, SCA, reauthorization UI, refunds and chargebacks remain outside this feature.
 
+**Implementation note (S4-08a, D-251).** The first row is delivered in the submit commit
+(`infra/gate/commit.rs`, step 7). The decision reads the frozen commercial attempt (its original
+principal's tenant and proof reference) against the resource tenant the engine locked, so a
+recovered attempt decides as the fresh one did. The requirement source comes from the order
+contract's `acceptance_required`, frozen with the attempt from the passing gate run, then the
+seller and platform `acceptance_required` elections; unset is `platform_default`. A failed
+election read answers `unavailable` and commits nothing. The row and the `OrderSubmitted`
+`acceptance` member both carry the engine's transition time `t`.
+
 ## 5. Definitions of Done
 
 ### 5.1 Acceptance implementation

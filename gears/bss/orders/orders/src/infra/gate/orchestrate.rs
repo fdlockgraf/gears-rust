@@ -36,8 +36,8 @@ use super::budget::{Budget, RunBudget};
 use super::pricing_read::CatalogReads;
 use super::signals::{Flow, GateSignals};
 use crate::domain::gate::answers::{
-    AcceptancePolicy, IndicativeTax, Market, OrderEvaluation, OrderEvaluationRequest, OverlapKey,
-    ResolvedTerms,
+    AcceptancePolicy, ContractFacts, IndicativeTax, Market, OrderEvaluation,
+    OrderEvaluationRequest, OverlapKey, ResolvedTerms,
 };
 use crate::domain::gate::assess::{Assessment, assess};
 use crate::domain::gate::commercial::CommercialError;
@@ -150,6 +150,23 @@ impl InflightClaims for StorageInflightClaims {
     }
 }
 
+/// Complete validated item keys per line from an answered overlap-key port; none otherwise.
+fn answered_keys(
+    basket: &Basket,
+    bindings: &BTreeMap<Uuid, Vec<AcceptedBinding>>,
+    answer: Option<&PortAnswer<Vec<OverlapKey>>>,
+) -> BTreeMap<Uuid, Vec<OverlapKey>> {
+    answer
+        .and_then(PortAnswer::answered)
+        .map(|answered| {
+            crate::domain::gate::item_keys::validated_line_keys(
+                &overlap_key_lines(basket, bindings),
+                answered.as_slice(),
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Why a run produced no assessment.
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestrateError {
@@ -192,6 +209,9 @@ pub struct Resolved {
     pub terms: BTreeMap<Uuid, ResolvedTerms>,
     /// The seller's acceptance policy, when answered and present.
     pub policy: Option<AcceptancePolicy>,
+    /// The referenced contracts' facts, when the relationship is confirmed and the port
+    /// answered; submit freezes the order contract's `acceptance_required` (S4-08a, D-251).
+    pub contracts: BTreeMap<Uuid, ContractFacts>,
     /// The exact request sent to Rating, absent when evaluation was not asked.
     pub evaluation_request: Option<OrderEvaluationRequest>,
     /// The Rating evaluation, when asked and answered.
@@ -555,17 +575,13 @@ impl Orchestrator {
             .map(|t| (t.line_id, t.clone()))
             .collect();
         let policy = acceptance_policy.answered().cloned().flatten();
-        let keys = overlap_keys
+        let keys = answered_keys(basket, &bindings, overlap_keys.as_ref());
+        let evaluated = evaluation.as_ref().and_then(|e| e.answered().cloned());
+        let contract_facts = contracts
             .as_ref()
             .and_then(PortAnswer::answered)
-            .map(|answered| {
-                crate::domain::gate::item_keys::validated_line_keys(
-                    &overlap_key_lines(basket, &bindings),
-                    answered.as_slice(),
-                )
-            })
+            .cloned()
             .unwrap_or_default();
-        let evaluated = evaluation.as_ref().and_then(|e| e.answered().cloned());
         let answers = Answers {
             catalog,
             identity,
@@ -588,6 +604,7 @@ impl Orchestrator {
             market,
             terms: resolved_terms,
             policy,
+            contracts: contract_facts,
             evaluation_request: request,
             evaluation: evaluated,
             tax,

@@ -320,6 +320,18 @@ impl<'l, 'a> EventEnqueue<'l, 'a> {
             summary,
         }
     }
+    /// The engine's single transition timestamp `t` (the summary's `occurred_at`, the instant
+    /// [`ChildDocuments::transition_time`] gives the writers): a payload reporting an instant
+    /// this transition stored reads it here, never from a clock (S4-08a).
+    #[must_use]
+    pub fn occurred_at(&self) -> OffsetDateTime {
+        self.summary.occurred_at
+    }
+    /// The committed post-state's order version.
+    #[must_use]
+    pub fn order_version(&self) -> i32 {
+        self.summary.order_version
+    }
     /// Enqueue the row's payload; consumes the handle.
     ///
     /// # Errors

@@ -32,7 +32,15 @@
 //!    the version contribution names the reserved candidate, the claims are the frozen keys,
 //!    the event is `OrderSubmitted`; the settlement carries the frozen gate report and the
 //!    engine writes the frozen outcome vector as the run's diagnostics, whether this call
-//!    assessed or recovered the attempt (D-235).
+//!    assessed or recovered the attempt (D-231);
+//! 7. automatic consent (S4-08a, D-146, D-251), only when nothing refused: decided from the
+//!    frozen attempt (its original principal's tenant and proof reference) against the resource
+//!    tenant the engine locked, so a recovered attempt decides as the fresh one did. A
+//!    self-service commit writes the `acceptance` row of the committed candidate
+//!    (`self_service`, the frozen subject's reference, the engine's transition time) with the
+//!    source resolved from the frozen contract fact, then the seller and platform elections
+//!    (a failed election read is `Unavailable`, never a default); `OrderSubmitted` carries
+//!    `acceptance { acceptedVersion, acceptedAt }` from the engine's summary.
 //!
 //! The engine does the rest: claims, version, documents, diagnostics, aggregate, audit, event,
 //! settlement and `finish_execution`.
@@ -49,14 +57,21 @@ use crate::domain::gate::commercial::{
 use crate::domain::gate::totals::{TotalRow, total_rows};
 use crate::domain::guards::{GATE_COMPOSITE, GUARDS, InputPort};
 use crate::domain::overlap::{ClaimParties, OverlapScopeKey, ProposedClaims};
+use crate::domain::preconditions::{
+    self, Requirement, RequirementSource, acceptance_requirement, recorded_source,
+};
 use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, InputState, Inputs};
 use crate::infra::dates::admitted_line;
-use crate::infra::engine::documents::EventDetail;
+use crate::infra::engine::documents::{EventEnqueue, EventSpec};
 use crate::infra::engine::{
     ChildDocuments, DocumentWriter, Preparation, PreparationView, PrepareError, Prepared,
 };
-use crate::infra::events::payload::{LineRef, OrderSubmitted};
-use crate::infra::storage::entity::{draft_content, order_line, resolved_total};
+use crate::infra::events::EventEnqueueError;
+use crate::infra::events::payload::{LineRef, OrderSubmitted, SubmitAcceptance};
+use crate::infra::policy::{self, Election, PolicyScope};
+use crate::infra::storage::entity::{
+    acceptance, commercial_attempt, draft_content, order_line, resolved_total,
+};
 use crate::infra::storage::repo::idempotency::Frozen;
 use async_trait::async_trait;
 use bss_orders_sdk::catalog::{Reason, Trigger};
@@ -93,6 +108,24 @@ pub struct SubmitPreparation {
     pub(super) requests: FrozenRequests,
     /// The configured line cap.
     pub(super) line_cap: usize,
+    /// The policy election store (step 7); `None` answers unavailable when an election is read.
+    pub(super) policy: Option<toolkit_db::Db>,
+}
+
+/// The consent a self-service commit records (module doc, step 7).
+#[derive(Debug, Clone)]
+struct Consent {
+    /// The trusted subject's reference (D-103: the lowercase hyphenated subject UUID).
+    recorded_by: String,
+    /// Where the requirement came from, or `volunteered`.
+    source: RequirementSource,
+}
+
+/// The identity members of a frozen `original_principal` (`submit::attempt_inputs`).
+#[derive(serde::Deserialize)]
+struct FrozenPrincipal {
+    subject_id: Uuid,
+    subject_tenant_id: Uuid,
 }
 
 /// What one accepted line contributes.
@@ -292,23 +325,29 @@ impl Preparation for SubmitPreparation {
             },
             keys,
         ));
+        // 7. Consent, only for a commit (a refusal records nothing and emits no event).
+        let consent = match blocked {
+            None => self.consent(attempt, view).await?,
+            Some(_) => None,
+        };
         if blocked.is_none() {
             prepared.documents = Some(Arc::new(SubmitDocuments {
                 lines: lines.into_iter().map(|l| l.row).collect(),
                 totals,
                 assessment_id: self.requests.order.assessment_id,
                 version: self.candidate_version,
+                consent: consent.clone(),
             }));
         }
-        prepared.event = Some(Arc::new(EventDetail(OrderSubmitted {
+        prepared.event = Some(Arc::new(SubmittedEvent {
             lines: self
                 .requests
                 .lines
                 .iter()
                 .map(|l| LineRef { line_id: l.line_id })
                 .collect(),
-            acceptance: None,
-        })));
+            accepted: consent.is_some(),
+        }));
         // The frozen run: a fresh and a recovered commit settle the same report and write the
         // same diagnostics (D-235).
         let order = &self.requests.order;
@@ -377,8 +416,9 @@ impl SubmitPreparation {
         )
     )]
     pub fn for_attempt(
-        attempt: &crate::infra::storage::entity::commercial_attempt::Model,
+        attempt: &commercial_attempt::Model,
         line_cap: usize,
+        policy: Option<toolkit_db::Db>,
     ) -> Option<Self> {
         Some(Self {
             attempt_id: attempt.attempt_id,
@@ -387,7 +427,75 @@ impl SubmitPreparation {
             requests: crate::domain::gate::commercial::decode_line_requests(&attempt.line_requests)
                 .ok()?,
             line_cap,
+            policy,
         })
+    }
+
+    /// Step 7 (module doc): the consent of a self-service commit, `None` otherwise.
+    async fn consent(
+        &self,
+        attempt: &commercial_attempt::Model,
+        view: &PreparationView,
+    ) -> Result<Option<Consent>, PrepareError> {
+        let principal: FrozenPrincipal = serde_json::from_value(attempt.original_principal.clone())
+            .map_err(|_| {
+                integration(
+                    Ids::attempt(view.facts.order_id, self.attempt_id),
+                    "the frozen original principal does not decode",
+                )
+            })?;
+        if !preconditions::auto_consent(
+            principal.subject_tenant_id,
+            view.facts.resource_tenant_id,
+            attempt.proof_reference.is_some(),
+        ) {
+            return Ok(None);
+        }
+        let requirement = self.requirement(view.facts.seller_tenant_id).await?;
+        Ok(Some(Consent {
+            recorded_by: principal.subject_id.hyphenated().to_string(),
+            source: recorded_source(requirement),
+        }))
+    }
+
+    /// The requirement's precedence (D-251): the frozen contract fact, then the seller's
+    /// election, then the platform's; each election is read only when the earlier term is
+    /// silent.
+    async fn requirement(&self, seller: Uuid) -> Result<Requirement, PrepareError> {
+        let contract = self.requests.order.contract_acceptance_required;
+        if contract.is_some() {
+            return Ok(acceptance_requirement(contract, None, None));
+        }
+        let seller = self.election(PolicyScope::Seller(seller)).await?;
+        let platform = match seller {
+            Some(_) => None,
+            None => self.election(PolicyScope::Platform).await?,
+        };
+        Ok(acceptance_requirement(None, seller, platform))
+    }
+
+    /// One `acceptance_required` election; a failed read is `Unavailable` (never "no row").
+    async fn election(&self, scope: PolicyScope) -> Result<Option<bool>, PrepareError> {
+        let Some(db) = &self.policy else {
+            tracing::warn!(
+                target: "orders.gate.submit",
+                "bss-orders: no policy election store is bound; a self-service submit answers \
+                 unavailable"
+            );
+            return Err(PrepareError::Unavailable);
+        };
+        policy::election(db, Election::AcceptanceRequired, scope)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "orders.gate.submit",
+                    scope = scope.token(),
+                    error = %error,
+                    "bss-orders: the acceptance election could not be read; submit answers \
+                     unavailable"
+                );
+                PrepareError::Unavailable
+            })
     }
 
     /// One accepted line: its verified pin and admitted row (module doc, steps 4–5).
@@ -620,12 +728,14 @@ fn line_row_bytes(row: &order_line::Model) -> usize {
         + persisted::json(&row.date_policy_switch_state)
 }
 
-/// The admitted version's child documents: line rows, then totals rows (step 19).
+/// The admitted version's child documents: line rows, totals rows, then the self-service
+/// consent of that version (step 19).
 struct SubmitDocuments {
     lines: Vec<order_line::Model>,
     totals: Vec<TotalRow>,
     assessment_id: Uuid,
     version: i32,
+    consent: Option<Consent>,
 }
 
 #[async_trait]
@@ -638,7 +748,47 @@ impl DocumentWriter for SubmitDocuments {
             .map(|row| total_model(documents.order_id(), self.version, self.assessment_id, row))
             .collect();
         documents.insert_resolved_totals(totals).await?;
+        if let Some(consent) = &self.consent {
+            documents
+                .insert_acceptance(acceptance::Model {
+                    order_id: documents.order_id(),
+                    accepted_version: self.version,
+                    accepted_at: documents.transition_time(),
+                    recorded_by: consent.recorded_by.clone(),
+                    recording_path: preconditions::SELF_SERVICE.to_owned(),
+                    requirement_source: consent.source.token().to_owned(),
+                })
+                .await?;
+        }
         Ok(())
+    }
+}
+
+/// Row 4's `OrderSubmitted`. Its acceptance names the committed version and the engine's
+/// transition time, both from the summary the engine hands the enqueue, so they equal what
+/// [`SubmitDocuments`] stored (module doc, step 7).
+struct SubmittedEvent {
+    lines: Vec<LineRef>,
+    /// Whether this commit recorded the self-service consent.
+    accepted: bool,
+}
+
+#[async_trait]
+impl EventSpec for SubmittedEvent {
+    fn kind(&self) -> bss_orders_sdk::catalog::EventKind {
+        bss_orders_sdk::catalog::EventKind::OrderSubmitted
+    }
+    async fn enqueue(&self, enqueue: EventEnqueue<'_, '_>) -> Result<(), EventEnqueueError> {
+        let acceptance = self.accepted.then(|| SubmitAcceptance {
+            accepted_version: enqueue.order_version(),
+            accepted_at: enqueue.occurred_at(),
+        });
+        enqueue
+            .enqueue(OrderSubmitted {
+                lines: self.lines.clone(),
+                acceptance,
+            })
+            .await
     }
 }
 

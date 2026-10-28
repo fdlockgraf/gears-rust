@@ -13,6 +13,7 @@
     "00000000-0000-0000-0000-0000000000c1": {
       "status": "active",
       "payer_eligible": true,
+      "acceptance_required": true,
       "version": "dev-stub-1"
     }
   },

@@ -610,7 +610,9 @@ impl Gear for BssOrdersGear {
                         ),
                     )
                     .with_acceptance_hub(ctx.client_hub())
-                    .with_acceptance(dev_acceptance(&gate, ctx.client_hub())),
+                    .with_acceptance(dev_acceptance(&gate, ctx.client_hub()))
+                    // S4-08a (D-251): the consent requirement's elections.
+                    .with_policy_store(runtime.db.clone()),
                 ))
             })
             .transpose()?;

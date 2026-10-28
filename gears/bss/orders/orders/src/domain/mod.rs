@@ -16,6 +16,8 @@ pub mod failure;
 pub mod gate;
 pub mod idempotency;
 pub mod overlap;
+/// Acceptance preconditions (S4-08): automatic consent and the requirement's precedence.
+pub mod preconditions;
 /// Read surfaces (early S6-01/S6-04): page bounds, cursor codec and the access-log decision.
 pub mod read;
 // The S2-04 engine's declarative core. Slice operations bind guards, select triggers from the

@@ -171,6 +171,12 @@ pub struct FrozenOrder {
     pub correlation_id: Option<Uuid>,
     /// The run's complete outcome vector, written as the commit's diagnostics (M2-2).
     pub vector: Vector,
+    /// The order's referenced contract's `acceptance_required` as the passing run resolved it
+    /// (S4-08a, D-251): the first term of the consent requirement's precedence, frozen so a
+    /// recovered commit decides the recorded source without re-running the gate. `None` when
+    /// the order has no contract, the contract does not state it, or the attempt predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_acceptance_required: Option<bool>,
 }
 
 /// One line of a stored attempt, decoded ([`decode_line_requests`]).
