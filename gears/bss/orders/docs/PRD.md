@@ -304,6 +304,8 @@ Entering fulfillment (`approved` → `in_fulfillment`) **MUST** be preceded by a
 
 In **self-service**, submit by the buyer **constitutes acceptance** and **MUST** be recorded as such (no separate field). On the **partner-placed** path, the order evidences delegation (the right to act) but not agreement to the purchase: a **customer-acceptance instant** **MUST** be recordable as a first-class fact, publishing `OrderAcceptanceRecorded`. The "acceptance required" flag is sourced from the contract where one exists (platform default otherwise). When acceptance is required, the order **MUST NOT** enter `in_fulfillment` until the acceptance instant is recorded. The instant **MUST NOT** be defaulted under any policy — including cascading defaults that fill the line-level customer-acceptance due date.
 
+Acceptance is **version-bound** (OL-26): each recorded acceptance names the immutable order version it was given for (`acceptedVersion`). An amendment starts the new version with **no consent**: acceptance is neither copied forward nor inferred, and an earlier version's consent never satisfies the new version's acceptance requirement, so fulfillment of that version waits for acceptance recorded against it. The original buyer may record acceptance again for the current version. Customer acceptance of partner-placed orders remains limited by Q-30 (no reachable customer acceptance surface).
+
 **Rationale**: In a dispute over a partner-placed order there is otherwise nothing showing the customer agreed to the purchase; acceptance is also where the quote/order conflation (§1.1) resolves into commitment.
 
 **Actors**: `cpt-cf-bss-orders-actor-orders-partner-admin`, `cpt-cf-bss-orders-actor-orders-direct-customer`

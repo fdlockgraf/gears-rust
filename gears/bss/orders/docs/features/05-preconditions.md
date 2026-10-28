@@ -64,7 +64,7 @@ Record actual buyer acceptance against an immutable commercial version and contr
 - **Dependencies**: [Foundation](01-foundation.md), [Capture](02-capture.md), [Gate and Pin](03-gate-and-pin.md).
 - **Consumer**: [Workflow Seam](06-workflow-seam.md).
 
-Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed contract acceptance SDK, Payments read-by-request contract and Workflow durable-execution prerequisites. Version-bound acceptance remains the proposed OL-26 PRD reconciliation. [DECISIONS.md](../DECISIONS.md) Q-08 (Payments limitations) and Q-30 (reachable customer acceptance) remain open, and Q-27 (unset TTL) is closed by D-181's provisional TTLs; this feature does not supply a payment system or acceptance UI.
+Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed contract acceptance SDK, Payments read-by-request contract and Workflow durable-execution prerequisites. Version-bound acceptance is stated in PRD §6.1 (OL-26, reconciled by D-249). [DECISIONS.md](../DECISIONS.md) Q-08 (Payments limitations) and Q-30 (reachable customer acceptance) remain open, and Q-27 (unset TTL) is closed by D-181's provisional TTLs; this feature does not supply a payment system or acceptance UI.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -92,13 +92,13 @@ Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_RE
 **Actor**: A resource-tenant principal authorized for `acceptance × record` and not barred by stored placing-party facts.
 
 1. [ ] Call `POST /bss-orders/v1/orders/{orderId}/acceptance` with expected version and idempotency key; the actor and instant are never accepted from caller claims.
-2. [ ] Apply Foundation boundary validation, authorization, idempotency, admissibility and version checks. Reject `draft` and terminal orders with `not-admissible`.
+2. [ ] Apply Foundation boundary validation, authorization, idempotency, admissibility and version checks. Reject `draft` and terminal orders with `not-admissible`. A present, well-formed `If-Match` that is not the current version is refused `precondition-failed` (HTTP 412, D-212), not `version-conflict`.
 3. [ ] Resolve the live requirement and recording-party inputs under §3.1–§3.2. Allow voluntary recording when policy does not require it.
 4. [ ] Contribute one append-only acceptance row and request the state-only engine transition. Atomically audit and enqueue `OrderAcceptanceRecorded` with version, instant, actor and source.
 5. [ ] Return the stored outcome. Same-key replay reuses it; an independent attempt for an already accepted version refuses `acceptance-already-recorded`.
 6. [ ] Serve `GET /orders/{orderId}/acceptance` through Read and Authorization's common wrapper under `order × read`, with access logging, showing the current version's acceptance or absence and historical records.
 
-**Success**: Both initial partner-path and renewed post-amendment acceptance can be recorded by an eligible customer. **Errors**: Missing permissions, barred recording actor, stale version, existing current-version record or unavailable policy input never manufacture acceptance.
+**Success**: Both initial partner-path and renewed post-amendment acceptance can be recorded by an eligible customer. **Errors**: Missing permissions, barred recording actor, stale version (`precondition-failed`, 412, D-212), existing current-version record or unavailable policy input never manufacture acceptance.
 
 ### 2.3 Attempt fulfillment with a payment outcome
 
@@ -421,8 +421,8 @@ of mutable `draft` content is inadmissible (`not-admissible`). Every separately 
 Workflow ignores a historical version's acceptance when considering current fulfillment.
 
 This version-bound rule changes the earlier PRD/design wording of one instant per order and
-partner-only separate recording. It is the proposed correction for OL-26; reconciliation of
-the Lifecycle and Workflow PRDs remains an upstream requirement, not a claim of Product approval.
+partner-only separate recording. It is the OL-26 correction; the Lifecycle PRD §6.1 states it (D-249, a representation reconciliation with no business change). Reconciliation of
+the Workflow PRD remains an upstream requirement, not a claim of Product approval.
 
 On the **partner-placed** path, acceptance **MUST** be recorded as a separate first-class
 instant, publishing `OrderAcceptanceRecorded`. The instant **MUST** be the engine's single

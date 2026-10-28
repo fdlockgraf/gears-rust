@@ -64,7 +64,7 @@ Append a new immutable commercial version when an order is amended, re-run the f
 - **Dependencies**: [Foundation](01-foundation.md), [Capture](02-capture.md), [Gate and Pin](03-gate-and-pin.md).
 - **Consumers**: [Workflow Seam](06-workflow-seam.md), [Read and Authorization](08-read-and-authz.md).
 
-DESIGN owns schemas and architectural rationale; this feature owns the complete guard registration and behavior contracts. D-174 selects two-step re-approval and S1-01 reconciles Q-12's stale PRD wording. [DECISIONS.md](../DECISIONS.md) Q-28 (payer/seller rebinding) and Q-41 (`OrderAmended` trigger wording, split from Q-25 by D-186) retain their product scope. D-82's version/audit reason split also remains explicitly disclosed by the design.
+DESIGN owns schemas and architectural rationale; this feature owns the complete guard registration and behavior contracts. Q-12 is closed as an algorithm choice: two-step reapproval is selected (D-174), and the Workflow PRD amendment is a delivery task (`…-upreq-workflow-amendment-verdict`), not an open question. Event triggers follow Q-41: version creation is event-less, submit publishes `OrderSubmitted`, and only an actual amendment (rows 18-20) publishes `OrderAmended`. The submitted role version is the committed version whose reason is `submit`; because version history is sparse (D-188) it is not necessarily version 2, and role resolution never assumes a version number. [DECISIONS.md](../DECISIONS.md) Q-28 (cross-seller transfer and payer/seller rebinding) and Q-30 (customer acceptance surface for partner-placed orders) remain open limitations that this feature does not resolve, and Q-41 (`OrderAmended` trigger wording in PRD §6.5, split from Q-25 by D-186) retains its product scope. D-82's version/audit reason split also remains explicitly disclosed by the design.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -467,8 +467,8 @@ amendment from `approved` impossible.
 unconditionally on the grounds that it "left row 20's `pending_approval` target unreachable and
 silently narrowed a PRD edge". Half of that objection is now moot and half is met head-on. The
 earlier two-row split is folded into the `approved → submitted` row, which carries the §3.6 amendment guards but no guard on the approval verdict,
-and `pending_approval` is reached by row 7, a real edge the sibling gear already drives. The historical divergence was recorded by D-61/Q-12. D-174 subsequently selected this
-two-step shape, and S1-01 aligns PRD §6.1, §6.2 and AC-5 with it. Amendments from all three
+and `pending_approval` is reached by row 7, a real edge the sibling gear already drives. The historical divergence was recorded by D-61/Q-12. D-174 selected this
+two-step shape, and S1-01 aligned PRD §6.1, §6.2 and AC-5 with it; the Workflow PRD amendment remains a delivery task. Amendments from all three
 admitted source states commit in `submitted`; only a fresh version-specific Workflow
 reflection can then move the new version to `pending_approval` or `approved`. No new verdict
 port or direct amendment edge is introduced.
