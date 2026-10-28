@@ -2042,16 +2042,6 @@
       "title": "Failed precondition"
     },
     {
-      "reason": "payer-rebinding-requires-seller",
-      "error_domain": "orders.v1",
-      "error_code": "PAYER_REBINDING_REQUIRES_SELLER",
-      "canonical_category": "FailedPrecondition",
-      "http_status": 400,
-      "gts_registry_key": "gts.cf.bss.orders.err.v1~cf.bss.orders.payer_rebinding_requires_seller.v1~",
-      "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
-      "title": "Failed precondition"
-    },
-    {
       "reason": "tenant-axis-immutable",
       "error_domain": "orders.v1",
       "error_code": "TENANT_AXIS_IMMUTABLE",

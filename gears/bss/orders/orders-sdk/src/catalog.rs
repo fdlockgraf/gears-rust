@@ -479,9 +479,6 @@ pub enum Reason {
     /// `overlap-collision`.
     #[serde(rename = "overlap-collision")]
     OverlapCollision,
-    /// `payer-rebinding-requires-seller`.
-    #[serde(rename = "payer-rebinding-requires-seller")]
-    PayerRebindingRequiresSeller,
     /// `tenant-axis-immutable`.
     #[serde(rename = "tenant-axis-immutable")]
     TenantAxisImmutable,
@@ -667,7 +664,6 @@ impl Reason {
         Self::IndicativeTaxUnavailable,
         Self::MarketDivergence,
         Self::OverlapCollision,
-        Self::PayerRebindingRequiresSeller,
         Self::TenantAxisImmutable,
         Self::AdministrativeFieldInAmendment,
         Self::AmendmentEmpty,
@@ -764,7 +760,6 @@ impl Reason {
             Self::IndicativeTaxUnavailable => "indicative-tax-unavailable",
             Self::MarketDivergence => "market-divergence",
             Self::OverlapCollision => "overlap-collision",
-            Self::PayerRebindingRequiresSeller => "payer-rebinding-requires-seller",
             Self::TenantAxisImmutable => "tenant-axis-immutable",
             Self::AdministrativeFieldInAmendment => "administrative-field-in-amendment",
             Self::AmendmentEmpty => "amendment-empty",
@@ -864,7 +859,6 @@ impl Reason {
             "indicative-tax-unavailable" => Some(Self::IndicativeTaxUnavailable),
             "market-divergence" => Some(Self::MarketDivergence),
             "overlap-collision" => Some(Self::OverlapCollision),
-            "payer-rebinding-requires-seller" => Some(Self::PayerRebindingRequiresSeller),
             "tenant-axis-immutable" => Some(Self::TenantAxisImmutable),
             "administrative-field-in-amendment" => Some(Self::AdministrativeFieldInAmendment),
             "amendment-empty" => Some(Self::AmendmentEmpty),
@@ -1213,12 +1207,6 @@ const REASON_MAPPINGS: &[ReasonMapping] = &[
         reason: "overlap-collision",
         code: "OVERLAP_COLLISION",
         gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.overlap_collision.v1~"),
-        category: ProblemCategory::FailedPrecondition,
-    },
-    ReasonMapping {
-        reason: "payer-rebinding-requires-seller",
-        code: "PAYER_REBINDING_REQUIRES_SELLER",
-        gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.payer_rebinding_requires_seller.v1~"),
         category: ProblemCategory::FailedPrecondition,
     },
     ReasonMapping {

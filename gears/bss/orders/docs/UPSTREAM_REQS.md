@@ -528,7 +528,7 @@ owned by Contracts (§2.11).
 The profile **must also state the payer's commercial relationship with a named seller tenant**:
 whether the payer is in a commercial relationship with the order's `sellerTenantId`. An amendment
 that changes `payerTenantId` reads this answer to decide whether the change crosses seller scope
-([04 §2.2](DESIGN.md#contract-04-2-2)), and refuses `payer-rebinding-requires-seller` unless the
+([04 §2.2](DESIGN.md#contract-04-2-2)), and the gate refuses `payer-relationship-unconfirmed` (D-248 removed `payer-rebinding-requires-seller`) unless the
 relationship is confirmed. It **must likewise state the payer's commercial relationship with the
 order's resource tenant** (D-215): Preview, submit and amendment refuse `payer-relationship-unconfirmed`
 unless the payer may pay for that resource tenant, before any payer-related fact is disclosed.

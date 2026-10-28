@@ -160,13 +160,6 @@ pub const GUARDS: &[GuardDecl] = &[
         reasons: &["tenant-axis-immutable"],
         inputs: &[],
     },
-    GuardDecl {
-        name: "versioning.payer-within-seller",
-        owner: "S4-01",
-        rows: AMEND,
-        reasons: &["payer-rebinding-requires-seller"],
-        inputs: &[P::Identity],
-    },
     // Shared structural guards, registered once and reused (Foundation step 19).
     GuardDecl {
         name: capture::CATEGORY,

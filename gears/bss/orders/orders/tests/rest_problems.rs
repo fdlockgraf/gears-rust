@@ -178,10 +178,10 @@ fn the_canonical_round_trip_cannot_carry_an_orders_refusal() {
             }
         }
     }
-    // Measured: 72 of the 92 reasons are rejected; the 20 not_found, already_exists and
-    // service_unavailable reasons convert without their code and diagnostics. D-232 added
-    // `payer-relationship-unconfirmed` (FailedPrecondition), one more rejected reason.
-    assert_eq!((rejected, Reason::ALL.len()), (72, 92));
+    // Measured: 71 of the 91 reasons are rejected; the 20 not_found, already_exists and
+    // service_unavailable reasons convert without their code and diagnostics. D-228 added
+    // `payer-relationship-unconfirmed` (FailedPrecondition), one more rejected reason; D-248 removed `payer-rebinding-requires-seller` (one fewer).
+    assert_eq!((rejected, Reason::ALL.len()), (71, 91));
     assert_eq!(
         Reason::from_token("payer-relationship-unconfirmed")
             .map(|r| (r.mapping().code, wire::reason_status(r))),

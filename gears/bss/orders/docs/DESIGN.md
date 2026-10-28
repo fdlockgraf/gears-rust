@@ -5029,7 +5029,6 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `indicative-tax-unavailable` | `INDICATIVE_TAX_UNAVAILABLE` | ServiceUnavailable | 503 |
 | `market-divergence` | `MARKET_DIVERGENCE` | FailedPrecondition | 400 |
 | `overlap-collision` | `OVERLAP_COLLISION` | FailedPrecondition | 400 |
-| `payer-rebinding-requires-seller` | `PAYER_REBINDING_REQUIRES_SELLER` | FailedPrecondition | 400 |
 | `tenant-axis-immutable` | `TENANT_AXIS_IMMUTABLE` | FailedPrecondition | 400 |
 | `administrative-field-in-amendment` | `ADMINISTRATIVE_FIELD_IN_AMENDMENT` | InvalidArgument | 400 |
 | `amendment-empty` | `AMENDMENT_EMPTY` | InvalidArgument | 400 |
@@ -7357,7 +7356,7 @@ created. The two-step shape is what makes rows 19 and 20 reachable at all
 
 `payerTenantId` is the only tenant axis with an amendment path, and that path **stops at the
 seller boundary**. A payer change that crosses seller scope **MUST** be refused with
-`payer-rebinding-requires-seller`, because the paired seller rebinding such a move requires
+`payer-relationship-unconfirmed` (gate predicate 1; the amendment-specific reason was removed by D-248), because the paired seller rebinding such a move requires
 cannot be performed here at all: `sellerTenantId` is **commercial-frozen** and **MUST NOT** change
 after `submitted` by any path, amendment included
 ([02-capture — Field classification (normative)](DESIGN.md#contract-02-4-3) *Commercial-frozen*; §4.1;
@@ -7376,7 +7375,7 @@ commercial profile that the identity port already returns from Account Managemen
 (`cpt-cf-bss-orders-upreq-payer-commercial-profile`, `UPSTREAM_REQS.md` §2.4); this
 slice holds no port of its own (§3.5), so *Append Amendment* step 2 resolves it through 03 once
 per run and the gate run reuses it. A confirmed relationship admits the change; an answer that
-does not confirm one is refused with `payer-rebinding-requires-seller`. If the operation is
+does not confirm one is refused with `payer-relationship-unconfirmed` by gate predicate 1 (D-248). If the operation is
 unavailable or misses its deadline, the input is unresolvable and refuses
 `identity-party-unavailable`. No new reason is added
 ([DECISIONS.md](DECISIONS.md) D-128).
@@ -7387,7 +7386,7 @@ claims otherwise. It previously described a paired payer/seller rebinding while 
 both, and a reader could conclude either that the documented payer-transfer path must be rejected
 or that an unintended tenant rebinding must be permitted. This deliberately narrows PRD §6.1's
 paired-rebinding MUST; it is not evidence of conformance. Product/Architecture reconciliation
-remains open under D-62/Q-28. `payer-rebinding-requires-seller` keeps its registered name and its
+remains open under D-62/Q-28. `payer-rebinding-requires-seller` was removed by D-248. The
 authorization requirements are those of `amend` itself: a cross-seller payer change needs no extra
 authority because it is never admitted.
 
@@ -7543,8 +7542,7 @@ and submit publishes `OrderSubmitted`. `OrderAmended` fires only on rows 18, 19 
 six of eight values on the audit row rather than the version row; the split is stated here so the
 two are not read as one vocabulary ([DECISIONS.md](DECISIONS.md) D-82).
 
-**Reasons contributed to the registry**: payer-rebinding-requires-seller,
-tenant-axis-immutable, **administrative-field-in-amendment**, amendment-empty,
+**Reasons contributed to the registry**: tenant-axis-immutable, **administrative-field-in-amendment**, amendment-empty,
 **amendment-reason-invalid**, version-not-found, **amendment-cap-exhausted**,
 **administrative-edit-unchanged**. The shared read wrapper raises version-not-found
 only after current-parent authorization when a requested historical version is absent; it is
@@ -7568,9 +7566,7 @@ the two are distinct names because they refuse on opposite operations and point 
 opposite directions. `amendment-reason-invalid` is registered **here and only here** (D-129): it refuses an amendment
 whose `amendment_reason` is absent or outside 1–4096 characters, and it is a name distinct from
 `amendment-empty`, which refuses an empty delta — two conditions, two names (D-38).
-`payer-rebinding-requires-seller` refuses a payer change that crosses seller
-scope as §2.2 defines it (D-128), which §2.2 and §4.1 establish is never admissible, since `sellerTenantId` cannot be
-rebound to accompany it. An amendment attempted from
+`payer-rebinding-requires-seller` was removed by D-248: the payer relationship is checked once, by gate predicate 1. An amendment attempted from
 `in_fulfillment` or a terminal state resolves to the engine's own `not-admissible`, which carries
 the current state and trigger — no row exists for those pairs, so a slice-local
 `amendment-not-admitted-in-state` was unreachable from every path and is deleted, matching the

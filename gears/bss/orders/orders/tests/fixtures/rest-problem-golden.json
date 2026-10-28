@@ -227,11 +227,6 @@
       "status": 400
     },
     {
-      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"payer-rebinding-requires-seller\",\"context\":{\"data\":{}},\"error_code\":\"PAYER_REBINDING_REQUIRES_SELLER\",\"error_domain\":\"orders.v1\"}",
-      "reason": "payer-rebinding-requires-seller",
-      "status": 400
-    },
-    {
       "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"tenant-axis-immutable\",\"context\":{\"data\":{}},\"error_code\":\"TENANT_AXIS_IMMUTABLE\",\"error_domain\":\"orders.v1\"}",
       "reason": "tenant-axis-immutable",
       "status": 400
@@ -834,12 +829,6 @@
         ]
       },
       "reason": "overlap-collision",
-      "status": 400
-    },
-    {
-      "body": "{\"context\":{\"data\":{}},\"detail\":\"payer-rebinding-requires-seller\",\"error_code\":\"PAYER_REBINDING_REQUIRES_SELLER\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
-      "data": {},
-      "reason": "payer-rebinding-requires-seller",
       "status": 400
     },
     {

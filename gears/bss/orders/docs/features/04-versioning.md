@@ -111,7 +111,7 @@ DESIGN owns schemas and architectural rationale; this feature owns the complete 
 1. [ ] Register guards in this order: amendment cap; nonempty delta; valid reason; no administrative field; no commercial-frozen field; payer within seller scope; Capture structural guards (`category-not-admitted`, `currency-mixed`, `line-cap-exceeded`); shared date guard; full gate composite. Preserve their registered refusal names.
 2. [ ] Enforce the finite amendment cap (baseline 20, never unlimited). An inadmissible state still refuses `not-admissible` before this guard; cap exhaustion is `amendment-cap-exhausted` with cap and count.
 3. [ ] Carry forward every unnamed commercial field and apply the delta. Reject any administrative field, including mixed deltas, with `administrative-field-in-amendment`; reject resource/seller axis fields with `tenant-axis-immutable`.
-4. [ ] For a payer change, resolve the commercial profile through Gate and Pin once and reuse it in the gate. A non-confirmed seller relationship refuses `payer-rebinding-requires-seller`; an unavailable identity input refuses `identity-party-unavailable`. Seller remains immutable; no paired rebinding is offered.
+4. [ ] For a payer change, resolve the commercial profile through Gate and Pin once and reuse it in the gate. The payer relationship is checked once, by gate predicate 1 (`payer-relationship-unconfirmed`, D-215, D-228; D-248 removed the separate amendment guard and its reason); an unavailable identity input refuses `identity-party-unavailable`. Seller remains immutable; no paired rebinding is offered.
 5. [ ] Skip external work precluded by earlier failing local guards, preserving ordered engine refusal precedence. Otherwise first prepare the policy snapshot, proposed dates and date basis under Capture §4.2, before any date-dependent external calls. Then resolve all proposed lines against a fixed revision per line in one seller-scoped assessment, recomposing every pin, market, resolved total and TCV. Retain full gate/pin outcomes when any input fails.
 6. [ ] Carry the prepared dates, date basis and policy snapshot into the contribution. Contribute the entire distinct `(proposed payer_tenant_id, resource_tenant_id, overlap_scope_key)` claim set, including retained lines; never treat absent claims as permission to bypass maintenance.
 7. [ ] Let the engine validate the final date basis and expected version, replace claims and append the version atomically. On a partial claim collision, release only the exact fresh claim IDs returned by this attempt, retain pre-existing claims and commercial content, then commit the released reservation history with the refusal audit and settlement. A cleanup-count mismatch or persistence failure instead rolls back the transaction under Foundation’s contract.
@@ -228,9 +228,8 @@ Output: the new version, or a registered refusal
    - (3) a valid explanation: `amendment_reason` present and 1–4096 characters, matching [01 §3.7](../DESIGN.md#contract-01-3-7) `orders_order_version.amendment_reason` (`amendment-reason-invalid`, D-129);
    - (4) no administrative field (`administrative-field-in-amendment`, naming the field and directing the caller to `PATCH /orders/{orderId}`);
    - (5) no commercial-frozen field (`tenant-axis-immutable`);
-   - (6) no payer change that crosses seller scope, as §2.2 defines it (`payer-rebinding-requires-seller`, D-128);
-   - (7) capture's shared structural guards ([01 §3.6](01-foundation.md#contract-01-3-6)): `category-not-admitted`, `currency-mixed`, and `line-cap-exceeded` applied to the complete proposed line set, since an amendment can add lines (the declared cap, baseline 200, [02-capture — Database Schemas and Tables](../DESIGN.md#contract-02-3-7));
-   - (8) the shared date guard (`date-cascade-invalid`, capture §4.2);
+   - (6) capture's shared structural guards ([01 §3.6](01-foundation.md#contract-01-3-6)): `category-not-admitted`, `currency-mixed`, and `line-cap-exceeded` applied to the complete proposed line set, since an amendment can add lines (the declared cap, baseline 200, [02-capture — Database Schemas and Tables](../DESIGN.md#contract-02-3-7));
+   - (7) the shared date guard (`date-cascade-invalid`, capture §4.2);
    - (9) the gate composite owned by [`03-gate-and-pin`](../DESIGN.md#contract-03-1-1), including its pin outcomes.
 
    The engine first applies authorization, idempotency resolution, state-table admissibility and expected-version checking ([01 §4.1](../DESIGN.md#contract-01-4-1)); admissibility is not a slice guard. Thus an amendment from `in_fulfillment` returns `not-admissible` even when the amendment cap is exhausted. An unclassified field fails startup ([02-capture — Field classification (normative)](../DESIGN.md#contract-02-4-3)); there is no runtime refusal for it, so every delta field has a class at runtime. A delta key naming no authored field is rejected at boundary validation with `request-invalid` ([01 §4.7](../DESIGN.md#contract-01-4-7) *Validation flow at the boundary*, D-142), before authorization and before the engine
@@ -391,7 +390,7 @@ administrative change with no `PATCH` audit entry. The caller **MUST** send the 
 **Precedence is the one registration order of §3.6 *Append Amendment* step 1.** Guards refuse
 in **registration order** ([01 §4.1](../DESIGN.md#contract-01-4-1)), after the engine's authorization, idempotency, state and
 expected-version checks: amendment cap, `amendment-empty`, `amendment-reason-invalid`,
-`administrative-field-in-amendment`, `tenant-axis-immutable`, `payer-rebinding-requires-seller`,
+`administrative-field-in-amendment`, `tenant-axis-immutable`,
 capture's shared structural guards (`category-not-admitted`, `currency-mixed`, and
 `line-cap-exceeded` over the complete proposed line set), `date-cascade-invalid`, then the gate
 composite. So where a delta names both an administrative field and a commercial-frozen axis, the
@@ -403,7 +402,7 @@ boundary validation, with `request-invalid` ([01 §4.7](../DESIGN.md#contract-01
 
 **The tenant axes are not uniformly amendable.** `payerTenantId` **MAY** change through an
 amendment **only where the change does not cross seller scope**; a cross-seller payer change
-**MUST** be refused with `payer-rebinding-requires-seller`, because the paired seller rebinding it
+**MUST** be refused (by gate predicate 1 as `payer-relationship-unconfirmed` where the relationship is not confirmed, D-248), because the paired seller rebinding it
 would require is unavailable — see §2.2 *A payer change must not cross seller scope*.
 `resourceTenantId` **MUST NOT** change through any path once the order is `submitted`, and
 `sellerTenantId` through any path once the order is created; an amendment delta naming either

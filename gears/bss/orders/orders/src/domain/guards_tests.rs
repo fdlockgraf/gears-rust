@@ -161,7 +161,6 @@ fn every_row_has_its_contract_guard_order() {
             "versioning.amendment-reason",
             "versioning.no-administrative-field",
             "versioning.no-frozen-field",
-            "versioning.payer-within-seller",
         ],
         structural.to_vec(),
         gate_tail.to_vec(),

@@ -244,7 +244,7 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
             ..
         }
     ));
-    // Nothing earlier fails: the unevaluable input is the outcome, at the payer guard.
+    // Nothing earlier fails: the unevaluable input is the outcome, at the gate composite.
     let d = decide(
         &table,
         &registry,
@@ -260,9 +260,9 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
     assert_eq!(
         d,
         Decision::Unevaluable {
-            guard: "versioning.payer-within-seller",
+            guard: "gate.sellability-composite",
             reason: Reason::IdentityPartyUnavailable,
-            assessment: false
+            assessment: true
         }
     );
     // Engine refusals outrank the unevaluable input too (early-branch precedence).
@@ -320,7 +320,7 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
             t(),
         )
         .unwrap_err(),
-        DecisionError::PrecludedReached("versioning.payer-within-seller")
+        DecisionError::PrecludedReached("gate.sellability-composite")
     );
     // The gate composite's unevaluable input reaches the assessment.
     let pricing_down = resolved(&registry, 4).with(
