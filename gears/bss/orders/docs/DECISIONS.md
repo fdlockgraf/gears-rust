@@ -696,7 +696,7 @@ relationship with the order's `sellerTenantId` ([04 §2.2](DESIGN.md#contract-04
 `resourceTenantId` and `sellerTenantId`. An amendment delta naming either is refused with the new
 `tenant-axis-immutable` reason. `payerTenantId` stays commercial and amendable **within one
 seller's scope**; a payer change that would cross seller scope is **refused** with
-`payer-rebinding-requires-seller` (removed by D-248; gate predicate 1 now checks the payer), not paired with a seller rebinding.
+`payer-rebinding-requires-seller`, not paired with a seller rebinding. Superseded by D-248: the reason is removed and gate predicate 1 refuses `payer-relationship-unconfirmed`.
 
 **Corrected 2026-09-10.** This entry originally said `payerTenantId` was "paired with a seller
 rebinding where the change crosses seller scope" — which the same decision makes impossible, since
