@@ -27,6 +27,50 @@ fn draft(id: u128, line: u128) -> entity::draft_content::Model {
         billing_cycle: Some("month".into()),
     }
 }
+/// D-188: candidates 2-3 are burned, so the committed submit row is version 4, never 2.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn submit_version_is_the_committed_submit_row_not_version_two() -> anyhow::Result<()> {
+    let pg = Pg::new().await?;
+    let (db, _) = pg.role("runtime").await?;
+    create(&db, 1).await?;
+    assert!(
+        repo::children::submit_version(&db.conn()?, &payer(30), u(1))
+            .await?
+            .is_none(),
+        "a draft has no submit row"
+    );
+    db.transaction_ref_mapped(|tx| {
+        Box::pin(async move {
+            let scope = payer(30);
+            let observed = repo::find_order(tx, &scope, u(1)).await?.unwrap();
+            let mut lock = repo::LockedOrder::acquire(tx, &scope, &observed).await?;
+            let mut new = observed.clone();
+            new.version_allocation_high_water = 5;
+            new.current_version = 5;
+            lock.replace(&scope, new).await?;
+            lock.insert_order_version(version(1, 4, Some(1))).await?;
+            let mut amendment = version(1, 5, Some(4));
+            amendment.reason = "amendment".into();
+            amendment.amendment_reason = Some("price correction".into());
+            lock.insert_order_version(amendment).await?;
+            anyhow::Ok(())
+        })
+    })
+    .await?;
+    let found = repo::children::submit_version(&db.conn()?, &payer(30), u(1))
+        .await?
+        .expect("submit row");
+    assert_eq!((found.version, found.reason.as_str()), (4, "submit"));
+    assert_eq!(found.supersedes_version, Some(1));
+    assert!(
+        repo::children::submit_version(&db.conn()?, &payer(31), u(1))
+            .await?
+            .is_none(),
+        "scope hides other payers' orders"
+    );
+    Ok(())
+}
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn current_parent_scope_controls_sparse_history_and_child_inserts() -> anyhow::Result<()> {
