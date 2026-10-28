@@ -1,8 +1,9 @@
 //! Amendment domain rules (04 §3.6 *Append Amendment* steps 1-4, §4.1; Stage 4 DESIGN §3; S4-03).
 //!
 //! Pure and local: the authored delta, its merge onto the committed content of version N, the
-//! facts the five versioning guards decide on, and their predicates bound to the registered
-//! names (`domain::guards`, rows 18-20). Carry-forward is total: every unnamed field and every
+//! facts the seven versioning guards decide on, and their predicates bound to the registered
+//! names (`domain::guards`, rows 18-20). An unknown line or an empty result is a guard fact,
+//! never a merge error: the engine audits and settles both like any refusal (D-252). Carry-forward is total: every unnamed field and every
 //! retained line the delta does not list is N's, byte for byte; retained line ids are stable and
 //! added lines get new ids. The merged [`ProposedVersion`] is shaped as the SDK [`DraftLine`]s
 //! Submit's basket builder already consumes, so the shared gate runs over it unchanged.
@@ -37,10 +38,14 @@ pub const REASON: &str = "versioning.amendment-reason";
 pub const NO_ADMIN: &str = "versioning.no-administrative-field";
 /// Refuses `tenant-axis-immutable` for a delta naming a commercial-frozen axis.
 pub const NO_FROZEN: &str = "versioning.no-frozen-field";
+/// Refuses `line-not-found` for a delta changing or removing a line that is not N's (D-252).
+pub const LINE_MEMBERSHIP: &str = "versioning.amendment-line-membership";
+/// Refuses `no-lines` for a proposed version with no line (D-252; Submit's `gate.has-lines`).
+pub const HAS_LINES: &str = "versioning.amendment-has-lines";
 
 /// The line-membership pseudo-field: adding or removing a line is commercial content
 /// (`AUTHORED_FIELDS`), classified like any named field.
-const MEMBERSHIP: &str = "membership";
+const MEMBERSHIP_FIELD: &str = "membership";
 
 /// One line operation of an amendment delta, by stable line id.
 #[domain_model]
@@ -128,6 +133,9 @@ pub struct ProposedVersion {
     pub header: CommittedHeader,
     /// N's retained lines in N's order, then added lines in delta order.
     pub lines: Vec<ProposedLine>,
+    /// Line ids the delta changes or removes that are not lines of N, in delta order. The
+    /// membership guard refuses them (D-252); nothing in `lines` reflects them.
+    pub unknown_lines: Vec<Uuid>,
 }
 
 impl ProposedVersion {
@@ -139,27 +147,37 @@ impl ProposedVersion {
     }
 }
 
-/// Why a delta cannot be merged onto N.
+/// Why a delta cannot be merged onto N. Neither is a guard refusal (D-252): an unknown line is
+/// a guard fact ([`ProposedVersion::unknown_lines`]), not a merge error.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MergeError {
-    /// A changed or removed line is not a line of N.
-    #[error("line {0} is not a line of the committed version")]
-    LineNotFound(Uuid),
-    /// The delta names one line more than once.
+    /// The delta names one line more than once: a malformed body, refused `request-invalid` at
+    /// boundary validation before authorization and the engine ([`AmendmentDelta::check_well_formed`]).
     #[error("line {0} is named more than once in the delta")]
     LineNamedTwice(Uuid),
+    /// The line-id allocator returned an id of N or one it already returned: an integration
+    /// failure, never a caller's refusal.
+    #[error("allocated line id {0} collides with an existing line")]
+    AllocatedIdCollision(Uuid),
 }
 
-impl MergeError {
-    /// The registered refusal reason, when there is one: `line-not-found` (404). A line named
-    /// twice is a malformed request (`request-invalid` at the boundary).
-    #[must_use]
-    pub fn reason(self) -> Option<Reason> {
-        match self {
-            Self::LineNotFound(_) => Some(Reason::LineNotFound),
-            Self::LineNamedTwice(_) => None,
+impl AmendmentDelta {
+    /// Boundary well-formedness: no line id is named twice. It depends on nothing but the body,
+    /// so the boundary decides it, as it does every other malformed authoring body (D-252).
+    ///
+    /// # Errors
+    /// [`MergeError::LineNamedTwice`].
+    pub fn check_well_formed(&self) -> Result<(), MergeError> {
+        let mut named = BTreeSet::new();
+        for op in &self.lines {
+            if let LineDelta::Change(id, _) | LineDelta::Remove(id) = op
+                && !named.insert(*id)
+            {
+                return Err(MergeError::LineNamedTwice(*id));
+            }
         }
+        Ok(())
     }
 }
 
@@ -171,7 +189,8 @@ pub fn merge(n: &CommittedVersion, delta: &AmendmentDelta) -> Result<ProposedVer
     merge_with(n, delta, Uuid::now_v7)
 }
 
-/// [`merge`] with the caller's line-id allocator.
+/// [`merge`] with the caller's line-id allocator. An allocated id that is one of N's or was
+/// already allocated is refused, never trusted.
 ///
 /// # Errors
 /// [`MergeError`].
@@ -180,19 +199,16 @@ pub fn merge_with(
     delta: &AmendmentDelta,
     mut new_id: impl FnMut() -> Uuid,
 ) -> Result<ProposedVersion, MergeError> {
-    let mut named = BTreeSet::new();
-    for op in &delta.lines {
-        let target = match op {
-            LineDelta::Add(_) => continue,
-            LineDelta::Change(id, _) | LineDelta::Remove(id) => *id,
-        };
-        if !named.insert(target) {
-            return Err(MergeError::LineNamedTwice(target));
-        }
-        if !n.lines.iter().any(|l| l.line_id == target) {
-            return Err(MergeError::LineNotFound(target));
-        }
-    }
+    delta.check_well_formed()?;
+    let unknown_lines = delta
+        .lines
+        .iter()
+        .filter_map(|op| match op {
+            LineDelta::Change(id, _) | LineDelta::Remove(id) => Some(*id),
+            LineDelta::Add(_) => None,
+        })
+        .filter(|id| !n.lines.iter().any(|l| l.line_id == *id))
+        .collect();
     let mut lines = Vec::with_capacity(n.lines.len() + delta.lines.len());
     for carried in &n.lines {
         let op = delta.lines.iter().find(|op| match op {
@@ -205,19 +221,25 @@ pub fn merge_with(
         };
         let origin = match op {
             Some(LineDelta::Remove(_)) => continue,
-            Some(LineDelta::Change(_, patch)) => {
+            // A change naming no field changes nothing: the line is retained.
+            Some(LineDelta::Change(_, patch)) if !patch.named_fields().is_empty() => {
                 apply_line(&mut line, patch);
                 LineOrigin::Changed
             }
-            Some(LineDelta::Add(_)) | None => LineOrigin::Retained,
+            Some(LineDelta::Change(..) | LineDelta::Add(_)) | None => LineOrigin::Retained,
         };
         lines.push(ProposedLine { origin, line });
     }
+    let mut taken: BTreeSet<Uuid> = n.lines.iter().map(|l| l.line_id).collect();
     for op in &delta.lines {
         if let LineDelta::Add(add) = op {
+            let line_id = new_id();
+            if !taken.insert(line_id) {
+                return Err(MergeError::AllocatedIdCollision(line_id));
+            }
             lines.push(ProposedLine {
                 origin: LineOrigin::Added,
-                line: added_line(new_id(), add),
+                line: added_line(line_id, add),
             });
         }
     }
@@ -225,6 +247,7 @@ pub fn merge_with(
         base_version: n.version,
         header: apply_header(n.header, &delta.header),
         lines,
+        unknown_lines,
     })
 }
 
@@ -342,6 +365,11 @@ pub struct UnclassifiedField {
 /// The request facts the versioning guards decide on. The cap is not one of them: its guard
 /// reads the `amendment_count` the engine locked (`GuardSubject::locked`), never a preparation
 /// snapshot (the S4-05 lock rule for line membership).
+///
+/// Line membership and the empty result are prepared facts, yet equivalent to a locked check
+/// (D-252): they are computed against committed version N, whose lines are immutable, and the
+/// engine verifies under the aggregate lock that the order is still at N (a stale `If-Match`
+/// is 412 `precondition-failed`) before any guard runs.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[expect(
@@ -357,16 +385,22 @@ pub struct AmendmentFacts {
     pub names_admin: bool,
     /// The delta names a commercial-frozen field (resource or seller tenant).
     pub names_frozen: bool,
+    /// Line ids the delta changes or removes that are not lines of N (D-252).
+    pub unknown_lines: Vec<Uuid>,
+    /// The proposed version has no line (D-252).
+    pub no_lines: bool,
 }
 
 impl AmendmentFacts {
-    /// Classify every field `delta` names through the shared declaration.
+    /// Classify every field `delta` names through the shared declaration, and take line
+    /// membership and the empty result from `proposed`, the merge of `delta` onto N.
     ///
     /// # Errors
     /// [`UnclassifiedField`] (startup proves none exists).
     pub fn of(
         fields: &FieldClassification,
         delta: &AmendmentDelta,
+        proposed: &ProposedVersion,
         reason: Option<String>,
     ) -> Result<Self, UnclassifiedField> {
         let named = delta
@@ -377,7 +411,7 @@ impl AmendmentFacts {
             .chain(delta.lines.iter().flat_map(|op| {
                 match op {
                     LineDelta::Add(_) | LineDelta::Remove(_) => {
-                        vec![(FieldScope::Line, MEMBERSHIP)]
+                        vec![(FieldScope::Line, MEMBERSHIP_FIELD)]
                     }
                     LineDelta::Change(_, patch) => patch
                         .named_fields()
@@ -391,6 +425,8 @@ impl AmendmentFacts {
             reason,
             names_admin: false,
             names_frozen: false,
+            unknown_lines: proposed.unknown_lines.clone(),
+            no_lines: proposed.lines.is_empty(),
         };
         for (scope, name) in named {
             facts.delta_empty = false;
@@ -412,7 +448,7 @@ impl AmendmentFacts {
         }
     }
 
-    /// Bind the five registered versioning guards of rows 18-20 to these facts. The caller adds
+    /// Bind the seven registered versioning guards of rows 18-20 to these facts. The caller adds
     /// the shared structural and gate bindings.
     #[must_use]
     pub fn bindings(self) -> GuardBindings {
@@ -438,6 +474,11 @@ impl AmendmentFacts {
                 NO_FROZEN,
                 bind(|f| fail_if(f.names_frozen, Reason::TenantAxisImmutable)),
             )
+            .bind(
+                LINE_MEMBERSHIP,
+                bind(|f| fail_if(!f.unknown_lines.is_empty(), Reason::LineNotFound)),
+            )
+            .bind(HAS_LINES, bind(|f| fail_if(f.no_lines, Reason::NoLines)))
     }
 }
 

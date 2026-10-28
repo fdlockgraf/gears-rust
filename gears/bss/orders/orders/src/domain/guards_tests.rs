@@ -161,6 +161,8 @@ fn every_row_has_its_contract_guard_order() {
             "versioning.amendment-reason",
             "versioning.no-administrative-field",
             "versioning.no-frozen-field",
+            "versioning.amendment-line-membership",
+            "versioning.amendment-has-lines",
         ],
         structural.to_vec(),
         gate_tail.to_vec(),
@@ -241,9 +243,12 @@ fn invalid_registrations_fail_startup() {
         compile_with(|d| d[0].rows = &[1, 2]).unwrap_err(),
         GuardRegistryError::CreateGuard("capture.draft-line-membership")
     );
-    // A reason no registration owns: drop the only owner of `no-lines`.
+    // A reason no registration owns: drop both owners of `no-lines` (rows 4 and 18-20).
     assert_eq!(
-        compile_with(|d| d.retain(|g| g.name != "gate.has-lines")).unwrap_err(),
+        compile_with(|d| {
+            d.retain(|g| g.name != "gate.has-lines" && g.name != "versioning.amendment-has-lines");
+        })
+        .unwrap_err(),
         GuardRegistryError::UnownedReason(Reason::NoLines)
     );
     // The composite gate must stay the last guard of its rows.

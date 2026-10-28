@@ -7,9 +7,13 @@ use super::*;
 use crate::domain::contributions::tests::facts;
 use crate::domain::guards::{GUARDS, GuardRegistry};
 use crate::domain::state_table::{RowId, StateTable};
-use crate::domain::transition::{Decision, DraftRevisions, InputState, Inputs, decide};
+use crate::domain::transition::{
+    Decision, DraftRevisions, EngineRefusal, InputState, Inputs, decide,
+};
 use bss_orders_sdk::authoring::{BillingCycle, CalendarDate, Currency, SelectedItem};
 use bss_orders_sdk::catalog::{OrderState as S, Reason, Trigger};
+use bss_orders_sdk::commercial::OrderPin;
+use bss_orders_sdk::reads::CommittedLine;
 use time::OffsetDateTime;
 
 fn id(n: u128) -> Uuid {
@@ -39,6 +43,17 @@ fn line(line_id: Uuid, quantity: &str) -> DraftLine {
         acceptance_due_date: None,
         term_duration: None,
         billing_cycle: Some(BillingCycle::Month),
+    }
+}
+
+/// The SDK's golden schema-2 pin: real committed evidence the merge must never carry.
+fn evidence() -> CommittedLine {
+    CommittedLine {
+        commercial_attempt_id: id(800),
+        order_pin: OrderPin::decode(
+            include_str!("../../../orders-sdk/tests/fixtures/commercial-pin-v2.json").as_bytes(),
+        )
+        .unwrap(),
     }
 }
 
@@ -146,22 +161,36 @@ fn merge_default_allocates_fresh_line_ids() {
 }
 
 #[test]
-fn merge_remove_unknown_line_is_line_not_found() {
+fn merge_records_unknown_lines_as_a_fact_and_changes_nothing_for_them() {
+    // D-252: an unknown line is the membership guard's refusal, never a merge error.
     let n = committed();
     let remove = AmendmentDelta {
         header: HeaderPatch::default(),
-        lines: vec![LineDelta::Remove(id(42))],
+        lines: vec![LineDelta::Remove(id(42)), quantity_change(id(1), "9")],
     };
-    assert_eq!(merge(&n, &remove), Err(MergeError::LineNotFound(id(42))));
+    let proposed = merge(&n, &remove).unwrap();
+    assert_eq!(proposed.unknown_lines, vec![id(42)]);
     assert_eq!(
-        MergeError::LineNotFound(id(42)).reason(),
-        Some(Reason::LineNotFound)
+        proposed
+            .as_draft_lines()
+            .iter()
+            .map(|l| l.line_id)
+            .collect::<Vec<_>>(),
+        vec![id(1), id(2)]
     );
     let change = AmendmentDelta {
         header: HeaderPatch::default(),
-        lines: vec![quantity_change(id(43), "2")],
+        lines: vec![quantity_change(id(43), "2"), LineDelta::Remove(id(44))],
     };
-    assert_eq!(merge(&n, &change), Err(MergeError::LineNotFound(id(43))));
+    let proposed = merge(&n, &change).unwrap();
+    assert_eq!(proposed.unknown_lines, vec![id(43), id(44)]);
+    assert_eq!(proposed.as_draft_lines(), n.lines);
+    assert!(
+        merge(&n, &AmendmentDelta::default())
+            .unwrap()
+            .unknown_lines
+            .is_empty()
+    );
 }
 
 #[test]
@@ -172,7 +201,87 @@ fn merge_refuses_a_line_named_twice() {
         lines: vec![quantity_change(id(1), "2"), LineDelta::Remove(id(1))],
     };
     assert_eq!(merge(&n, &delta), Err(MergeError::LineNamedTwice(id(1))));
-    assert_eq!(MergeError::LineNamedTwice(id(1)).reason(), None);
+    assert_eq!(
+        delta.check_well_formed(),
+        Err(MergeError::LineNamedTwice(id(1)))
+    );
+    // Named twice outranks unknown: the boundary refuses it before any guard runs (D-252).
+    let unknown_twice = AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines: vec![LineDelta::Remove(id(42)), LineDelta::Remove(id(42))],
+    };
+    assert_eq!(
+        merge(&n, &unknown_twice),
+        Err(MergeError::LineNamedTwice(id(42)))
+    );
+    assert_eq!(valid_delta().check_well_formed(), Ok(()));
+}
+
+fn valid_delta() -> AmendmentDelta {
+    AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines: vec![quantity_change(id(1), "2"), LineDelta::Remove(id(2))],
+    }
+}
+
+#[test]
+fn merge_refuses_an_allocated_id_that_collides() {
+    let n = committed();
+    let one_add = AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines: vec![LineDelta::Add(add_line())],
+    };
+    assert_eq!(
+        merge_with(&n, &one_add, || id(2)),
+        Err(MergeError::AllocatedIdCollision(id(2)))
+    );
+    let two_adds = AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines: vec![LineDelta::Add(add_line()), LineDelta::Add(add_line())],
+    };
+    assert_eq!(
+        merge_with(&n, &two_adds, || id(99)),
+        Err(MergeError::AllocatedIdCollision(id(99)))
+    );
+}
+
+#[test]
+fn merge_strips_committed_evidence_from_retained_and_changed_lines() {
+    let mut n = committed();
+    for l in &mut n.lines {
+        l.committed = Some(evidence());
+    }
+    let delta = AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines: vec![quantity_change(id(1), "4")],
+    };
+    let proposed = merge(&n, &delta).unwrap();
+    assert_eq!(proposed.lines[0].origin, LineOrigin::Changed);
+    assert!(proposed.lines[0].line.committed.is_none());
+    assert_eq!(proposed.lines[1].origin, LineOrigin::Retained);
+    assert!(proposed.lines[1].line.committed.is_none());
+    assert_eq!(
+        proposed.lines[1].line,
+        DraftLine {
+            committed: None,
+            ..n.lines[1].clone()
+        },
+        "a retained line is N's authored content without N's evidence"
+    );
+}
+
+#[test]
+fn a_change_naming_no_field_keeps_the_line_retained() {
+    let n = committed();
+    let delta = AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines: vec![LineDelta::Change(id(1), LinePatch::default())],
+    };
+    let proposed = merge(&n, &delta).unwrap();
+    assert_eq!(proposed.lines[0].origin, LineOrigin::Retained);
+    assert_eq!(proposed.lines[0].line, n.lines[0]);
+    // It is still no delta for the nonempty guard.
+    assert!(classify(&delta, Some("r")).delta_empty);
 }
 
 #[test]
@@ -196,9 +305,8 @@ fn merge_never_drops_a_line_absent_from_the_delta() {
 }
 
 #[test]
-fn merge_applies_commercial_header_fields_and_strips_committed_evidence() {
-    let mut n = committed();
-    n.lines[0].committed = None;
+fn merge_applies_commercial_header_fields() {
+    let n = committed();
     let delta = AmendmentDelta {
         header: HeaderPatch {
             payer_tenant_id: Some(id(31)),
@@ -212,7 +320,6 @@ fn merge_applies_commercial_header_fields_and_strips_committed_evidence() {
     assert_eq!(proposed.header.contract_id, Some(id(700)));
     assert_eq!(proposed.header.resource_tenant_id, id(10));
     assert_eq!(proposed.header.seller_tenant_id, id(20));
-    assert!(proposed.lines.iter().all(|l| l.line.committed.is_none()));
 
     let cleared = AmendmentDelta {
         header: HeaderPatch {
@@ -245,9 +352,11 @@ fn merge_never_applies_a_frozen_axis() {
 
 // --- Facts from the shared classifier ---------------------------------------------------------
 
+/// Facts of `delta` merged onto [`committed`] (lines 1 and 2).
 fn classify(delta: &AmendmentDelta, reason: Option<&str>) -> AmendmentFacts {
     let fields = FieldClassification::registered().unwrap();
-    AmendmentFacts::of(&fields, delta, reason.map(str::to_owned)).unwrap()
+    let proposed = merge(&committed(), delta).unwrap();
+    AmendmentFacts::of(&fields, delta, &proposed, reason.map(str::to_owned)).unwrap()
 }
 
 fn header_delta(patch: HeaderPatch) -> AmendmentDelta {
@@ -356,12 +465,29 @@ fn facts_classify_every_named_field_with_the_shared_declaration() {
 /// guard of the row bound to a passing stub (labelled double: the structural and gate guards are
 /// the existing bindings' responsibility).
 fn run(amendment: AmendmentFacts, amendment_count: i32) -> Option<Reason> {
+    outcome(S::Submitted, amendment, amendment_count).unwrap()
+}
+
+/// [`run`] from any state: an engine refusal is `Err`.
+fn outcome(
+    state: S,
+    amendment: AmendmentFacts,
+    amendment_count: i32,
+) -> Result<Option<Reason>, EngineRefusal> {
     let table = StateTable::registered().unwrap();
     let registry = GuardRegistry::registered(&table).unwrap();
-    let mut locked = facts(S::Submitted);
+    let mut locked = facts(state);
     locked.amendment_count = amendment_count;
     let mut bindings = amendment.bindings();
-    let ours = [CAP, NONEMPTY, REASON, NO_ADMIN, NO_FROZEN];
+    let ours = [
+        CAP,
+        NONEMPTY,
+        REASON,
+        NO_ADMIN,
+        NO_FROZEN,
+        LINE_MEMBERSHIP,
+        HAS_LINES,
+    ];
     for guard in GUARDS.iter().filter(|g| g.rows.contains(&18)) {
         if !ours.contains(&guard.name) {
             bindings = bindings.bind(guard.name, |_: &GuardSubject<'_>| GuardVerdict::Pass);
@@ -386,9 +512,10 @@ fn run(amendment: AmendmentFacts, amendment_count: i32) -> Option<Reason> {
     match decision {
         Decision::Admitted(row) => {
             assert_eq!(row.id, RowId::of(18));
-            None
+            Ok(None)
         }
-        Decision::Guard { reason, .. } => Some(reason),
+        Decision::Guard { reason, .. } => Ok(Some(reason)),
+        Decision::Engine(refusal) => Err(refusal),
         other => panic!("{other:?}"),
     }
 }
@@ -399,6 +526,20 @@ fn ok() -> AmendmentFacts {
         reason: Some("price correction".into()),
         names_admin: false,
         names_frozen: false,
+        unknown_lines: vec![],
+        no_lines: false,
+    }
+}
+
+/// Every versioning fact failing at once.
+fn worst() -> AmendmentFacts {
+    AmendmentFacts {
+        delta_empty: true,
+        reason: None,
+        names_admin: true,
+        names_frozen: true,
+        unknown_lines: vec![id(42)],
+        no_lines: true,
     }
 }
 
@@ -411,43 +552,62 @@ fn guard_names_are_the_registered_row_18_to_20_order() {
             .row_guards(RowId::of(row))
             .iter()
             .map(|g| g.name)
-            .take(5)
+            .take(7)
             .collect();
-        assert_eq!(names, vec![CAP, NONEMPTY, REASON, NO_ADMIN, NO_FROZEN]);
+        assert_eq!(
+            names,
+            vec![
+                CAP,
+                NONEMPTY,
+                REASON,
+                NO_ADMIN,
+                NO_FROZEN,
+                LINE_MEMBERSHIP,
+                HAS_LINES
+            ]
+        );
     }
 }
 
 #[test]
 fn row_18_refuses_in_contract_order() {
-    let worst = AmendmentFacts {
-        delta_empty: true,
-        reason: None,
-        names_admin: true,
-        names_frozen: true,
-    };
     assert_eq!(
-        run(worst.clone(), AMENDMENT_CAP),
+        run(worst(), AMENDMENT_CAP),
         Some(Reason::AmendmentCapExhausted)
     );
-    assert_eq!(run(worst, AMENDMENT_CAP - 1), Some(Reason::AmendmentEmpty));
+    assert_eq!(
+        run(worst(), AMENDMENT_CAP - 1),
+        Some(Reason::AmendmentEmpty)
+    );
     let bad_reason = AmendmentFacts {
         delta_empty: false,
-        reason: None,
-        names_admin: true,
-        names_frozen: true,
+        ..worst()
     };
     assert_eq!(run(bad_reason, 0), Some(Reason::AmendmentReasonInvalid));
     let admin = AmendmentFacts {
-        names_admin: true,
-        names_frozen: true,
-        ..ok()
+        delta_empty: false,
+        reason: Some("r".into()),
+        ..worst()
     };
     assert_eq!(run(admin, 0), Some(Reason::AdministrativeFieldInAmendment));
     let frozen = AmendmentFacts {
         names_frozen: true,
+        unknown_lines: vec![id(42)],
+        no_lines: true,
         ..ok()
     };
     assert_eq!(run(frozen, 0), Some(Reason::TenantAxisImmutable));
+    let unknown = AmendmentFacts {
+        unknown_lines: vec![id(42)],
+        no_lines: true,
+        ..ok()
+    };
+    assert_eq!(run(unknown, 0), Some(Reason::LineNotFound));
+    let empty = AmendmentFacts {
+        no_lines: true,
+        ..ok()
+    };
+    assert_eq!(run(empty, 0), Some(Reason::NoLines));
     assert_eq!(run(ok(), AMENDMENT_CAP - 1), None);
     assert_eq!(
         run(ok(), AMENDMENT_CAP + 3),
@@ -484,7 +644,9 @@ fn amendment_reason_is_one_to_4096_characters() {
 fn mixed_admin_and_frozen_and_payer_deltas_through_the_guards() {
     let fields = FieldClassification::registered().unwrap();
     let facts_of = |patch: HeaderPatch| {
-        AmendmentFacts::of(&fields, &header_delta(patch), Some("why".into())).unwrap()
+        let delta = header_delta(patch);
+        let proposed = merge(&committed(), &delta).unwrap();
+        AmendmentFacts::of(&fields, &delta, &proposed, Some("why".into())).unwrap()
     };
     let mixed = facts_of(HeaderPatch {
         category: Some(Category::NewSale),
@@ -508,4 +670,65 @@ fn mixed_admin_and_frozen_and_payer_deltas_through_the_guards() {
         ..HeaderPatch::default()
     });
     assert_eq!(run(payer, 0), None);
+}
+
+#[test]
+fn an_inadmissible_state_refuses_before_the_cap() {
+    // 04 §3.1 step 2: admissibility is the engine's, ahead of every slice guard.
+    for state in [S::Draft, S::InFulfillment] {
+        assert!(matches!(
+            outcome(state, worst(), AMENDMENT_CAP),
+            Err(EngineRefusal::NotAdmissible {
+                trigger: Trigger::Amendment,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn row_18_refuses_unknown_lines_and_an_empty_result_from_real_deltas() {
+    let delta = |lines| AmendmentDelta {
+        header: HeaderPatch::default(),
+        lines,
+    };
+    // Removing every line of N leaves no line: `no-lines` (D-252 (a)).
+    let all_removed = classify(
+        &delta(vec![LineDelta::Remove(id(1)), LineDelta::Remove(id(2))]),
+        Some("r"),
+    );
+    assert!(all_removed.no_lines && all_removed.unknown_lines.is_empty());
+    assert_eq!(run(all_removed, 0), Some(Reason::NoLines));
+    // Removing all and adding one is a proposed version with a line.
+    let replaced = classify(
+        &delta(vec![
+            LineDelta::Remove(id(1)),
+            LineDelta::Remove(id(2)),
+            LineDelta::Add(add_line()),
+        ]),
+        Some("r"),
+    );
+    assert_eq!(run(replaced, 0), None);
+    // Removing or changing a line that is not N's: `line-not-found` (D-252 (b)).
+    let removed_unknown = classify(&delta(vec![LineDelta::Remove(id(42))]), Some("r"));
+    assert_eq!(removed_unknown.unknown_lines, vec![id(42)]);
+    assert_eq!(run(removed_unknown, 0), Some(Reason::LineNotFound));
+    let changed_unknown = classify(&delta(vec![quantity_change(id(43), "2")]), Some("r"));
+    assert_eq!(run(changed_unknown.clone(), 0), Some(Reason::LineNotFound));
+    // The cap outranks an unknown line.
+    assert_eq!(
+        run(changed_unknown, AMENDMENT_CAP),
+        Some(Reason::AmendmentCapExhausted)
+    );
+    // An unknown line outranks an empty result.
+    let both = classify(
+        &delta(vec![
+            LineDelta::Remove(id(1)),
+            LineDelta::Remove(id(2)),
+            LineDelta::Remove(id(42)),
+        ]),
+        Some("r"),
+    );
+    assert!(both.no_lines);
+    assert_eq!(run(both, 0), Some(Reason::LineNotFound));
 }

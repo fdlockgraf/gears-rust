@@ -160,6 +160,22 @@ pub const GUARDS: &[GuardDecl] = &[
         reasons: &["tenant-axis-immutable"],
         inputs: &[],
     },
+    // Line membership, then at least one proposed line, after the request-shape guards and
+    // before the shared structural guards (D-252). Row 4's `gate.has-lines` keeps its place.
+    GuardDecl {
+        name: "versioning.amendment-line-membership",
+        owner: "S4-01",
+        rows: AMEND,
+        reasons: &["line-not-found"],
+        inputs: &[],
+    },
+    GuardDecl {
+        name: "versioning.amendment-has-lines",
+        owner: "S4-01",
+        rows: AMEND,
+        reasons: &["no-lines"],
+        inputs: &[],
+    },
     // Shared structural guards, registered once and reused (Foundation step 19).
     GuardDecl {
         name: capture::CATEGORY,
