@@ -25,6 +25,9 @@ use super::audit::validate_caller_reason;
 use super::contributions::{FieldClass, FieldClassification, FieldScope};
 use super::transition::{GuardBindings, GuardSubject, GuardVerdict};
 
+/// One request-fact guard predicate over [`AmendmentFacts`].
+type FactCheck = fn(&AmendmentFacts) -> GuardVerdict;
+
 /// The amendment cap: baseline 20 amendments per order, never unlimited (04 §4.1).
 pub const AMENDMENT_CAP: i32 = 20;
 
@@ -469,37 +472,51 @@ impl AmendmentFacts {
         }
     }
 
+    /// The six request-fact guards after the cap, in registration order (the one table both
+    /// [`Self::bindings`] and [`Self::first_failure`] read).
+    const CHECKS: [(&'static str, FactCheck); 6] = [
+        (NONEMPTY, |f| fail_if(f.delta_empty, Reason::AmendmentEmpty)),
+        (REASON, Self::reason_verdict),
+        (NO_ADMIN, |f| {
+            fail_if(f.names_admin, Reason::AdministrativeFieldInAmendment)
+        }),
+        (NO_FROZEN, |f| {
+            fail_if(f.names_frozen, Reason::TenantAxisImmutable)
+        }),
+        (LINE_MEMBERSHIP, |f| {
+            fail_if(!f.unknown_lines.is_empty(), Reason::LineNotFound)
+        }),
+        (HAS_LINES, |f| fail_if(f.no_lines, Reason::NoLines)),
+    ];
+
+    /// The reason the seven versioning guards would refuse with over `amendment_count`, in
+    /// registration order, or `None` when all pass. The amendment service reads it before any
+    /// external call to preclude the gate (04 §3.6 step 2, D-113); the engine still decides on
+    /// the locked count.
+    #[must_use]
+    pub fn first_failure(&self, amendment_count: i32) -> Option<Reason> {
+        std::iter::once(cap_verdict(amendment_count))
+            .chain(Self::CHECKS.iter().map(|(_, check)| check(self)))
+            .find_map(|verdict| match verdict {
+                GuardVerdict::Fail(reason) => Some(reason),
+                GuardVerdict::Pass => None,
+            })
+    }
+
     /// Bind the seven registered versioning guards of rows 18-20 to these facts. The caller adds
     /// the shared structural and gate bindings.
     #[must_use]
     pub fn bindings(self) -> GuardBindings {
         let facts = Arc::new(self);
-        let bind = |f: fn(&Self) -> GuardVerdict| {
-            let facts = Arc::clone(&facts);
-            move |_: &GuardSubject<'_>| f(&facts)
-        };
-        GuardBindings::new()
-            .bind(CAP, |subject: &GuardSubject<'_>| {
+        Self::CHECKS.iter().fold(
+            GuardBindings::new().bind(CAP, |subject: &GuardSubject<'_>| {
                 cap_verdict(subject.locked.amendment_count)
-            })
-            .bind(
-                NONEMPTY,
-                bind(|f| fail_if(f.delta_empty, Reason::AmendmentEmpty)),
-            )
-            .bind(REASON, bind(Self::reason_verdict))
-            .bind(
-                NO_ADMIN,
-                bind(|f| fail_if(f.names_admin, Reason::AdministrativeFieldInAmendment)),
-            )
-            .bind(
-                NO_FROZEN,
-                bind(|f| fail_if(f.names_frozen, Reason::TenantAxisImmutable)),
-            )
-            .bind(
-                LINE_MEMBERSHIP,
-                bind(|f| fail_if(!f.unknown_lines.is_empty(), Reason::LineNotFound)),
-            )
-            .bind(HAS_LINES, bind(|f| fail_if(f.no_lines, Reason::NoLines)))
+            }),
+            |bindings, &(name, check)| {
+                let facts = Arc::clone(&facts);
+                bindings.bind(name, move |_: &GuardSubject<'_>| check(&facts))
+            },
+        )
     }
 }
 

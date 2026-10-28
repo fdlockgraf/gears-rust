@@ -732,3 +732,48 @@ fn row_18_refuses_unknown_lines_and_an_empty_result_from_real_deltas() {
     assert!(both.no_lines);
     assert_eq!(run(both, 0), Some(Reason::LineNotFound));
 }
+
+/// The service's pre-call check (04 §3.6 step 2, D-113) is the engine's decision: for every
+/// combination of failing facts and counts, `first_failure` names what `decide` refuses with.
+#[test]
+fn first_failure_is_the_engine_decision_over_the_same_facts() {
+    let cases = [
+        worst(),
+        ok(),
+        AmendmentFacts {
+            delta_empty: false,
+            ..worst()
+        },
+        AmendmentFacts {
+            names_admin: true,
+            names_frozen: true,
+            ..ok()
+        },
+        AmendmentFacts {
+            names_frozen: true,
+            ..ok()
+        },
+        AmendmentFacts {
+            unknown_lines: vec![id(42)],
+            no_lines: true,
+            ..ok()
+        },
+        AmendmentFacts {
+            no_lines: true,
+            ..ok()
+        },
+        AmendmentFacts {
+            reason: None,
+            ..ok()
+        },
+    ];
+    for facts in cases {
+        for count in [0, AMENDMENT_CAP - 1, AMENDMENT_CAP, AMENDMENT_CAP + 1] {
+            assert_eq!(
+                facts.first_failure(count),
+                run(facts.clone(), count),
+                "{facts:?} at {count}"
+            );
+        }
+    }
+}

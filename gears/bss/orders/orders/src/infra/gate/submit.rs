@@ -70,14 +70,14 @@ use super::authority::{AuthorityError, CommercialAuthority};
 use super::budget::{ACCEPTANCE_DEADLINE, AcceptanceBudget, CallError};
 use super::commercial::FrozenLineInputs;
 use super::commit::{
-    BINDING_ADMISSION, DATE_BASIS, HAS_LINES, SubmitPreparation, row_inputs_resolved,
+    BINDING_ADMISSION, DATE_BASIS, HAS_LINES, ReservedAttempt, SUBMIT_ROW, Structural,
+    SubmitPreparation, row_inputs, row_inputs_resolved,
 };
 use super::failure::{Ids, submit_integration};
 use super::orchestrate::{OrchestrateError, Orchestrator, Resolved};
 use super::preview::{PreviewDates, gate_line};
 use super::writer::GateRun;
 use crate::authz::Caller;
-use crate::domain::capture::{self, category_verdict, currency_verdict, line_cap_verdict};
 use crate::domain::contributions::AggregateContribution;
 use crate::domain::dates::{DateBasis, SuppliedDates};
 use crate::domain::gate::assess::BasketLine;
@@ -104,7 +104,7 @@ use crate::infra::throttle::{PerCallerLimiter, Rejection, rejection_error};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bss_orders_sdk::OrdersError;
-use bss_orders_sdk::authoring::{DraftLine, OrderView};
+use bss_orders_sdk::authoring::DraftLine;
 use bss_orders_sdk::catalog::{Reason, Trigger};
 use bss_orders_sdk::gate_report::GateReport;
 use bss_orders_sdk::models::{CallMeta, DraftRevision};
@@ -319,10 +319,7 @@ impl SubmitService {
         // no longer a draft (a new key on a committed order) is the engine's settled
         // `not-admissible`, decided from the state table before any guard or port call.
         let Some(view) = self.reads.get_draft(caller, order_id).await? else {
-            let preparation = RefusalPreparation {
-                gate: RefusalGate::NotRun,
-                line_cap: self.line_cap,
-            };
+            let preparation = RefusalPreparation::draft(RefusalGate::NotRun, self.line_cap);
             let outcome = engine.transition(caller, request, &preparation).await?;
             return Ok(Settled::from_outcome(outcome));
         };
@@ -330,10 +327,7 @@ impl SubmitService {
         // draft likewise makes no port call: the engine's `gate.has-lines` guard settles
         // `no-lines` (the other guards still evaluate over the locked snapshot).
         if view.draft_revision != Some(expected_draft_revision) || view.lines.is_empty() {
-            let preparation = RefusalPreparation {
-                gate: RefusalGate::NotRun,
-                line_cap: self.line_cap,
-            };
+            let preparation = RefusalPreparation::draft(RefusalGate::NotRun, self.line_cap);
             let outcome = engine.transition(caller, request, &preparation).await?;
             return Ok(Settled::from_outcome(outcome));
         }
@@ -343,21 +337,83 @@ impl SubmitService {
         if consumed_item_capacity(view.lines.iter().map(|line| line.selected_items.len()))
             != GuardVerdict::Pass
         {
-            let preparation = RefusalPreparation {
-                gate: RefusalGate::Capacity,
-                line_cap: self.line_cap,
-            };
+            let preparation = RefusalPreparation::draft(RefusalGate::Capacity, self.line_cap);
             let outcome = engine.transition(caller, request, &preparation).await?;
             return Ok(Settled::from_outcome(outcome));
         }
 
         // 6. The frozen date basis, then one gate run.
-        let axes = TenantAxes {
-            resource: view.order.resource_tenant_id,
-            payer: view.order.payer_tenant_id,
-            seller: view.order.seller_tenant_id,
+        let subject = Assessing {
+            order_id,
+            axes: TenantAxes {
+                resource: view.order.resource_tenant_id,
+                payer: view.order.payer_tenant_id,
+                seller: view.order.seller_tenant_id,
+            },
+            contract_id: view.order.contract_id,
+            lines: &view.lines,
+            target: GateTarget::Submit { order_id },
         };
-        let supplied = view
+        let assessed = self.assess(caller, &subject, meta, cancel).await?;
+
+        // 7. A business refusal settles through the engine without reserving anything.
+        if let Some(gate) = assessed.refusal(&subject)? {
+            let preparation = RefusalPreparation::draft(gate, self.line_cap);
+            let outcome = engine.transition(caller, request, &preparation).await?;
+            return Ok(Settled::from_outcome(outcome));
+        }
+
+        // 8. Freeze the attempt inputs and reserve the candidate.
+        let reserved = Box::pin(self.reserve(
+            caller,
+            &engine,
+            &request,
+            &subject,
+            assessed,
+            Reservation {
+                prepared_draft_revision: view.draft_revision.map(i64::from),
+                current_version: i32::from(view.version.version),
+                correlation_id: meta.correlation_id,
+            },
+        ))
+        .await?;
+        match reserved {
+            PreparedExecution::Settled(outcome) => Ok(Settled::from_outcome(*outcome)),
+            PreparedExecution::Execution(execution) => {
+                let (execution, frozen) = *execution;
+                self.continue_attempt(caller, &engine, request, &execution, frozen, cancel)
+                    .await
+            }
+        }
+    }
+
+    /// The engine slot the service transitions through.
+    pub(crate) fn engine(&self) -> Result<Arc<Engine>, OrdersError> {
+        self.engine.load_full().ok_or(OrdersError::Unavailable)
+    }
+
+    /// The authorized reads the service composes its input from.
+    pub(crate) fn reads(&self) -> &ReadService {
+        &self.reads
+    }
+
+    /// The configured line cap.
+    pub(crate) fn line_cap(&self) -> usize {
+        self.line_cap
+    }
+
+    /// Step 6 (module doc): the frozen date basis for `subject`'s resource tenant, then one
+    /// orchestrated gate run over every line of `subject` (one batched call per port) on the
+    /// basis' proposed date. Shared by submit and amendment (04 §3.6 step 5).
+    pub(crate) async fn assess(
+        &self,
+        caller: &Caller,
+        subject: &Assessing<'_>,
+        meta: &CallMeta,
+        cancel: &CancellationToken,
+    ) -> Result<Assessed, OrdersError> {
+        let axes = subject.axes;
+        let supplied = subject
             .lines
             .iter()
             .map(|l| (l.line_id, supplied(l)))
@@ -369,7 +425,7 @@ impl SubmitService {
             .map_err(|error| {
                 tracing::warn!(
                     target: "orders.gate.submit",
-                    order_id = %order_id,
+                    order_id = %subject.order_id,
                     correlation_id = ?meta.correlation_id,
                     error = %error,
                     "bss-orders: submit date basis could not be prepared"
@@ -377,15 +433,13 @@ impl SubmitService {
                 OrdersError::Unavailable
             })?;
         let run_id = Uuid::now_v7();
-        let basket = basket(run_id, order_id, axes, &view, &basis);
+        let basket = basket(run_id, subject, &basis);
         let resolved = self
             .orchestrator
             .run(caller.ctx(), &basket, cancel)
             .await
-            .map_err(|error| run_failure(order_id, &error))?;
-        let evaluated_at = basket.assessed_at;
-        let assessment = &resolved.assessment;
-        let report = assessment.report(run_id);
+            .map_err(|error| run_failure(subject.order_id, &error))?;
+        let report = resolved.assessment.report(run_id);
         let diagnostics = Arc::new(GateRun {
             overlap_keys: resolved
                 .keys
@@ -402,55 +456,61 @@ impl SubmitService {
             seller_tenant_id: axes.seller,
             payer_tenant_id: axes.payer,
             correlation_id: meta.correlation_id,
-            evaluated_at,
-            vector: assessment.vector.clone(),
+            evaluated_at: basket.assessed_at,
+            vector: resolved.assessment.vector.clone(),
         });
-        let basis = Arc::new(basis);
+        Ok(Assessed {
+            run_id,
+            basket,
+            resolved,
+            report,
+            diagnostics,
+            basis: Arc::new(basis),
+        })
+    }
 
-        // 7. A business refusal settles through the engine without reserving anything.
-        let line_ids: Vec<Uuid> = view.lines.iter().map(|l| l.line_id).collect();
-        if let Some(gate) = refusal_gate(
-            order_id,
-            &resolved,
-            &line_ids,
-            &report,
-            &diagnostics,
-            &basis,
-        )? {
-            let preparation = RefusalPreparation {
-                gate,
-                line_cap: self.line_cap,
-            };
-            let outcome = engine.transition(caller, request, &preparation).await?;
-            return Ok(Settled::from_outcome(outcome));
-        }
-
-        // 8. Freeze the attempt inputs and reserve the candidate.
-        let policy = resolved.policy.as_ref().ok_or_else(|| {
-            integration(
-                Ids::order(order_id),
-                "a passing run without an acceptance policy",
-            )
-        })?;
-        let evaluation = resolved.evaluation.clone().ok_or_else(|| {
-            integration(Ids::order(order_id), "a passing run without an evaluation")
-        })?;
+    /// Step 8 (module doc): freeze a passing run's attempt inputs and reserve the candidate.
+    /// The line requests are proven buildable before the reservation; only the order version,
+    /// which every positive candidate encodes alike, differs from the requests it freezes.
+    pub(crate) async fn reserve(
+        &self,
+        caller: &Caller,
+        engine: &Engine,
+        request: &TransitionRequest,
+        subject: &Assessing<'_>,
+        assessed: Assessed,
+        reservation: Reservation,
+    ) -> Result<PreparedExecution, OrdersError> {
+        let Assessed {
+            run_id,
+            basket,
+            resolved,
+            report,
+            basis,
+            ..
+        } = assessed;
+        let ids = Ids::order(subject.order_id);
+        let policy = resolved
+            .policy
+            .as_ref()
+            .ok_or_else(|| integration(ids, "a passing run without an acceptance policy"))?;
+        let evaluation = resolved
+            .evaluation
+            .clone()
+            .ok_or_else(|| integration(ids, "a passing run without an evaluation"))?;
         let evaluation_request = resolved.evaluation_request.clone().ok_or_else(|| {
-            integration(
-                Ids::order(order_id),
-                "a passing run without the actual evaluation request",
-            )
+            integration(ids, "a passing run without the actual evaluation request")
         })?;
         // S4-08a (D-251): a passing run resolved the order contract (`orders.contract-active`
         // passes only over an answered, active contract), so its requirement is known.
-        let contract_acceptance_required = match view.order.contract_id {
+        let contract_acceptance_required = match subject.contract_id {
             Some(contract) => {
                 resolved
                     .contracts
                     .get(&contract)
                     .ok_or_else(|| {
                         integration(
-                            Ids::order(order_id),
+                            Ids::order(subject.order_id),
                             "a passing run without its order contract's facts",
                         )
                     })?
@@ -460,32 +520,36 @@ impl SubmitService {
         };
         let order = FrozenOrder {
             assessment_id: run_id,
-            assessed_at: evaluated_at,
+            assessed_at: basket.assessed_at,
             resolve_date: basket.resolve_date,
             evaluation_request: Some(evaluation_request),
             evaluation,
             report,
-            correlation_id: meta.correlation_id,
-            vector: assessment.vector.clone(),
+            correlation_id: reservation.correlation_id,
+            vector: resolved.assessment.vector.clone(),
             contract_acceptance_required,
         };
         let frozen = FrozenLineInputs::capture(
-            order_id,
-            axes,
+            subject.order_id,
+            subject.axes,
             &basket.lines,
             &resolved,
             &basis,
             policy,
             order,
         );
-        // Proven buildable before the reservation; only the order version, which every positive
-        // candidate encodes alike, differs from the requests the reservation freezes.
-        let probe = i32::from(view.version.version).saturating_add(1);
+        let probe = reservation.current_version.saturating_add(1);
         frozen
             .line_requests(probe)
             .map_err(|error| commercial_failure(&error))?;
         let inputs = self
-            .attempt_inputs(caller, order_id, axes, &view, &basis)
+            .attempt_inputs(
+                caller,
+                subject.order_id,
+                subject.axes,
+                reservation.prepared_draft_revision,
+                &basis,
+            )
             .await?;
         let lines = move |candidate| {
             frozen.line_requests(candidate).map_err(|error| {
@@ -493,17 +557,9 @@ impl SubmitService {
                 PrepareError::Integration
             })
         };
-        match engine
-            .prepare_commercial_attempt(caller, &request, inputs, lines)
-            .await?
-        {
-            PreparedExecution::Settled(outcome) => Ok(Settled::from_outcome(*outcome)),
-            PreparedExecution::Execution(execution) => {
-                let (execution, frozen) = *execution;
-                self.continue_attempt(caller, &engine, request, &execution, frozen, cancel)
-                    .await
-            }
-        }
+        Ok(engine
+            .prepare_commercial_attempt(caller, request, inputs, lines)
+            .await?)
     }
 
     /// Phases B and C of a reserved or recovered attempt (module doc, steps 9–10): both read
@@ -517,10 +573,41 @@ impl SubmitService {
         frozen: Frozen,
         cancel: &CancellationToken,
     ) -> Result<Settled, OrdersError> {
+        let policy = self.policy.clone();
+        self.continue_with(
+            caller,
+            engine,
+            request,
+            execution,
+            frozen,
+            cancel,
+            |reserved| Ok(SubmitPreparation { reserved, policy }),
+        )
+        .await
+    }
+
+    /// Phase B, then phase C through the commit preparation `commit` builds from the reserved
+    /// attempt (submit's [`SubmitPreparation`], an amendment's own). Shared by submit and
+    /// amendment.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "both phases read the caller, the engine, the request, the owner, the frozen \
+                  attempt, the cancellation and the row's commit preparation"
+    )]
+    pub(crate) async fn continue_with<P: Preparation>(
+        &self,
+        caller: &Caller,
+        engine: &Engine,
+        request: TransitionRequest,
+        execution: &DurableExecution,
+        frozen: Frozen,
+        cancel: &CancellationToken,
+        commit: impl FnOnce(ReservedAttempt) -> Result<P, OrdersError>,
+    ) -> Result<Settled, OrdersError> {
         let Frozen::Commercial(attempt) = frozen else {
             return Err(integration(
                 Ids::order(request.order_id),
-                "a submit key linked to a receiver control",
+                "a commercial key linked to a receiver control",
             ));
         };
         let ids = Ids::attempt(attempt.order_id, attempt.attempt_id);
@@ -535,14 +622,7 @@ impl SubmitService {
             caller, engine, &request, execution, &attempt, &requests, cancel,
         )
         .await?;
-        let preparation = SubmitPreparation {
-            attempt_id: attempt.attempt_id,
-            candidate_version: attempt.candidate_version,
-            line_requests: attempt.line_requests.clone(),
-            requests,
-            line_cap: self.line_cap,
-            policy: self.policy.clone(),
-        };
+        let preparation = commit(ReservedAttempt::of(&attempt, requests, self.line_cap))?;
         let outcome = engine
             .transition(
                 caller,
@@ -700,7 +780,7 @@ impl SubmitService {
         caller: &Caller,
         order_id: Uuid,
         axes: TenantAxes,
-        view: &OrderView,
+        prepared_draft_revision: Option<i64>,
         basis: &DateBasis,
     ) -> Result<AttemptInputs, OrdersError> {
         let ctx = caller.ctx();
@@ -726,7 +806,7 @@ impl SubmitService {
         let authorization_fact_fingerprint = authorization_fact_fingerprint(order_id, &facts)
             .map_err(|_| integration(Ids::order(order_id), "the authorization-fact fingerprint"))?;
         Ok(AttemptInputs {
-            prepared_draft_revision: view.draft_revision.map(i64::from),
+            prepared_draft_revision,
             proposed_arrangement: json!({
                 "resource_tenant_id": axes.resource,
                 "seller_tenant_id": axes.seller,
@@ -747,95 +827,131 @@ impl SubmitService {
     }
 }
 
-/// Step 7 (module doc): the refusal a run decides before any reservation. `None` when the run
-/// passed, the draft has lines and the evaluation can be stored as submit totals.
-fn refusal_gate(
-    order_id: Uuid,
-    resolved: &Resolved,
-    lines: &[Uuid],
-    report: &GateReport,
-    diagnostics: &Arc<GateRun>,
-    basis: &Arc<DateBasis>,
-) -> Result<Option<RefusalGate>, OrdersError> {
-    let assessment = &resolved.assessment;
-    let storable = match (&assessment.primary, &resolved.evaluation) {
-        (Some(_), _) => None,
-        _ if lines.is_empty() => None,
-        (None, Some(evaluation)) => {
-            let market = resolved.market.as_ref().ok_or_else(|| {
-                integration(Ids::order(order_id), "a passing run without a market")
-            })?;
-            match total_rows(evaluation, lines, &market.currency) {
-                Ok(_) => Some(true),
-                Err(error) if error.is_contract_defect() => {
-                    return Err(integration_with(
-                        Ids::order(order_id),
-                        "the evaluation is not in the market currency (D-216)",
-                        &error,
-                    ));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "orders.gate.submit",
-                        order_id = %order_id,
-                        error = %error,
-                        "bss-orders: the evaluation cannot be stored as submit totals"
-                    );
-                    Some(false)
-                }
-            }
-        }
-        (None, None) => Some(false),
-    };
-    if storable == Some(true) {
-        return Ok(None);
-    }
-    let primary = match &assessment.primary {
-        Some(outcome) => Some(outcome.reason.ok_or_else(|| {
-            integration(Ids::order(order_id), "a blocking outcome without a reason")
-        })?),
-        None => None,
-    };
-    let mut inputs = assessment.inputs.clone();
-    if storable == Some(false) {
-        // D-216: the passing run's evaluation has no storable form (a non-terminating
-        // fraction, a display finer than the currency scale, a missing declaration), so the
-        // evaluation input is unusable for submit.
-        tracing::warn!(
-            target: "orders.gate.submit",
-            "bss-orders: the evaluation cannot be stored as submit totals; refused \
-             evaluation-unavailable before reserving"
-        );
-        inputs = inputs.with(
-            InputPort::Evaluation,
-            InputState::Unresolvable(Reason::EvaluationUnavailable),
-        );
-    }
-    Ok(Some(RefusalGate::Assessed {
-        inputs,
-        primary,
-        report: report.clone(),
-        diagnostics: Arc::clone(diagnostics),
-        basis: Arc::clone(basis),
-    }))
+/// The commercial subject one gate run assesses: the order, its axes and contract, every line
+/// (submit: the working draft; amendment: the proposed version) and the gate target.
+pub struct Assessing<'a> {
+    /// The order.
+    pub order_id: Uuid,
+    /// The tenant axes the run is assessed under (an amendment's proposed payer included).
+    pub axes: TenantAxes,
+    /// The governing contract, if any.
+    pub contract_id: Option<Uuid>,
+    /// Every line, in read order.
+    pub lines: &'a [DraftLine],
+    /// The gate target: [`GateTarget::Submit`] or [`GateTarget::Amendment`] of `order_id`.
+    pub target: GateTarget,
 }
 
-/// The gate basket of a submit: every working line, in read order, on the basis' proposed date.
-fn basket(
+/// One assessed gate run (module doc, step 6).
+pub struct Assessed {
     run_id: Uuid,
-    order_id: Uuid,
-    axes: TenantAxes,
-    view: &OrderView,
-    basis: &DateBasis,
-) -> Basket {
+    basket: Basket,
+    resolved: Resolved,
+    report: GateReport,
+    diagnostics: Arc<GateRun>,
+    basis: Arc<DateBasis>,
+}
+
+/// What [`SubmitService::reserve`] freezes beside the run.
+pub struct Reservation {
+    /// The draft revision the run was prepared from (`None` for an amendment).
+    pub prepared_draft_revision: Option<i64>,
+    /// The order's current version (the requests' buildability probe uses its successor).
+    pub current_version: i32,
+    /// The caller's correlation identifier.
+    pub correlation_id: Option<Uuid>,
+}
+
+impl Assessed {
+    /// Step 7 (module doc): the refusal the run decides before any reservation. `None` when the
+    /// run passed, `subject` has lines and the evaluation can be stored as totals.
+    pub(crate) fn refusal(
+        &self,
+        subject: &Assessing<'_>,
+    ) -> Result<Option<RefusalGate>, OrdersError> {
+        let lines: Vec<Uuid> = subject.lines.iter().map(|l| l.line_id).collect();
+        let resolved = &self.resolved;
+        let assessment = &resolved.assessment;
+        let storable = match (&assessment.primary, &resolved.evaluation) {
+            (Some(_), _) => None,
+            _ if lines.is_empty() => None,
+            (None, Some(evaluation)) => {
+                let market = resolved.market.as_ref().ok_or_else(|| {
+                    integration(
+                        Ids::order(subject.order_id),
+                        "a passing run without a market",
+                    )
+                })?;
+                match total_rows(evaluation, &lines, &market.currency) {
+                    Ok(_) => Some(true),
+                    Err(error) if error.is_contract_defect() => {
+                        return Err(integration_with(
+                            Ids::order(subject.order_id),
+                            "the evaluation is not in the market currency (D-216)",
+                            &error,
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "orders.gate.submit",
+                            order_id = %subject.order_id,
+                            error = %error,
+                            "bss-orders: the evaluation cannot be stored as submit totals"
+                        );
+                        Some(false)
+                    }
+                }
+            }
+            (None, None) => Some(false),
+        };
+        if storable == Some(true) {
+            return Ok(None);
+        }
+        let primary = match &assessment.primary {
+            Some(outcome) => Some(outcome.reason.ok_or_else(|| {
+                integration(
+                    Ids::order(subject.order_id),
+                    "a blocking outcome without a reason",
+                )
+            })?),
+            None => None,
+        };
+        let mut inputs = assessment.inputs.clone();
+        if storable == Some(false) {
+            // D-216: the passing run's evaluation has no storable form (a non-terminating
+            // fraction, a display finer than the currency scale, a missing declaration), so the
+            // evaluation input is unusable for submit.
+            tracing::warn!(
+                target: "orders.gate.submit",
+                "bss-orders: the evaluation cannot be stored as submit totals; refused \
+                 evaluation-unavailable before reserving"
+            );
+            inputs = inputs.with(
+                InputPort::Evaluation,
+                InputState::Unresolvable(Reason::EvaluationUnavailable),
+            );
+        }
+        Ok(Some(RefusalGate::Assessed {
+            inputs,
+            primary,
+            report: self.report.clone(),
+            diagnostics: Arc::clone(&self.diagnostics),
+            basis: Arc::clone(&self.basis),
+        }))
+    }
+}
+
+/// The gate basket of one run: every line of `subject`, in read order, on the basis' proposed
+/// date.
+fn basket(run_id: Uuid, subject: &Assessing<'_>, basis: &DateBasis) -> Basket {
     Basket {
         assessed_at: OffsetDateTime::now_utc(),
-        target: GateTarget::Submit { order_id },
+        target: subject.target,
         assessment_id: run_id,
-        axes,
-        contract_id: view.order.contract_id,
-        lines: view.lines.iter().map(draft_line).collect(),
-        terms: view
+        axes: subject.axes,
+        contract_id: subject.contract_id,
+        lines: subject.lines.iter().map(draft_line).collect(),
+        terms: subject
             .lines
             .iter()
             .map(|l| {
@@ -975,7 +1091,7 @@ fn command_failure(line_id: Uuid, error: &CallError) -> OrdersError {
 }
 
 /// What the refusal path presents for the composite gate.
-enum RefusalGate {
+pub enum RefusalGate {
     /// The draft revision was stale or the order is no longer a draft, so no gate ran: the
     /// engine's precedence refusal (`not-admissible`, `version-conflict`, `precondition-failed`)
     /// settles before any guard is evaluated, and every input and guard is presented resolved and
@@ -983,6 +1099,10 @@ enum RefusalGate {
     NotRun,
     /// An over-cap draft detected before any gate or reservation; rechecked under lock.
     Capacity,
+    /// An earlier-registered local guard already fails on its resolved inputs (an amendment's
+    /// versioning or structural guard): the gate's inputs are precluded (D-113), never
+    /// unresolvable, and reaching the gate with them is an integration failure.
+    Precluded,
     /// A blocking (or line-less, or unstorable-evaluation) assessment.
     Assessed {
         /// The assessment's engine input resolutions.
@@ -999,29 +1119,105 @@ enum RefusalGate {
     },
 }
 
-/// Submit's refusal preparation (module doc, steps 4, 5 and 7): row 4's guards, never an admission.
+/// The lines and request guards a refusal preparation evaluates.
+pub enum RefusalSubject {
+    /// Submit (row 4): `gate.has-lines` and the structural guards over the engine's locked
+    /// working draft.
+    Draft,
+    /// An amendment (rows 18–20): the row's request guards, then the structural guards over
+    /// the proposed version and its authored-selection capacity.
+    Proposed {
+        /// The bound request guards (the seven versioning guards; every guard passing when no
+        /// proposal was read).
+        own: GuardBindings,
+        /// The structural guards over the proposed version.
+        structural: Structural,
+        /// The authored-selection capacity verdict over the proposed version.
+        capacity: GuardVerdict,
+    },
+    /// No proposal was read (an amendment of a draft, of an order outside rows 18–20, or naming
+    /// a version that is no longer current): every guard of `row` passing only to satisfy the
+    /// binding contract; the engine's precedence refusal settles before any guard.
+    Unread {
+        /// The transition-table row.
+        row: u8,
+        /// Every guard of the row, bound passing.
+        passing: GuardBindings,
+    },
+}
+
+/// The refusal preparation of submit's steps 4, 5 and 7 and of an amendment's refusal before
+/// any reservation: the row's guards, never an admission.
 ///
 /// The aggregate contribution is [`AggregateContribution::None`]: a refusal settles before
 /// `admit`, where the contribution is first read (`check_subflow`, then `contributions::plan`),
-/// and `check_subflow` aborts a submit admission without a durable execution before it reads the
-/// contribution, so no `Version` candidate is ever named here. It never meets a reserved attempt
-/// (step 3 routes those to the commit); if a race made it one, the engine fails closed (E3).
-struct RefusalPreparation {
+/// and `check_subflow` aborts a versioning admission without a durable execution before it reads
+/// the contribution, so no `Version` candidate is ever named here. It never meets a reserved
+/// attempt (recovery routes those to the commit); if a race made it one, the engine fails closed
+/// (E3).
+pub struct RefusalPreparation {
     gate: RefusalGate,
     line_cap: usize,
+    subject: RefusalSubject,
+}
+
+impl RefusalPreparation {
+    /// Submit's refusal over the locked working draft.
+    fn draft(gate: RefusalGate, line_cap: usize) -> Self {
+        Self {
+            gate,
+            line_cap,
+            subject: RefusalSubject::Draft,
+        }
+    }
+
+    /// An amendment's refusal over its proposed version (rows 18–20).
+    pub fn proposed(gate: RefusalGate, subject: RefusalSubject) -> Self {
+        Self {
+            gate,
+            line_cap: 0,
+            subject,
+        }
+    }
 }
 
 #[async_trait]
 impl Preparation for RefusalPreparation {
     async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
         let mut prepared = Prepared::new(AggregateContribution::None);
-        let capacity = locked_consumed_item_capacity(view)?;
-        let mut guards = structural_guards(view, self.line_cap)
-            // The accepted-binding deadline and byte capacity remain the commit's.
-            .bind(BINDING_ADMISSION, move |_: &GuardSubject<'_>| capacity);
+        let (row, guards, capacity) = match &self.subject {
+            RefusalSubject::Draft => {
+                let structural = Structural::draft(view, self.line_cap);
+                let lines = structural.lines;
+                let own = GuardBindings::new().bind(HAS_LINES, move |_: &GuardSubject<'_>| {
+                    if lines == 0 {
+                        GuardVerdict::Fail(Reason::NoLines)
+                    } else {
+                        GuardVerdict::Pass
+                    }
+                });
+                (
+                    SUBMIT_ROW,
+                    structural.bind(own),
+                    locked_consumed_item_capacity(view)?,
+                )
+            }
+            RefusalSubject::Proposed {
+                own,
+                structural,
+                capacity,
+            } => (structural.row, structural.bind(own.clone()), *capacity),
+            RefusalSubject::Unread { row, passing } => (*row, passing.clone(), GuardVerdict::Pass),
+        };
+        // The accepted-binding deadline and byte capacity remain the commit's.
+        let mut guards = guards.bind(BINDING_ADMISSION, move |_: &GuardSubject<'_>| capacity);
         match &self.gate {
-            RefusalGate::NotRun | RefusalGate::Capacity => {
-                prepared.inputs = row_inputs_resolved();
+            RefusalGate::NotRun | RefusalGate::Capacity | RefusalGate::Precluded => {
+                prepared.inputs = if matches!(self.gate, RefusalGate::Precluded) {
+                    row_inputs(row, InputState::Precluded)
+                } else {
+                    row_inputs_resolved(row)
+                };
                 guards = guards
                     .bind(DATE_BASIS, |_: &GuardSubject<'_>| GuardVerdict::Pass)
                     .bind(GATE_COMPOSITE, |_: &GuardSubject<'_>| GuardVerdict::Pass);
@@ -1053,35 +1249,6 @@ impl Preparation for RefusalPreparation {
         prepared.guards = guards;
         Ok(prepared)
     }
-}
-
-/// Row 4's structural guards over the engine's locked draft (`HAS_LINES`, `CATEGORY`, `CURRENCY`,
-/// `LINE_CAP`), shared by the refusal and the commit preparation; each adds its own
-/// `BINDING_ADMISSION`, `DATE_BASIS` and `GATE_COMPOSITE`.
-pub(super) fn structural_guards(view: &PreparationView, line_cap: usize) -> GuardBindings {
-    let lines = view.draft_lines.len();
-    let currencies: Vec<String> = view
-        .draft_lines
-        .iter()
-        .map(|l| l.currency.clone())
-        .collect();
-    GuardBindings::new()
-        .bind(HAS_LINES, move |_: &GuardSubject<'_>| {
-            if lines == 0 {
-                GuardVerdict::Fail(Reason::NoLines)
-            } else {
-                GuardVerdict::Pass
-            }
-        })
-        .bind(capture::CATEGORY, |subject: &GuardSubject<'_>| {
-            category_verdict(None, &subject.locked.category)
-        })
-        .bind(capture::CURRENCY, move |_: &GuardSubject<'_>| {
-            currency_verdict(currencies.iter().map(String::as_str))
-        })
-        .bind(capture::LINE_CAP, move |_: &GuardSubject<'_>| {
-            line_cap_verdict(lines, line_cap)
-        })
 }
 
 /// Count the authored selections in the engine's locked working draft. A malformed stored

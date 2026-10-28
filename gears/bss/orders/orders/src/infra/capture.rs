@@ -740,6 +740,31 @@ fn draft_row(
     })
 }
 
+/// A proposed amendment line as its content row (synthetic: never written to the working table),
+/// through the same authored codec as a draft line, so the commit admits it exactly as submit
+/// admits a working line (04 §3.6 steps 3-4).
+///
+/// # Errors
+/// An unrepresentable authored value: an integration failure, logged with the line identity.
+pub fn content_row(
+    order_id: Uuid,
+    line: &bss_orders_sdk::authoring::DraftLine,
+) -> Result<draft_content::Model, PrepareError> {
+    let authored = AddLine {
+        plan_id: line.plan_id,
+        plan_revision_id: line.plan_revision_id,
+        selected_items: line.selected_items.clone(),
+        currency: line.currency.clone(),
+        contract_effective_date: line.contract_effective_date,
+        service_activation_date: line.service_activation_date,
+        acceptance_due_date: line.acceptance_due_date,
+        term_duration: line.term_duration,
+        billing_cycle: line.billing_cycle,
+    };
+    draft_row(order_id, line.line_id, &authored)
+        .map_err(|failure| failure.integration(order_id, line.line_id))
+}
+
 /// The named commercial changes applied to the locked working row; every unnamed value is
 /// preserved. The stored interval is recomputed only when the term or the cycle is named.
 fn edited_row(

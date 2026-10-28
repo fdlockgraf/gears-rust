@@ -99,7 +99,7 @@ pub struct BssOrdersGear {
     /// The submit service (S3-12), under the same development-delivery condition as `preview`;
     /// the REST route (M3b, D-238) and the local SDK delegate to it, `None` in every other build.
     submit: ArcSwapOption<crate::infra::gate::submit::SubmitService>,
-    /// The amendment service (S4-03 stub), under the same development-delivery condition; the
+    /// The amendment service (S4-03/S4-04), under the same development-delivery condition; the
     /// REST route and the local SDK delegate to it, `None` in every other build.
     amend: ArcSwapOption<crate::infra::amend::AmendService>,
 }
@@ -620,10 +620,11 @@ impl Gear for BssOrdersGear {
                 ))
             })
             .transpose()?;
-        // S4-03 (D-231): the amendment stub rides the submit service's development delivery.
+        // S4-03/S4-04 (D-231): the amendment service runs the submit pipeline, so it rides the
+        // submit service's development delivery.
         let amend = submit
-            .is_some()
-            .then(|| Arc::new(crate::infra::amend::AmendService::stub()));
+            .as_ref()
+            .map(|submit| Arc::new(crate::infra::amend::AmendService::new(Arc::clone(submit))));
         let throttle = runtime._config.throttle_settings()?;
         // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows and
         // policy elections (S4-07, D-250) with the deployment, and startup refuses a missing or

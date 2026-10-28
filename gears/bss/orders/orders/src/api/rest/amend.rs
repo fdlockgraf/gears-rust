@@ -128,6 +128,11 @@ pub fn amend_router(
             StatusCode::PRECONDITION_FAILED,
             super::capture::STALE_IF_MATCH,
         )
+        .problem_response(
+            openapi,
+            StatusCode::PRECONDITION_REQUIRED,
+            super::capture::MISSING_IF_MATCH,
+        )
         .error_429(openapi)
         .error_503(openapi)
         .register(router, openapi);

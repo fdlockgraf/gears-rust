@@ -267,6 +267,8 @@ mod workers;
 
 #[cfg(feature = "gate-dev-stubs")]
 mod administrative;
+#[cfg(feature = "gate-dev-stubs")]
+mod amend;
 mod capture;
 mod dates;
 mod engine;

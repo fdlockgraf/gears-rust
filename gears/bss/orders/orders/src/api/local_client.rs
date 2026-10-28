@@ -283,12 +283,13 @@ impl OrdersV1 for LocalOrdersClient {
         let Some(service) = &self.amend else {
             return Err(not_delivered("amend (S4-04)").into());
         };
-        // D-202 before any PDP or store work, as on the REST header path.
-        let caller = Caller::from_meta(ctx, meta.delegation_proof_ref.as_ref())?;
-        // The same well-formedness the REST boundary decides, before any authorization.
+        // The same well-formedness the REST boundary decides (the body before the headers'
+        // authority, as REST's `amend_body` precedes the service), before any authorization.
         crate::domain::versioning::AmendmentDelta::from_request(&request)
             .check_well_formed()
             .map_err(|_| OrdersError::Refused(bss_orders_sdk::catalog::Reason::RequestInvalid))?;
+        // D-202 before any PDP or store work, as on the REST header path.
+        let caller = Caller::from_meta(ctx, meta.delegation_proof_ref.as_ref())?;
         sdk_result(
             service
                 .amend(&caller, order_id, request, &meta, &CancellationToken::new())

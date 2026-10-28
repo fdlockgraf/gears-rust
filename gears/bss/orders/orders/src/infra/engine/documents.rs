@@ -112,6 +112,22 @@ impl<'l, 'a> ChildDocuments<'l, 'a> {
             .into_iter()
             .find(|row| row.line_id == line_id))
     }
+    /// Reserve a never-used line identity at the transition time for a line an amendment adds
+    /// to the committed version (04 §3.6 step 4): its immutable `order_line` row needs it, and
+    /// the primary key rejects reuse of any identity the order ever had.
+    ///
+    /// # Errors
+    /// Foreign parent, reused identity, scope or store failure.
+    pub async fn reserve_line_identity(&self, line_id: uuid::Uuid) -> Result<(), ScopeError> {
+        self.locked
+            .insert_order_line_identity(entity::order_line_identity::Model {
+                order_id: self.order_id(),
+                line_id,
+                created_at: self.transition_time,
+            })
+            .await
+            .map(|_| ())
+    }
     /// One batch for a submit version's line rows (n107).
     ///
     /// # Errors

@@ -42,11 +42,13 @@
 //!    (a failed election read is `Unavailable`, never a default); `OrderSubmitted` carries
 //!    `acceptance { acceptedVersion, acceptedAt }` from the engine's summary.
 //!
-//! The engine does the rest: claims, version, documents, diagnostics, aggregate, audit, event,
-//! settlement and `finish_execution`.
+//! Steps 1 and 3–6 are [`ReservedAttempt`]'s and shared with the amendment commit
+//! (`super::amend_commit`), which differs only in its contribution, content rows, request
+//! guards, documents and event. The engine does the rest: claims, version, documents,
+//! diagnostics, aggregate, audit, event, settlement and `finish_execution`.
 use super::failure::{Ids, submit_integration};
-use super::submit::structural_guards;
 use super::writer::GateRun;
+use crate::domain::capture::{self, category_verdict, currency_verdict, line_cap_verdict};
 use crate::domain::contributions::{AggregateContribution, VersionContribution};
 use crate::domain::dates::DateBasis;
 use crate::domain::gate::commercial::{
@@ -74,11 +76,13 @@ use crate::infra::storage::entity::{
 };
 use crate::infra::storage::repo::idempotency::Frozen;
 use async_trait::async_trait;
+use bss_orders_sdk::authoring::Category;
 use bss_orders_sdk::catalog::{Reason, Trigger};
 use bss_orders_sdk::commercial::{
     AcceptedVersionRef, AssessmentRef, CodecError, OrderPin, SelectionEvidence,
 };
 use bss_orders_sdk::models::OrderVersion;
+use bss_pricing_sdk::acceptance::Market;
 use bss_pricing_sdk::digest::terms_digest;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -88,7 +92,7 @@ use toolkit_db::secure::ScopeError;
 use uuid::Uuid;
 
 /// The transition-table row submit runs (`draft → submitted`).
-const SUBMIT_ROW: u8 = 4;
+pub(super) const SUBMIT_ROW: u8 = 4;
 /// The guard submit's at-least-one-line rule is registered under (03 step 1).
 pub(super) const HAS_LINES: &str = "gate.has-lines";
 /// The accepted-binding admission guard (03 step 15).
@@ -96,18 +100,25 @@ pub(super) const BINDING_ADMISSION: &str = "gate.binding-admission";
 /// The date-basis guard (S2-10).
 pub(super) const DATE_BASIS: &str = "capture.date-basis";
 
+/// The reserved attempt phase C commits, as the service reserved or recovered it: shared by
+/// submit ([`SubmitPreparation`]) and amendment (`super::amend_commit::AmendPreparation`).
+pub struct ReservedAttempt {
+    /// The reserved attempt.
+    pub attempt_id: Uuid,
+    /// Its candidate version.
+    pub candidate_version: i32,
+    /// Its stored `line_requests`, compared with the attempt the engine loaded.
+    pub line_requests: Value,
+    /// The decoded frozen requests and order facts.
+    pub requests: FrozenRequests,
+    /// The configured line cap.
+    pub line_cap: usize,
+}
+
 /// Submit's commit preparation (module doc).
 pub struct SubmitPreparation {
     /// The reserved attempt.
-    pub(super) attempt_id: Uuid,
-    /// Its candidate version.
-    pub(super) candidate_version: i32,
-    /// Its stored `line_requests`, compared with the attempt the engine loaded.
-    pub(super) line_requests: Value,
-    /// The decoded frozen requests and order facts.
-    pub(super) requests: FrozenRequests,
-    /// The configured line cap.
-    pub(super) line_cap: usize,
+    pub(super) reserved: ReservedAttempt,
     /// The policy election store (step 7); `None` answers unavailable when an election is read.
     pub(super) policy: Option<toolkit_db::Db>,
 }
@@ -145,7 +156,7 @@ enum Admission {
 
 /// A recorded refusal or a commercial input the commit cannot admit, with where it settles.
 #[derive(Clone, Copy)]
-enum Blocked {
+pub(super) enum Blocked {
     Pricing(RefusalDisposition),
     /// The evaluation cannot be stored (D-216).
     Totals,
@@ -164,29 +175,82 @@ fn integration_with(ids: Ids, what: &'static str, cause: &dyn std::fmt::Display)
     PrepareError::Integration
 }
 
-#[async_trait]
-impl Preparation for SubmitPreparation {
-    async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
+/// What a reserved attempt's frozen evidence admits (module doc, steps 1 and 3–5), before the
+/// row's own guards, contribution, documents and event are added.
+pub(super) struct Evidence<'v> {
+    /// The attempt the engine loaded under the presented owner.
+    pub(super) attempt: &'v commercial_attempt::Model,
+    /// A recorded refusal or unstorable totals; nothing commercial is admitted then.
+    pub(super) blocked: Option<Blocked>,
+    lines: Vec<AdmittedLine>,
+    totals: Vec<TotalRow>,
+    basis: DateBasis,
+}
+
+impl Evidence<'_> {
+    /// The admitted line rows (empty when blocked).
+    pub(super) fn line_rows(&self) -> Vec<order_line::Model> {
+        self.lines.iter().map(|l| l.row.clone()).collect()
+    }
+}
+
+impl ReservedAttempt {
+    /// The reserved attempt of `attempt`, its frozen requests decoded.
+    pub(super) fn of(
+        attempt: &commercial_attempt::Model,
+        requests: FrozenRequests,
+        line_cap: usize,
+    ) -> Self {
+        Self {
+            attempt_id: attempt.attempt_id,
+            candidate_version: attempt.candidate_version,
+            line_requests: attempt.line_requests.clone(),
+            requests,
+            line_cap,
+        }
+    }
+
+    /// The identities a failure of this attempt names: the order its frozen requests are for
+    /// and the attempt.
+    fn ids(&self) -> Ids {
+        Ids {
+            order_id: self.requests.lines.first().map(|l| l.query.order_id),
+            attempt_id: Some(self.attempt_id),
+            line_id: None,
+        }
+    }
+
+    /// Step 1: the attempt the engine loaded under the presented owner must be this one.
+    pub(super) fn loaded<'v>(
+        &self,
+        view: &'v PreparationView,
+    ) -> Result<&'v commercial_attempt::Model, PrepareError> {
         let ids = Ids::attempt(view.facts.order_id, self.attempt_id);
-        let fail = |what: &'static str| integration(ids, what);
-        // 1. The attempt the engine loaded under the presented owner, and its frozen basis.
         let Some(Frozen::Commercial(attempt)) = &view.frozen else {
-            return Err(fail("commit without the reserved commercial attempt"));
+            return Err(integration(
+                ids,
+                "commit without the reserved commercial attempt",
+            ));
         };
         if attempt.attempt_id != self.attempt_id
             || attempt.candidate_version != self.candidate_version
             || attempt.line_requests != self.line_requests
         {
-            return Err(fail("the loaded attempt is not the reserved one"));
+            return Err(integration(
+                ids,
+                "the loaded attempt is not the reserved one",
+            ));
         }
-        let basis = DateBasis::from_frozen(&attempt.date_policy_basis)
-            .map_err(|e| integration_with(ids, "the frozen date basis does not restore", &e))?;
-        let facts = &view.facts;
+        Ok(attempt)
+    }
+
+    /// The one market every frozen line was assessed in.
+    pub(super) fn market(&self) -> Result<&Market, PrepareError> {
         let market = &self
             .requests
             .lines
             .first()
-            .ok_or_else(|| fail("an attempt without lines"))?
+            .ok_or_else(|| integration(self.ids(), "an attempt without lines"))?
             .query
             .market;
         if self
@@ -195,31 +259,58 @@ impl Preparation for SubmitPreparation {
             .iter()
             .any(|l| l.query.market != *market)
         {
-            return Err(fail("frozen lines disagree on the market"));
+            return Err(integration(
+                self.ids(),
+                "frozen lines disagree on the market",
+            ));
         }
-        let mut prepared = Prepared::new(AggregateContribution::Version(VersionContribution {
+        Ok(market)
+    }
+
+    /// The version contribution naming the reserved candidate, in the frozen market.
+    pub(super) fn contribution(
+        &self,
+        payer_tenant_id: Uuid,
+        category: String,
+        contract_id: Option<Uuid>,
+        amendment_reason: Option<String>,
+    ) -> Result<VersionContribution, PrepareError> {
+        let market = self.market()?;
+        Ok(VersionContribution {
             candidate: self.candidate_version,
-            payer_tenant_id: facts.payer_tenant_id,
-            category: facts.category.clone(),
-            contract_id: facts.contract_id,
+            payer_tenant_id,
+            category,
+            contract_id,
             market_currency: Some(market.currency.clone()),
             market_region: market.region.clone(),
-            amendment_reason: None,
-        }));
-        // 2. A changed draft: the engine refuses by precedence before any guard.
-        if view.prepared_draft_revision != attempt.prepared_draft_revision {
-            return Ok(prepared);
-        }
-        let drafts: BTreeMap<Uuid, &draft_content::Model> =
-            view.draft_lines.iter().map(|l| (l.line_id, l)).collect();
-        if drafts.len() != self.requests.lines.len()
+            amendment_reason,
+        })
+    }
+
+    /// Steps 1 and 3–5: the loaded attempt, its frozen basis, every line's recorded result and,
+    /// when nothing refused, the verified pins, the admitted rows built from `content` (the
+    /// content row of every frozen line, nothing else) and the totals rows.
+    pub(super) fn evidence<'v>(
+        &self,
+        view: &'v PreparationView,
+        content: &BTreeMap<Uuid, &draft_content::Model>,
+    ) -> Result<Evidence<'v>, PrepareError> {
+        let attempt = self.loaded(view)?;
+        let ids = Ids::attempt(view.facts.order_id, self.attempt_id);
+        let basis = DateBasis::from_frozen(&attempt.date_policy_basis)
+            .map_err(|e| integration_with(ids, "the frozen date basis does not restore", &e))?;
+        let market = self.market()?;
+        if content.len() != self.requests.lines.len()
             || self
                 .requests
                 .lines
                 .iter()
-                .any(|l| !drafts.contains_key(&l.line_id))
+                .any(|l| !content.contains_key(&l.line_id))
         {
-            return Err(fail("the draft lines are not the frozen lines"));
+            return Err(integration(
+                ids,
+                "the content lines are not the frozen lines",
+            ));
         }
         // 3. The recorded results.
         let mut blocked = None;
@@ -239,7 +330,7 @@ impl Preparation for SubmitPreparation {
                     }
                 },
                 None if blocked.is_some() => {}
-                None => return Err(fail("a line without a recorded result")),
+                None => return Err(integration(ids, "a line without a recorded result")),
             }
         }
         // 4–5. Pins, line rows and totals, only when nothing refused.
@@ -247,10 +338,10 @@ impl Preparation for SubmitPreparation {
         let mut totals = Vec::new();
         if blocked.is_none() {
             for (line, receipt) in receipts {
-                let draft = drafts.get(&line.line_id).ok_or_else(|| {
-                    integration(ids.line(line.line_id), "a frozen line without its draft")
+                let row = content.get(&line.line_id).ok_or_else(|| {
+                    integration(ids.line(line.line_id), "a frozen line without its content")
                 })?;
-                match self.admitted(line, draft, receipt, facts.resource_tenant_id, &basis)? {
+                match self.admitted(line, row, receipt, view.facts.resource_tenant_id, &basis)? {
                     Admission::Admitted(admitted) => lines.push(*admitted),
                     Admission::OverCapacity => {
                         lines.clear();
@@ -283,71 +374,72 @@ impl Preparation for SubmitPreparation {
                 }
             }
         }
-        // 6. Guards, inputs, contribution, claims, documents and event. The version limit
-        // counts every persisted member: the line rows (pins included), the totals rows and the
-        // version row.
-        let version_row = match &prepared.aggregate {
-            AggregateContribution::Version(version) => {
-                version_row_bytes(version, Trigger::Submit.token())
-            }
-            _ => return Err(fail("submit without a version contribution")),
-        };
-        let persisted: Vec<usize> = lines
+        Ok(Evidence {
+            attempt,
+            blocked,
+            lines,
+            totals,
+            basis,
+        })
+    }
+
+    /// Step 6's shared part over `evidence`: the row's resolved inputs (a recorded unevaluable
+    /// refusal or unstorable totals as the input that settles it), the commercial guards after
+    /// the row's own (`structural`, binding admission, date basis, composite gate), the claims
+    /// (the frozen keys of every line) and the frozen run (D-231). `own` are the row's request
+    /// guards; `version_row` the persisted bytes of the version row; `item_capacity` the
+    /// authored-selection capacity verdict over the committed content.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "step 6 reads the evidence, the row's own guards, its structural facts, the \
+                  version row bytes, the item capacity and the claim parties"
+    )]
+    pub(super) fn prepare_commercial(
+        &self,
+        prepared: &mut Prepared,
+        evidence: &Evidence<'_>,
+        own: GuardBindings,
+        structural: &Structural,
+        version_row: usize,
+        item_capacity: GuardVerdict,
+        parties: ClaimParties,
+    ) -> Result<(), PrepareError> {
+        // The version limit counts every persisted member: the line rows (pins included), the
+        // totals rows and the version row.
+        let persisted: Vec<usize> = evidence
+            .lines
             .iter()
             .map(|l| l.bytes)
-            .chain(totals.iter().map(TotalRow::persisted_bytes))
+            .chain(evidence.totals.iter().map(TotalRow::persisted_bytes))
             .chain([version_row])
             .collect();
-        let capacity = match super::submit::locked_consumed_item_capacity(view)? {
+        let capacity = match item_capacity {
             GuardVerdict::Pass => version_capacity(persisted),
             failure @ GuardVerdict::Fail(_) => failure,
         };
-        let earliest_hold = lines.iter().map(|l| l.hold_until).min();
-        prepared.inputs = row_inputs_resolved();
-        if let Some(Blocked::Pricing(RefusalDisposition::Unevaluable(reason))) = blocked {
-            prepared.inputs = prepared.inputs.with(
+        let earliest_hold = evidence.lines.iter().map(|l| l.hold_until).min();
+        prepared.inputs = row_inputs_resolved(structural.row);
+        if let Some(Blocked::Pricing(RefusalDisposition::Unevaluable(reason))) = evidence.blocked {
+            prepared.inputs = prepared.inputs.clone().with(
                 InputPort::CatalogPredicates,
                 InputState::Unresolvable(reason),
             );
         }
-        if let Some(Blocked::Totals) = blocked {
-            prepared.inputs = prepared.inputs.with(
+        if let Some(Blocked::Totals) = evidence.blocked {
+            prepared.inputs = prepared.inputs.clone().with(
                 InputPort::Evaluation,
                 InputState::Unresolvable(Reason::EvaluationUnavailable),
             );
         }
-        prepared.guards = self.guards(view, blocked, capacity, earliest_hold, basis);
-        let keys = frozen_scope_keys(&self.requests.lines, ids)?;
-        prepared.claims = Some(ProposedClaims::new(
-            ClaimParties {
-                payer_tenant_id: facts.payer_tenant_id,
-                resource_tenant_id: facts.resource_tenant_id,
-            },
-            keys,
-        ));
-        // 7. Consent, only for a commit (a refusal records nothing and emits no event).
-        let consent = match blocked {
-            None => self.consent(attempt, view).await?,
-            Some(_) => None,
-        };
-        if blocked.is_none() {
-            prepared.documents = Some(Arc::new(SubmitDocuments {
-                lines: lines.into_iter().map(|l| l.row).collect(),
-                totals,
-                assessment_id: self.requests.order.assessment_id,
-                version: self.candidate_version,
-                consent: consent.clone(),
-            }));
-        }
-        prepared.event = Some(Arc::new(SubmittedEvent {
-            lines: self
-                .requests
-                .lines
-                .iter()
-                .map(|l| LineRef { line_id: l.line_id })
-                .collect(),
-            accepted: consent.is_some(),
-        }));
+        prepared.guards = commercial_guards(
+            structural.bind(own),
+            evidence.blocked,
+            capacity,
+            earliest_hold,
+            evidence.basis.clone(),
+        );
+        let keys = frozen_scope_keys(&self.requests.lines, self.ids())?;
+        prepared.claims = Some(ProposedClaims::new(parties, keys));
         // The frozen run: a fresh and a recovered commit settle the same report and write the
         // same diagnostics (D-235).
         let order = &self.requests.order;
@@ -355,12 +447,13 @@ impl Preparation for SubmitPreparation {
             .requests
             .lines
             .first()
-            .ok_or_else(|| fail("an attempt without lines"))?
+            .ok_or_else(|| integration(self.ids(), "an attempt without lines"))?
             .query
             .tenant_axes;
         // The engine settles the report as its wire value (`Prepared::assessment`).
         prepared.assessment = Some(
-            serde_json::to_value(&order.report).map_err(|_| integration(ids, "frozen report"))?,
+            serde_json::to_value(&order.report)
+                .map_err(|_| integration(self.ids(), "frozen report"))?,
         );
         prepared.assessment_id = Some(order.assessment_id);
         let run: Arc<GateRun> = Arc::new(GateRun {
@@ -384,118 +477,27 @@ impl Preparation for SubmitPreparation {
             vector: order.vector.clone(),
         });
         prepared.diagnostics = Some(run);
-        Ok(prepared)
-    }
-}
-
-fn frozen_scope_keys(lines: &[FrozenLine], ids: Ids) -> Result<Vec<OverlapScopeKey>, PrepareError> {
-    lines
-        .iter()
-        .flat_map(|line| line.scopes().into_iter().map(move |key| (line, key)))
-        .map(|(line, key)| {
-            OverlapScopeKey::try_from(key.to_owned()).map_err(|e| {
-                integration_with(
-                    ids.line(line.line_id),
-                    "a frozen overlap key is invalid",
-                    &e,
-                )
-            })
-        })
-        .collect()
-}
-
-impl SubmitPreparation {
-    /// The commit preparation of `attempt` as phase C builds it (storage tests drive phase C
-    /// for a chosen owner).
-    #[cfg(test)]
-    #[cfg_attr(
-        not(feature = "gate-dev-stubs"),
-        expect(
-            dead_code,
-            reason = "only the `gate-dev-stubs` storage and orchestrate tests use it"
-        )
-    )]
-    pub fn for_attempt(
-        attempt: &commercial_attempt::Model,
-        line_cap: usize,
-        policy: Option<toolkit_db::Db>,
-    ) -> Option<Self> {
-        Some(Self {
-            attempt_id: attempt.attempt_id,
-            candidate_version: attempt.candidate_version,
-            line_requests: attempt.line_requests.clone(),
-            requests: crate::domain::gate::commercial::decode_line_requests(&attempt.line_requests)
-                .ok()?,
-            line_cap,
-            policy,
-        })
+        Ok(())
     }
 
-    /// Step 7 (module doc): the consent of a self-service commit, `None` otherwise.
-    async fn consent(
+    /// The `resolved_total` rows of the admitted version (empty when blocked).
+    pub(super) fn total_models(
         &self,
-        attempt: &commercial_attempt::Model,
-        view: &PreparationView,
-    ) -> Result<Option<Consent>, PrepareError> {
-        let principal: FrozenPrincipal = serde_json::from_value(attempt.original_principal.clone())
-            .map_err(|_| {
-                integration(
-                    Ids::attempt(view.facts.order_id, self.attempt_id),
-                    "the frozen original principal does not decode",
+        order_id: Uuid,
+        evidence: &Evidence<'_>,
+    ) -> Vec<resolved_total::Model> {
+        evidence
+            .totals
+            .iter()
+            .map(|row| {
+                total_model(
+                    order_id,
+                    self.candidate_version,
+                    self.requests.order.assessment_id,
+                    row,
                 )
-            })?;
-        if !preconditions::auto_consent(
-            principal.subject_tenant_id,
-            view.facts.resource_tenant_id,
-            attempt.proof_reference.is_some(),
-        ) {
-            return Ok(None);
-        }
-        let requirement = self.requirement(view.facts.seller_tenant_id).await?;
-        Ok(Some(Consent {
-            recorded_by: principal.subject_id.hyphenated().to_string(),
-            source: recorded_source(requirement),
-        }))
-    }
-
-    /// The requirement's precedence (D-251): the frozen contract fact, then the seller's
-    /// election, then the platform's; each election is read only when the earlier term is
-    /// silent.
-    async fn requirement(&self, seller: Uuid) -> Result<Requirement, PrepareError> {
-        let contract = self.requests.order.contract_acceptance_required;
-        if contract.is_some() {
-            return Ok(acceptance_requirement(contract, None, None));
-        }
-        let seller = self.election(PolicyScope::Seller(seller)).await?;
-        let platform = match seller {
-            Some(_) => None,
-            None => self.election(PolicyScope::Platform).await?,
-        };
-        Ok(acceptance_requirement(None, seller, platform))
-    }
-
-    /// One `acceptance_required` election; a failed read is `Unavailable` (never "no row").
-    async fn election(&self, scope: PolicyScope) -> Result<Option<bool>, PrepareError> {
-        let Some(db) = &self.policy else {
-            tracing::warn!(
-                target: "orders.gate.submit",
-                "bss-orders: no policy election store is bound; a self-service submit answers \
-                 unavailable"
-            );
-            return Err(PrepareError::Unavailable);
-        };
-        policy::election(db, Election::AcceptanceRequired, scope)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    target: "orders.gate.submit",
-                    scope = scope.token(),
-                    error = %error,
-                    "bss-orders: the acceptance election could not be read; submit answers \
-                     unavailable"
-                );
-                PrepareError::Unavailable
             })
+            .collect()
     }
 
     /// One accepted line: its verified pin and admitted row (module doc, steps 4–5).
@@ -588,7 +590,7 @@ impl SubmitPreparation {
             .map_err(|_| integration(ids, "the encoded pin is not JSON"))?;
         let mut row = admitted_line(draft, resource_tenant_id, self.candidate_version, basis)
             .map_err(|e| {
-                integration_with(ids, "the frozen basis does not admit the draft line", &e)
+                integration_with(ids, "the frozen basis does not admit the content line", &e)
             })?;
         let items: Vec<bss_orders_sdk::authoring::SelectedItem> =
             serde_json::from_value(row.selected_items.clone())
@@ -632,69 +634,325 @@ impl SubmitPreparation {
             hold_until,
         })))
     }
+}
 
-    /// Row 4's guards over the commit's facts (module doc, step 6).
-    fn guards(
+#[async_trait]
+impl Preparation for SubmitPreparation {
+    async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
+        let reserved = &self.reserved;
+        // 1. The attempt the engine loaded under the presented owner.
+        let attempt = reserved.loaded(view)?;
+        let facts = &view.facts;
+        let mut prepared = Prepared::new(AggregateContribution::Version(reserved.contribution(
+            facts.payer_tenant_id,
+            facts.category.clone(),
+            facts.contract_id,
+            None,
+        )?));
+        // 2. A changed draft: the engine refuses by precedence before any guard.
+        if view.prepared_draft_revision != attempt.prepared_draft_revision {
+            return Ok(prepared);
+        }
+        let drafts: BTreeMap<Uuid, &draft_content::Model> =
+            view.draft_lines.iter().map(|l| (l.line_id, l)).collect();
+        // 3–5. The recorded results, pins, line rows and totals.
+        let evidence = reserved.evidence(view, &drafts)?;
+        // 6. Guards, inputs, claims and the frozen run, over the locked working draft.
+        let version_row = match &prepared.aggregate {
+            AggregateContribution::Version(version) => {
+                version_row_bytes(version, Trigger::Submit.token())
+            }
+            _ => {
+                return Err(integration(
+                    Ids::attempt(facts.order_id, reserved.attempt_id),
+                    "submit without a version contribution",
+                ));
+            }
+        };
+        let structural = Structural::draft(view, reserved.line_cap);
+        let lines = structural.lines;
+        let own = GuardBindings::new().bind(HAS_LINES, move |_: &GuardSubject<'_>| {
+            if lines == 0 {
+                GuardVerdict::Fail(Reason::NoLines)
+            } else {
+                GuardVerdict::Pass
+            }
+        });
+        reserved.prepare_commercial(
+            &mut prepared,
+            &evidence,
+            own,
+            &structural,
+            version_row,
+            super::submit::locked_consumed_item_capacity(view)?,
+            ClaimParties {
+                payer_tenant_id: facts.payer_tenant_id,
+                resource_tenant_id: facts.resource_tenant_id,
+            },
+        )?;
+        // 7. Consent, only for a commit (a refusal records nothing and emits no event).
+        let consent = match evidence.blocked {
+            None => self.consent(evidence.attempt, view).await?,
+            Some(_) => None,
+        };
+        if evidence.blocked.is_none() {
+            prepared.documents = Some(Arc::new(SubmitDocuments {
+                lines: evidence.line_rows(),
+                totals: reserved.total_models(facts.order_id, &evidence),
+                version: reserved.candidate_version,
+                consent: consent.clone(),
+            }));
+        }
+        prepared.event = Some(Arc::new(SubmittedEvent {
+            lines: reserved
+                .requests
+                .lines
+                .iter()
+                .map(|l| LineRef { line_id: l.line_id })
+                .collect(),
+            accepted: consent.is_some(),
+        }));
+        Ok(prepared)
+    }
+}
+
+fn frozen_scope_keys(lines: &[FrozenLine], ids: Ids) -> Result<Vec<OverlapScopeKey>, PrepareError> {
+    lines
+        .iter()
+        .flat_map(|line| line.scopes().into_iter().map(move |key| (line, key)))
+        .map(|(line, key)| {
+            OverlapScopeKey::try_from(key.to_owned()).map_err(|e| {
+                integration_with(
+                    ids.line(line.line_id),
+                    "a frozen overlap key is invalid",
+                    &e,
+                )
+            })
+        })
+        .collect()
+}
+
+impl SubmitPreparation {
+    /// The commit preparation of `attempt` as phase C builds it (storage tests drive phase C
+    /// for a chosen owner).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "gate-dev-stubs"),
+        expect(
+            dead_code,
+            reason = "only the `gate-dev-stubs` storage and orchestrate tests use it"
+        )
+    )]
+    pub fn for_attempt(
+        attempt: &commercial_attempt::Model,
+        line_cap: usize,
+        policy: Option<toolkit_db::Db>,
+    ) -> Option<Self> {
+        Some(Self {
+            reserved: ReservedAttempt::of(
+                attempt,
+                crate::domain::gate::commercial::decode_line_requests(&attempt.line_requests)
+                    .ok()?,
+                line_cap,
+            ),
+            policy,
+        })
+    }
+
+    /// Step 7 (module doc): the consent of a self-service commit, `None` otherwise.
+    async fn consent(
         &self,
+        attempt: &commercial_attempt::Model,
         view: &PreparationView,
-        blocked: Option<Blocked>,
-        capacity: GuardVerdict,
-        earliest_hold: Option<OffsetDateTime>,
-        basis: DateBasis,
-    ) -> GuardBindings {
-        let admission = match blocked {
-            Some(Blocked::Pricing(RefusalDisposition::BindingAdmission(reason))) => {
-                GuardVerdict::Fail(reason)
-            }
-            Some(Blocked::Capacity) => GuardVerdict::Fail(Reason::PurchaseCapacityExceeded),
-            Some(
-                Blocked::Pricing(
-                    RefusalDisposition::Composite(_) | RefusalDisposition::Unevaluable(_),
+    ) -> Result<Option<Consent>, PrepareError> {
+        let principal: FrozenPrincipal = serde_json::from_value(attempt.original_principal.clone())
+            .map_err(|_| {
+                integration(
+                    Ids::attempt(view.facts.order_id, self.reserved.attempt_id),
+                    "the frozen original principal does not decode",
                 )
-                | Blocked::Totals,
-            )
-            | None => capacity,
+            })?;
+        if !preconditions::auto_consent(
+            principal.subject_tenant_id,
+            view.facts.resource_tenant_id,
+            attempt.proof_reference.is_some(),
+        ) {
+            return Ok(None);
+        }
+        let requirement = self.requirement(view.facts.seller_tenant_id).await?;
+        Ok(Some(Consent {
+            recorded_by: principal.subject_id.hyphenated().to_string(),
+            source: recorded_source(requirement),
+        }))
+    }
+
+    /// The requirement's precedence (D-251): the frozen contract fact, then the seller's
+    /// election, then the platform's; each election is read only when the earlier term is
+    /// silent.
+    async fn requirement(&self, seller: Uuid) -> Result<Requirement, PrepareError> {
+        let contract = self.reserved.requests.order.contract_acceptance_required;
+        if contract.is_some() {
+            return Ok(acceptance_requirement(contract, None, None));
+        }
+        let seller = self.election(PolicyScope::Seller(seller)).await?;
+        let platform = match seller {
+            Some(_) => None,
+            None => self.election(PolicyScope::Platform).await?,
         };
-        let composite = match blocked {
-            Some(Blocked::Pricing(RefusalDisposition::Composite(reason))) => {
-                GuardVerdict::Fail(reason)
-            }
-            Some(
-                Blocked::Pricing(
-                    RefusalDisposition::BindingAdmission(_) | RefusalDisposition::Unevaluable(_),
-                )
-                | Blocked::Totals
-                | Blocked::Capacity,
-            )
-            | None => GuardVerdict::Pass,
+        Ok(acceptance_requirement(None, seller, platform))
+    }
+
+    /// One `acceptance_required` election; a failed read is `Unavailable` (never "no row").
+    async fn election(&self, scope: PolicyScope) -> Result<Option<bool>, PrepareError> {
+        let Some(db) = &self.policy else {
+            tracing::warn!(
+                target: "orders.gate.submit",
+                "bss-orders: no policy election store is bound; a self-service submit answers \
+                 unavailable"
+            );
+            return Err(PrepareError::Unavailable);
         };
-        structural_guards(view, self.line_cap)
-            // A recorded lapsed hold, the version limit, then each receipt's exclusive
-            // activation deadline against the engine's transition time (03 step 15, D-152).
-            .bind(BINDING_ADMISSION, move |subject: &GuardSubject<'_>| match (
-                admission,
-                earliest_hold,
-            ) {
+        policy::election(db, Election::AcceptanceRequired, scope)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "orders.gate.submit",
+                    scope = scope.token(),
+                    error = %error,
+                    "bss-orders: the acceptance election could not be read; submit answers \
+                     unavailable"
+                );
+                PrepareError::Unavailable
+            })
+    }
+}
+
+/// The shared structural guards of rows 2, 4 and 18–20 over one line set (01 §3.6):
+/// `capture.category-admitted` (the named category, else the locked one), `currency-mixed` and
+/// `line-cap-exceeded` over the complete line set. Submit evaluates them over the engine's
+/// locked working draft; an amendment over its proposed version.
+pub struct Structural {
+    /// The transition-table row whose declared inputs the preparation resolves.
+    pub row: u8,
+    /// A category the request names; `None` reads the locked one.
+    pub named_category: Option<Category>,
+    /// The line count.
+    pub lines: usize,
+    /// Every line's currency.
+    pub currencies: Vec<String>,
+    /// The configured line cap.
+    pub cap: usize,
+}
+
+impl Structural {
+    /// Row 4 over the engine's locked working draft.
+    pub(super) fn draft(view: &PreparationView, cap: usize) -> Self {
+        Self {
+            row: SUBMIT_ROW,
+            named_category: None,
+            lines: view.draft_lines.len(),
+            currencies: view
+                .draft_lines
+                .iter()
+                .map(|l| l.currency.clone())
+                .collect(),
+            cap,
+        }
+    }
+
+    /// The first refusal these guards decide, in registration order (an amendment's pre-call
+    /// check, D-113): category, currency, then the line cap.
+    pub fn first_failure(&self, locked_category: &str) -> Option<Reason> {
+        [
+            category_verdict(self.named_category, locked_category),
+            currency_verdict(self.currencies.iter().map(String::as_str)),
+            line_cap_verdict(self.lines, self.cap),
+        ]
+        .into_iter()
+        .find_map(|verdict| match verdict {
+            GuardVerdict::Fail(reason) => Some(reason),
+            GuardVerdict::Pass => None,
+        })
+    }
+
+    /// `bindings` with the three structural guards bound.
+    pub(super) fn bind(&self, bindings: GuardBindings) -> GuardBindings {
+        let named = self.named_category;
+        let currencies = self.currencies.clone();
+        let (lines, cap) = (self.lines, self.cap);
+        bindings
+            .bind(capture::CATEGORY, move |subject: &GuardSubject<'_>| {
+                category_verdict(named, &subject.locked.category)
+            })
+            .bind(capture::CURRENCY, move |_: &GuardSubject<'_>| {
+                currency_verdict(currencies.iter().map(String::as_str))
+            })
+            .bind(capture::LINE_CAP, move |_: &GuardSubject<'_>| {
+                line_cap_verdict(lines, cap)
+            })
+    }
+}
+
+/// The commit's guards after the structural ones (module doc, step 6): a recorded lapsed hold,
+/// the version limit, then each receipt's exclusive activation deadline against the engine's
+/// transition time (03 step 15, D-152); the frozen date basis; the composite gate's recorded
+/// Pricing refusal.
+fn commercial_guards(
+    bindings: GuardBindings,
+    blocked: Option<Blocked>,
+    capacity: GuardVerdict,
+    earliest_hold: Option<OffsetDateTime>,
+    basis: DateBasis,
+) -> GuardBindings {
+    let admission = match blocked {
+        Some(Blocked::Pricing(RefusalDisposition::BindingAdmission(reason))) => {
+            GuardVerdict::Fail(reason)
+        }
+        Some(Blocked::Capacity) => GuardVerdict::Fail(Reason::PurchaseCapacityExceeded),
+        Some(
+            Blocked::Pricing(RefusalDisposition::Composite(_) | RefusalDisposition::Unevaluable(_))
+            | Blocked::Totals,
+        )
+        | None => capacity,
+    };
+    let composite = match blocked {
+        Some(Blocked::Pricing(RefusalDisposition::Composite(reason))) => GuardVerdict::Fail(reason),
+        Some(
+            Blocked::Pricing(
+                RefusalDisposition::BindingAdmission(_) | RefusalDisposition::Unevaluable(_),
+            )
+            | Blocked::Totals
+            | Blocked::Capacity,
+        )
+        | None => GuardVerdict::Pass,
+    };
+    bindings
+        .bind(
+            BINDING_ADMISSION,
+            move |subject: &GuardSubject<'_>| match (admission, earliest_hold) {
                 (GuardVerdict::Fail(reason), _) => GuardVerdict::Fail(reason),
                 (GuardVerdict::Pass, Some(hold)) if hold <= subject.transition_time => {
                     GuardVerdict::Fail(Reason::OrderBindingExpired)
                 }
                 (GuardVerdict::Pass, _) => GuardVerdict::Pass,
-            })
-            .bind(DATE_BASIS, Arc::new(basis).guard())
-            .bind(GATE_COMPOSITE, move |_: &GuardSubject<'_>| composite)
-    }
+            },
+        )
+        .bind(DATE_BASIS, Arc::new(basis).guard())
+        .bind(GATE_COMPOSITE, move |_: &GuardSubject<'_>| composite)
 }
 
-/// Every input row 4 declares, resolved: the receipts are the evidence (module doc).
-pub(super) fn row_inputs_resolved() -> Inputs {
+/// Every input `row` declares, resolved: the receipts are the evidence (module doc).
+pub(super) fn row_inputs_resolved(row: u8) -> Inputs {
+    row_inputs(row, InputState::Resolved)
+}
+
+/// Every input `row` declares, in `state`.
+pub(super) fn row_inputs(row: u8, state: InputState) -> Inputs {
     GUARDS
         .iter()
-        .filter(|g| g.rows.contains(&SUBMIT_ROW))
+        .filter(|g| g.rows.contains(&row))
         .flat_map(|g| g.inputs.iter().copied())
-        .fold(Inputs::new(), |inputs, port| {
-            inputs.with(port, InputState::Resolved)
-        })
+        .fold(Inputs::new(), |inputs, port| inputs.with(port, state))
 }
 
 /// The persisted bytes of one admitted `order_line` row, every column counted ([`persisted`]),
@@ -732,22 +990,25 @@ fn line_row_bytes(row: &order_line::Model) -> usize {
 /// consent of that version (step 19).
 struct SubmitDocuments {
     lines: Vec<order_line::Model>,
-    totals: Vec<TotalRow>,
-    assessment_id: Uuid,
+    totals: Vec<resolved_total::Model>,
     version: i32,
     consent: Option<Consent>,
+}
+
+/// Insert the admitted version's line rows, then its totals rows (step 19).
+pub(super) async fn write_version_rows(
+    documents: &ChildDocuments<'_, '_>,
+    lines: &[order_line::Model],
+    totals: &[resolved_total::Model],
+) -> Result<(), ScopeError> {
+    documents.insert_order_lines(lines.to_vec()).await?;
+    documents.insert_resolved_totals(totals.to_vec()).await
 }
 
 #[async_trait]
 impl DocumentWriter for SubmitDocuments {
     async fn write(&self, documents: &ChildDocuments<'_, '_>) -> Result<(), ScopeError> {
-        documents.insert_order_lines(self.lines.clone()).await?;
-        let totals = self
-            .totals
-            .iter()
-            .map(|row| total_model(documents.order_id(), self.version, self.assessment_id, row))
-            .collect();
-        documents.insert_resolved_totals(totals).await?;
+        write_version_rows(documents, &self.lines, &self.totals).await?;
         if let Some(consent) = &self.consent {
             documents
                 .insert_acceptance(acceptance::Model {

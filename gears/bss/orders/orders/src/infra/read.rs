@@ -61,6 +61,7 @@ use crate::domain::read::{
     self, AccessOutcome, Collection, CursorBinding, GET_OPERATION, Position, ReadRuleError,
     Refusal, ServedLog, Target,
 };
+use crate::domain::versioning::{CommittedHeader, CommittedVersion};
 use crate::infra::diagnostics::serde_category;
 use crate::infra::engine::errors::not_delivered;
 use crate::infra::storage::entity::{
@@ -144,6 +145,20 @@ impl ReadSignals for OtelReadSignals {
             self.proof_denials.add(1, &[KeyValue::new("kind", kind)]);
         }
     }
+}
+
+/// The current committed version of an order and the aggregate facts an amendment's local
+/// guards read before any external call ([`ReadService::get_committed`]).
+#[derive(Debug, Clone)]
+pub struct CommittedSnapshot {
+    /// The order's state.
+    pub state: OrderState,
+    /// The aggregate's category (the structural guard's locked value).
+    pub category: String,
+    /// The aggregate's amendment count.
+    pub amendment_count: i32,
+    /// The current committed version N.
+    pub version: CommittedVersion,
 }
 
 /// The shared read service. Reads are unavailable while the gear is not serving (no parts).
@@ -310,6 +325,58 @@ impl ReadService {
         self.served_point(&parts, caller, GET_OPERATION, &snapshot.row)
             .await?;
         Ok(Some(view))
+    }
+
+    /// The authorized committed read of an amendment (S4-03; 04 §3.6 step 3): [`Self::get`]'s
+    /// decision, snapshot and served log over the current committed version, as the domain's
+    /// [`CommittedVersion`] (N's header from its version row, every committed line through the
+    /// pin-verifying codec, in identity order) with the locked-equivalent facts the amendment's
+    /// local guards read. `Ok(None)` when the authorized order is still a draft (no committed
+    /// content: the engine settles `not-admissible`); nothing is disclosed and no served log is
+    /// written for it. Every non-draft state composes, so the engine, not the read, decides
+    /// admissibility.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub async fn get_committed(
+        &self,
+        caller: &Caller,
+        order_id: Uuid,
+    ) -> Result<Option<CommittedSnapshot>, OrdersError> {
+        Self::check_proof(caller)?;
+        let parts = self.parts()?;
+        let snapshot = self
+            .targeted(&parts, caller, GET_OPERATION, order_id, &Load::Detail)
+            .await?;
+        if is_draft(&snapshot.row) {
+            return Ok(None);
+        }
+        let row = &snapshot.row;
+        let version = snapshot
+            .version
+            .as_ref()
+            .ok_or_else(|| integration("current version row"))?;
+        let committed = CommittedSnapshot {
+            state: crate::domain::audit::parse_state(&row.state)
+                .map_err(|_| integration("state"))?,
+            category: row.category.clone(),
+            amendment_count: row.amendment_count,
+            version: CommittedVersion {
+                version: row.current_version,
+                header: CommittedHeader {
+                    category: Category::parse(&version.category)
+                        .ok_or_else(|| integration("version category"))?,
+                    resource_tenant_id: row.resource_tenant_id,
+                    seller_tenant_id: row.seller_tenant_id,
+                    payer_tenant_id: version.payer_tenant_id,
+                    contract_id: version.contract_id,
+                },
+                lines: compose_committed_lines(row, &snapshot.identities, &snapshot.committed)?,
+            },
+        };
+        self.served_point(&parts, caller, GET_OPERATION, row)
+            .await?;
+        Ok(Some(committed))
     }
 
     /// *List Orders* (08 §3.6 paginated list): an untargeted `order × read`, the PDP scope,

@@ -55,6 +55,9 @@ const TAG: &str = "Orders";
 /// the 409 draft-revision conflict.
 pub(super) const STALE_IF_MATCH: &str =
     "PRECONDITION_FAILED: If-Match is not the current version (names current_version)";
+/// The documented 428 of a route whose `If-Match` is required (boundary, D-212).
+pub(super) const MISSING_IF_MATCH: &str =
+    "EXPECTED_VERSION_REQUIRED: If-Match is absent or not a strong \"N\" ETag";
 
 fn invalid() -> OrdersError {
     OrdersError::Refused(Reason::RequestInvalid)

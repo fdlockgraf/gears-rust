@@ -481,6 +481,27 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
         crate::api::rest::problem(result.unwrap_err()).status,
         Some(503)
     );
+    // Without the development delivery the local client has no amendment service: not
+    // delivered (503), even for a body the boundary would refuse.
+    let amended = client
+        .amend(
+            &caller,
+            Uuid::from_u128(3),
+            serde_json::from_value(json!({"reason": "r", "lines": [
+                {"op": "remove", "line_id": Uuid::from_u128(4)},
+                {"op": "remove", "line_id": Uuid::from_u128(4)}]}))?,
+            CallMeta {
+                expected_version: OrderVersion::try_from(1)?,
+                idempotency_key: IdempotencyKey::try_from("key-amend".to_owned())?,
+                correlation_id: None,
+                delegation_proof_ref: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        crate::api::rest::problem(amended.unwrap_err()).status,
+        Some(503)
+    );
     // S2-09 mounts exactly the five delivered authoring operations and the early-S6 package
     // the three draft read operations; nothing else.
     let openapi = toolkit::api::OpenApiRegistryImpl::new();
@@ -511,6 +532,10 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
             "POST /bss-orders/v1/orders",
             "POST /bss-orders/v1/orders/{orderId}/lines",
         ]
+    );
+    assert!(
+        document["paths"]["/bss-orders/v1/orders/{orderId}/amendments"].is_null(),
+        "the amendment route is absent without the development delivery"
     );
     assert_delivered_census(&router, &openapi, &document, &operations, &caller).await?;
     // Before `serve` binds the engine the routes answer unavailable: no write before readiness.
@@ -1251,7 +1276,8 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
     )?;
     let mut cfg = config();
     cfg["gate"] = json!({"dev_stubs": true, "dev_stub_fixture": fixture});
-    let ctx = context(Some(cfg), dependencies("complete")).with_db(toolkit_db::DBProvider::new(db));
+    let hub = dependencies("complete");
+    let ctx = context(Some(cfg), Arc::clone(&hub)).with_db(toolkit_db::DBProvider::new(db));
     let booted = gear.init(&ctx).await;
     std::fs::remove_file(&fixture)?;
     booted?;
@@ -1382,7 +1408,7 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
     ] {
         assert!(params.contains(&name.to_owned()), "{name} in {params:?}");
     }
-    for status in ["200", "400", "412", "429", "503"] {
+    for status in ["200", "400", "412", "428", "429", "503"] {
         assert!(amend_doc["responses"][status].is_object(), "{status}");
     }
     assert!(!crate::api::rest::DELIVERED_OPERATIONS.contains(&"amend"));
@@ -1425,6 +1451,12 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             amend_valid,
             bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
         ),
+        // If-Match without an Idempotency-Key: the key is enforced before the service.
+        (
+            &[if_match][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
         // An unknown key is refused at the boundary.
         (
             &[if_match, key][..],
@@ -1437,15 +1469,15 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             twice,
             bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
         ),
-        // A missing reason is not a boundary failure: it reaches the (stub) service, which
-        // answers unavailable. The audited `amendment-reason-invalid` refusal is the real
-        // service's (S4-04).
+        // A missing reason is not a boundary failure: it reaches the service, which answers
+        // unavailable before `serve` binds the engine (the audited `amendment-reason-invalid`
+        // refusal is the engine's, `infra::storage::tests::amend`).
         (
             &[if_match, key][..],
             r#"{"lines":[{"op":"remove","line_id":"00000000-0000-0000-0000-00000000000a"}]}"#,
             bss_orders_sdk::OrdersError::Unavailable,
         ),
-        // A well-formed request reaches the stub.
+        // A well-formed request reaches the service: unavailable before `serve`.
         (
             &[if_match, key][..],
             amend_valid,
@@ -1461,7 +1493,48 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             "{headers:?} {body}"
         );
     }
-    // Neither the boundary refusals nor the stub wrote an audit, access-log or idempotency row.
+    // The local client decides the same well-formedness before any authority or store work,
+    // and a well-formed request reaches the same service.
+    let client = hub.get::<dyn OrdersV1>()?;
+    let call = |text: &str| -> anyhow::Result<CallMeta> {
+        Ok(CallMeta {
+            expected_version: OrderVersion::try_from(1)?,
+            idempotency_key: IdempotencyKey::try_from(text.to_owned())?,
+            correlation_id: None,
+            delegation_proof_ref: None,
+        })
+    };
+    let local = client
+        .amend(
+            &caller,
+            Uuid::from_u128(3),
+            serde_json::from_str(twice)?,
+            call("k-local-1")?,
+        )
+        .await;
+    assert!(
+        matches!(
+            local,
+            Err(bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid))
+        ),
+        "{local:?}"
+    );
+    let local = client
+        .amend(
+            &caller,
+            Uuid::from_u128(3),
+            serde_json::from_str(amend_valid)?,
+            call("k-local-2")?,
+        )
+        .await;
+    assert!(
+        matches!(local, Err(bss_orders_sdk::OrdersError::Unavailable)),
+        "{local:?}"
+    );
+    // Neither the boundary refusals nor the unbound service wrote an audit, access-log or
+    // idempotency row. (A reaching amendment's audit and idempotency rows are asserted on a bound
+    // engine in `infra::storage::tests::amend`; this host has no Event Broker, so `serve` never
+    // binds one here.)
     for table in [
         "bss_orders__transition_audit",
         "bss_orders__read_access_log",

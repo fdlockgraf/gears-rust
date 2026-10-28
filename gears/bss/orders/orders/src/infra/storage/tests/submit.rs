@@ -62,17 +62,19 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbTx;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
-const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
-const RESOURCE: u128 = 10;
-const SELLER: u128 = 20;
+pub(super) const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
+pub(super) const RESOURCE: u128 = 10;
+pub(super) const SELLER: u128 = 20;
 /// The seller's configured Orders service principal (D-194).
 const SERVICE: (u128, u128) = (700, 701);
+/// The configured Workflow service principal (`capture::identities`).
+pub(super) const WORKFLOW: (u128, u128) = (106, 99);
 /// A principal no rule names.
 const STRANGER: (u128, u128) = (104, 10);
 
 /// The buyer authors and submits on resource tenant 10 (`submit` absent when `revoked`).
 fn policy_with(submit: bool) -> Value {
-    let mut actions = vec!["create", "write", "edit", "read"];
+    let mut actions = vec!["create", "write", "edit", "read", "amend"];
     if submit {
         actions.push("submit");
     }
@@ -125,8 +127,8 @@ impl AuthZResolverApi for Revocable {
 /// The frozen basis over the platform default (no date required), on today's UTC date, so the
 /// engine's date-basis guard sees the proposed date it transitions on.
 #[derive(Default)]
-struct TodayDates {
-    prepared: AtomicUsize,
+pub(super) struct TodayDates {
+    pub(super) prepared: AtomicUsize,
 }
 #[async_trait]
 impl PreviewDates for TodayDates {
@@ -151,8 +153,8 @@ impl PreviewDates for TodayDates {
 
 /// The seller's service principal, counted.
 #[derive(Default)]
-struct Authority {
-    calls: AtomicUsize,
+pub(super) struct Authority {
+    pub(super) calls: AtomicUsize,
     rotated: AtomicBool,
     /// The exchange never answers (a hung `IdP`).
     stall: AtomicBool,
@@ -179,7 +181,7 @@ impl CommercialAuthority for Authority {
 
 /// The harness catalog's bindings: what the double accepts on.
 #[derive(Default)]
-struct FixedBindings {
+pub(super) struct FixedBindings {
     kinds: Mutex<BTreeMap<Uuid, bss_pricing_sdk::read::ChargeKind>>,
     multikey: bool,
     /// When set, every binding's SKU name (an oversized pin).
@@ -270,12 +272,12 @@ impl StubBindings for FixedBindings {
 /// The development double behind a script: per-line refusals, lost replies (the double issues
 /// and records its receipt, then the reply is lost), an already lapsed receipt, and a hook run
 /// on every call. Every call is counted with its command key.
-struct Scripted {
+pub(super) struct Scripted {
     stub: SellabilityStub,
     bindings: Arc<FixedBindings>,
     calls: Mutex<Vec<(String, Uuid)>>,
-    refuse: Mutex<BTreeMap<Uuid, CommercialReason>>,
-    lose_replies: AtomicUsize,
+    pub(super) refuse: Mutex<BTreeMap<Uuid, CommercialReason>>,
+    pub(super) lose_replies: AtomicUsize,
     lapsed: AtomicBool,
     on_call: Mutex<Option<OnCall>>,
 }
@@ -293,10 +295,10 @@ impl Scripted {
             on_call: Mutex::new(None),
         })
     }
-    fn calls(&self) -> usize {
+    pub(super) fn calls(&self) -> usize {
         self.calls.lock().len()
     }
-    fn keys(&self) -> Vec<String> {
+    pub(super) fn keys(&self) -> Vec<String> {
         self.calls.lock().iter().map(|(k, _)| k.clone()).collect()
     }
 }
@@ -354,12 +356,12 @@ pub(super) struct Fixture {
     pub(super) t: T,
     pub(super) capture: CaptureService,
     submit: SubmitService,
-    h: Harness,
-    dates: Arc<TodayDates>,
-    authority: Arc<Authority>,
+    pub(super) h: Harness,
+    pub(super) dates: Arc<TodayDates>,
+    pub(super) authority: Arc<Authority>,
     pdp: Arc<Revocable>,
-    acceptance: Arc<Scripted>,
-    engine: Arc<Engine>,
+    pub(super) acceptance: Arc<Scripted>,
+    pub(super) engine: Arc<Engine>,
 }
 
 // Multi-line commercial scenarios intentionally admit both lines on the fixture's shared SKU.
@@ -443,7 +445,7 @@ async fn setup_with_bindings(
 }
 
 /// The same service with the scripted double bound (a later process after a crash).
-fn rebind(f: &Fixture) -> SubmitService {
+pub(super) fn rebind(f: &Fixture) -> SubmitService {
     let port: Arc<dyn SellabilityV1> = f.acceptance.clone();
     SubmitService::new(
         Arc::new(ArcSwapOption::from(Some(Arc::clone(&f.engine)))),
@@ -562,7 +564,7 @@ async fn accepted_result(f: &Fixture, attempt: &commercial_attempt::Model) -> (S
 }
 
 /// Committed version numbers of `order`, ascending, with their `supersedes_version`.
-async fn versions(f: &Fixture, order: Uuid) -> Value {
+pub(super) async fn versions(f: &Fixture, order: Uuid) -> Value {
     f.t.json(&format!(
         "SELECT coalesce(jsonb_agg(jsonb_build_array(version, supersedes_version) \
          ORDER BY version), '[]'::jsonb) AS j FROM bss_orders__order_version \
@@ -572,7 +574,7 @@ async fn versions(f: &Fixture, order: Uuid) -> Value {
 }
 
 /// A rolling monthly line on the fixture's plan revision.
-fn line() -> AddLine {
+pub(super) fn line() -> AddLine {
     AddLine {
         plan_id: PLAN,
         plan_revision_id: REVISION,
@@ -591,7 +593,7 @@ fn line() -> AddLine {
 }
 
 /// A draft of `lines` lines (draft revision = `lines`), as the buyer; `tag` keeps keys distinct.
-async fn draft_tagged(f: &Fixture, lines: usize, tag: &str) -> OrderView {
+pub(super) async fn draft_tagged(f: &Fixture, lines: usize, tag: &str) -> OrderView {
     draft_tagged_items(f, lines, tag, false).await
 }
 async fn draft_tagged_items(f: &Fixture, lines: usize, tag: &str, multikey: bool) -> OrderView {
@@ -680,7 +682,7 @@ pub(super) async fn submit(
     submit_with(&f.submit, caller, v, text).await
 }
 
-async fn attempts(f: &Fixture, order: Uuid) -> i64 {
+pub(super) async fn attempts(f: &Fixture, order: Uuid) -> i64 {
     f.t.n(&format!(
         "SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE order_id='{order}'"
     ))
@@ -692,14 +694,14 @@ async fn attempt_status(f: &Fixture, order: Uuid) -> Value {
     ))
     .await
 }
-async fn high_water(f: &Fixture, order: Uuid) -> i64 {
+pub(super) async fn high_water(f: &Fixture, order: Uuid) -> i64 {
     f.t.n(&format!(
         "SELECT version_allocation_high_water::bigint AS n FROM bss_orders__order WHERE order_id='{order}'"
     ))
     .await
 }
 /// Committed versions, line rows, pinned lines and totals rows of `order`.
-async fn committed(f: &Fixture, order: Uuid) -> (i64, i64, i64, i64) {
+pub(super) async fn committed(f: &Fixture, order: Uuid) -> (i64, i64, i64, i64) {
     let n = async |sql: String| f.t.n(&sql).await;
     (
         n(format!(
@@ -721,7 +723,7 @@ async fn committed(f: &Fixture, order: Uuid) -> (i64, i64, i64, i64) {
     )
 }
 /// Lapse the lease of every in-flight marker and attempt of `order` (a crashed owner).
-async fn lapse_leases(f: &Fixture, order: Uuid) {
+pub(super) async fn lapse_leases(f: &Fixture, order: Uuid) {
     f.t.env
         .pg
         .sql(&format!(
@@ -3065,7 +3067,7 @@ fn contract_fixture(required: Option<bool>) -> StubFixture {
 }
 
 /// Every acceptance row of `order`, ascending by version.
-async fn acceptances(f: &Fixture, order: Uuid) -> Value {
+pub(super) async fn acceptances(f: &Fixture, order: Uuid) -> Value {
     f.t.json(&format!(
         "SELECT coalesce(jsonb_agg(jsonb_build_object('version', accepted_version, \
          'accepted_at', accepted_at, 'recorded_by', recorded_by, 'path', recording_path, \
@@ -3076,7 +3078,7 @@ async fn acceptances(f: &Fixture, order: Uuid) -> Value {
 }
 
 /// The `data` of the newest outbox event.
-async fn last_event(f: &Fixture) -> Value {
+pub(super) async fn last_event(f: &Fixture) -> Value {
     let envelope =
         f.t.json(
             "SELECT convert_from(payload, 'UTF8')::jsonb AS j FROM toolkit_outbox_body \
@@ -3088,7 +3090,7 @@ async fn last_event(f: &Fixture) -> Value {
 
 /// The engine's transition instant of the committed `version` (the version row's `created_at`,
 /// also the order's `state_entered_at`), as stored.
-async fn transition_instant(f: &Fixture, order: Uuid, version: i64) -> Value {
+pub(super) async fn transition_instant(f: &Fixture, order: Uuid, version: i64) -> Value {
     let t =
         f.t.json(&format!(
             "SELECT to_jsonb(v.created_at) AS j FROM bss_orders__order_version v \

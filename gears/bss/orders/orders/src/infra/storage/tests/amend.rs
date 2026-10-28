@@ -1,0 +1,972 @@
+//! Amendment on real PostgreSQL (S4-03/S4-04; 04 §3.6 *Append Amendment*; Stage 4 DESIGN §3):
+//! the amendment service over the submit fixture (rules PDP, authorized reads, the gate
+//! orchestrator over the dev stubs, Pricing's development double behind the scripted wrapper).
+//! A submitted order at version N is amended by a delta: the shared assessment runs over every
+//! proposed line, the D-188 attempt reserves candidate M and phase C appends M through the
+//! engine (`supersedes_version = N`, reason `amendment`, one `OrderAmended`). Compiled only with
+//! `gate-dev-stubs`.
+use super::capture::{buyer, key, s};
+use super::engine::fixed;
+use super::submit::{
+    Fixture, ORDER_RT, SELLER, WORKFLOW, acceptances, attempts, committed, draft_tagged,
+    high_water, lapse_leases, last_event, rebind, setup_with, submit, transition_instant,
+    two_line_fixture, versions,
+};
+use super::*;
+use crate::authz::Caller;
+use crate::authz::test_pdp::{RulesProvider, service};
+use crate::domain::contributions::AggregateContribution;
+use crate::domain::gate::ports::GatePort;
+use crate::domain::state_table::RowId;
+use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, InputState, Inputs};
+use crate::infra::amend::AmendService;
+use crate::infra::capture::{Settled, SettledOutcome};
+use crate::infra::engine::documents::EventDetail;
+use crate::infra::engine::{EngineOutcome, OutcomeKind, Prepared, Registries, TransitionRequest};
+use crate::infra::events::payload::OrderApproved;
+use crate::infra::gate::tests::orchestrate::PAYER;
+use bss_orders_sdk::OrdersError;
+use bss_orders_sdk::amend::AmendOrder;
+use bss_orders_sdk::authoring::OrderView;
+use bss_orders_sdk::catalog::{Reason, Trigger};
+use bss_orders_sdk::models::{CallMeta, OrderVersion};
+use bss_pricing_sdk::acceptance::CommercialReason;
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use tokio_util::sync::CancellationToken;
+
+/// The amendment service over the fixture's engine, gate, dates, authority and Pricing double.
+fn amend_service(f: &Fixture) -> AmendService {
+    AmendService::new(Arc::new(rebind(f)))
+}
+
+fn amend_meta(text: &str, version: i64) -> CallMeta {
+    CallMeta {
+        expected_version: OrderVersion::try_from(version).unwrap(),
+        idempotency_key: key(text),
+        correlation_id: None,
+        delegation_proof_ref: None,
+    }
+}
+
+async fn amend_as(
+    svc: &AmendService,
+    caller: &Caller,
+    order: Uuid,
+    version: i64,
+    request: Value,
+    text: &str,
+) -> Result<Settled, OrdersError> {
+    let request: AmendOrder = serde_json::from_value(request).unwrap();
+    svc.amend(
+        caller,
+        order,
+        request,
+        &amend_meta(text, version),
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+async fn amend(
+    f: &Fixture,
+    order: Uuid,
+    version: i64,
+    request: Value,
+    text: &str,
+) -> Result<Settled, OrdersError> {
+    amend_as(&amend_service(f), &buyer(), order, version, request, text).await
+}
+
+/// A submitted order of `lines` lines: the draft view (its line ids are N's) and N.
+async fn submitted(f: &Fixture, lines: usize, tag: &str) -> (OrderView, i64) {
+    let v = draft_tagged(f, lines, tag).await;
+    let settled = submit(f, &buyer(), &v, &format!("{tag}-submit"))
+        .await
+        .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let n = settled.response.body()["version"].as_i64().unwrap();
+    (v, n)
+}
+
+/// A delta changing line `line`'s quantity to `quantity`.
+fn change_quantity(line: Uuid, quantity: &str) -> Value {
+    json!({"reason": "bigger plan", "lines": [{"op": "change", "line_id": line,
+        "patch": {"selected_items": [{"item_id": crate::infra::gate::tests::orchestrate::ITEM,
+            "quantity": quantity}]}}]})
+}
+
+/// Every external call the fixture counts: gate ports, catalog reads, date preparations,
+/// principal lookups and Pricing commands.
+fn external_calls(f: &Fixture) -> usize {
+    GatePort::ALL
+        .iter()
+        .map(|p| f.h.calls.of(*p))
+        .sum::<usize>()
+        + *f.h.calls.read_lines.lock()
+        + f.dates.prepared.load(Ordering::SeqCst)
+        + f.authority.calls.load(Ordering::SeqCst)
+        + f.acceptance.calls()
+}
+
+async fn order_row(f: &Fixture, order: Uuid) -> Value {
+    f.t.json(&format!(
+        "SELECT to_jsonb(o) AS j FROM bss_orders__order o WHERE order_id='{order}'"
+    ))
+    .await
+}
+
+/// Every row that belongs to committed version `version` of `order`: the version row, its
+/// lines and totals, ordered, as JSON (byte-identical comparisons).
+async fn version_rows(f: &Fixture, order: Uuid, version: i64) -> Value {
+    f.t.json(&format!(
+        "SELECT jsonb_build_array( \
+           (SELECT to_jsonb(v) FROM bss_orders__order_version v WHERE order_id='{order}' AND version={version}), \
+           (SELECT coalesce(jsonb_agg(to_jsonb(l) ORDER BY line_id), '[]') FROM bss_orders__order_line l WHERE order_id='{order}' AND version={version}), \
+           (SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY scope, line_id, charge_kind), '[]') FROM bss_orders__resolved_total t WHERE order_id='{order}' AND version={version}), \
+           (SELECT coalesce(jsonb_agg(to_jsonb(a) ORDER BY accepted_version), '[]') FROM bss_orders__acceptance a WHERE order_id='{order}')) AS j"
+    ))
+    .await
+}
+
+/// Live claims of `order` (the claim set N holds).
+async fn live_claims(f: &Fixture, order: Uuid) -> Value {
+    f.t.json(&format!(
+        "SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY claim_id), '[]') AS j \
+         FROM bss_orders__inflight_overlap_claim c WHERE order_id='{order}' AND released_at IS NULL"
+    ))
+    .await
+}
+
+/// Set an aggregate column directly (a state the fixture cannot reach through delivered paths).
+async fn force(f: &Fixture, order: Uuid, assignment: &str) {
+    f.t.env
+        .pg
+        .sql(&format!(
+            "ALTER TABLE bss_orders__order DISABLE TRIGGER USER; \
+             UPDATE bss_orders__order SET {assignment} WHERE order_id='{order}'; \
+             ALTER TABLE bss_orders__order ENABLE TRIGGER USER;"
+        ))
+        .await
+        .unwrap();
+}
+
+fn workflow() -> Caller {
+    service(WORKFLOW.0, WORKFLOW.1)
+}
+
+/// A Workflow approval reflection of `order` at `version` (row 7, 8 or 9) with the row's guards
+/// bound passing (the S5-03 owner's predicates are not this package's).
+async fn reflect(
+    f: &Fixture,
+    order: Uuid,
+    row: u8,
+    trigger: Trigger,
+    version: i64,
+    text: &str,
+) -> EngineOutcome {
+    let registries = Registries::compile().unwrap();
+    let guards = registries.guards.row_guards(RowId::of(row));
+    let mut p = Prepared::new(AggregateContribution::None);
+    p.guards = guards.iter().fold(GuardBindings::new(), |b, g| {
+        b.bind(g.name, |_: &GuardSubject<'_>| GuardVerdict::Pass)
+    });
+    p.inputs = registries
+        .guards
+        .row_inputs(RowId::of(row))
+        .into_iter()
+        .fold(Inputs::new(), |i, port| i.with(port, InputState::Resolved));
+    if matches!(row, 8 | 9) {
+        p.event = Some(Arc::new(EventDetail(OrderApproved {
+            deciding_authority: "approver-1".into(),
+            approved_version: i32::try_from(version).unwrap(),
+        })));
+    }
+    // Workflow decisions carry a finite order-ID path restriction (D-182 seam policy).
+    let policy = json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s4-03",
+    "rules": [{
+        "id": "workflow", "subject": {"id": s(Uuid::from_u128(WORKFLOW.0))},
+        "resource_type": ORDER_RT, "actions": ["read", "approval_reflection"],
+        "paths": [{"predicates": [
+            {"property": "id", "values": [s(order)]},
+            {"property": "seller_tenant_id", "values": [s(Uuid::from_u128(SELLER))]}]}],
+    }]});
+    f.t.engine(RulesProvider::from_policy(policy))
+        .transition(
+            &workflow(),
+            TransitionRequest {
+                order_id: order,
+                trigger,
+                operation: "reflect_approval",
+                expected_version: OrderVersion::try_from(version).unwrap(),
+                expected_draft_revision: None,
+                document: json!({"verdict": text}),
+                proposed: None,
+                caller_reason: None,
+                idempotency_key: key(text),
+                correlation_id: None,
+                execution: None,
+            },
+            &fixed(p),
+        )
+        .await
+        .unwrap()
+}
+
+/// S4-04: an amendment of a `submitted` order commits M superseding N with the explanation
+/// stored on the version and the audit entry, counts once, keeps the state and its entry time,
+/// moves the claims to M and emits exactly one `OrderAmended { supersedesVersion: N }`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amend_submitted_order_commits_m_superseding_n() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 2, "am-commit").await;
+    let order = v.order.order_id;
+    let before = order_row(&f, order).await;
+    let claims_n = live_claims(&f, order).await;
+    let m = high_water(&f, order).await + 1;
+    let outbox = f.t.outbox().await;
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-commit-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert!(m > n);
+    assert_eq!(settled.response.body()["version"], json!(m));
+    assert_eq!(settled.response.body()["state"], json!("submitted"));
+    let after = order_row(&f, order).await;
+    assert_eq!(after["current_version"], json!(m));
+    assert_eq!(after["state"], json!("submitted"));
+    assert_eq!(after["amendment_count"], json!(1));
+    assert_eq!(after["state_entered_at"], before["state_entered_at"]);
+    assert_eq!(
+        f.t.json(&format!(
+            "SELECT jsonb_build_array(supersedes_version, reason, amendment_reason) AS j \
+             FROM bss_orders__order_version WHERE order_id='{order}' AND version={m}"
+        ))
+        .await,
+        json!([n, "amendment", "bigger plan"])
+    );
+    assert_eq!(
+        f.t.json(&format!(
+            "SELECT jsonb_agg(jsonb_build_array(caller_reason, version)) AS j \
+             FROM bss_orders__transition_audit WHERE order_id='{order}' AND trigger='amendment'"
+        ))
+        .await,
+        json!([["bigger plan", m]])
+    );
+    // M's lines: both proposed lines, pinned at M; the changed quantity is M's.
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__order_line WHERE order_id='{order}' \
+             AND version={m} AND order_pin IS NOT NULL"
+        ))
+        .await,
+        2
+    );
+    assert_eq!(
+        f.t.json(&format!(
+            "SELECT selected_items->0->'quantity' AS j FROM bss_orders__order_line \
+             WHERE order_id='{order}' AND version={m} AND line_id='{}'",
+            v.lines[0].line_id
+        ))
+        .await,
+        json!("2")
+    );
+    // The complete proposed claim set is live: the same (payer, resource, key) tuple is
+    // retained, never released and re-taken.
+    assert_eq!(live_claims(&f, order).await, claims_n);
+    assert_eq!(claims_n.as_array().unwrap().len(), 1);
+    assert_eq!(f.t.outbox().await, outbox + 1, "exactly one OrderAmended");
+    let event = last_event(&f).await;
+    assert_eq!(event["supersedesVersion"], json!(n), "{event}");
+    assert_eq!(event["orderVersion"], json!(m));
+    assert_eq!(event["state"], json!("submitted"));
+    assert_eq!(attempts(&f, order).await, 2);
+    // The reads compose M.
+    let read = f.t.reads().get(&buyer(), order).await.unwrap();
+    assert_eq!(i64::from(read.version.version), m);
+    assert_eq!(read.version.supersedes_version.map(i64::from), Some(n));
+}
+
+/// Rows 19/20: an amendment of an `approved` order targets `submitted`, and the state change
+/// moves `state_entered_at` to the engine's transition time.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amend_from_approved_targets_submitted_and_updates_state_entered_at() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-approved").await;
+    let order = v.order.order_id;
+    let approved = reflect(
+        &f,
+        order,
+        8,
+        Trigger::ReflectApprovalNotRequired,
+        n,
+        "am-approved-r",
+    )
+    .await;
+    assert!(
+        matches!(approved.kind, OutcomeKind::Committed { .. }),
+        "{approved:?}"
+    );
+    assert_eq!(order_row(&f, order).await["state"], json!("approved"));
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "3"),
+        "am-approved-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let m = settled.response.body()["version"].as_i64().unwrap();
+    let after = order_row(&f, order).await;
+    assert_eq!(after["state"], json!("submitted"));
+    // `transition_instant` asserts the order's entry time is M's creation instant.
+    transition_instant(&f, order, m).await;
+    let event = last_event(&f).await;
+    assert_eq!(event["supersedesVersion"], json!(n), "{event}");
+    assert_eq!(event["orderVersion"], json!(m));
+}
+
+/// 04 §3.6 step 5: the shared assessment runs over every proposed line, the untouched one
+/// included: each line is commanded at M under its own key.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amend_reassesses_untouched_lines() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 2, "am-all").await;
+    let order = v.order.order_id;
+    let commands = f.acceptance.calls();
+    let reads = *f.h.calls.read_lines.lock();
+    let m = high_water(&f, order).await + 1;
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-all-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(f.acceptance.calls(), commands + 2);
+    let untouched = v.lines[1].line_id;
+    assert!(
+        f.acceptance
+            .keys()
+            .contains(&format!("{order}/{m}/{untouched}/submit")),
+        "{:?}",
+        f.acceptance.keys()
+    );
+    assert_eq!(*f.h.calls.read_lines.lock(), reads + 1, "one catalog call");
+    // M's diagnostics name both lines.
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(DISTINCT line_id) AS n FROM bss_orders__gate_outcome \
+             WHERE order_id='{order}' AND version={m} AND line_id IS NOT NULL"
+        ))
+        .await,
+        2
+    );
+}
+
+/// Nothing from N is evidence for M: N's consent stays N's, and M has none.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn new_version_has_no_consent() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-consent").await;
+    let order = v.order.order_id;
+    let consent_n = acceptances(&f, order).await;
+    assert_eq!(consent_n[0]["version"], json!(n), "{consent_n}");
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-consent-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(acceptances(&f, order).await, consent_n);
+}
+
+/// D-215/D-228: a payer change is assessed by gate predicate 1 like a submit; a payer outside
+/// the resource relationship refuses `payer-relationship-unconfirmed`, audited and settled, and
+/// N stays current.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn payer_change_without_resource_relationship_refuses_payer_relationship_unconfirmed() {
+    let other = Uuid::from_u128(31);
+    let mut stubs = two_line_fixture();
+    let mut profile = stubs.payer_profiles[&PAYER].clone();
+    profile.in_relationship_with_resource = false;
+    stubs.payer_profiles.insert(other, profile);
+    let f = setup_with(stubs, 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-payer").await;
+    let order = v.order.order_id;
+    let settled = amend(
+        &f,
+        order,
+        n,
+        json!({"reason": "new payer", "header": {"payer_tenant_id": other}}),
+        "am-payer-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::PayerRelationshipUnconfirmed)),
+        "{settled:?}"
+    );
+    let row = order_row(&f, order).await;
+    assert_eq!(row["current_version"], json!(n));
+    assert_eq!(row["payer_tenant_id"], json!(PAYER));
+    assert_eq!(row["amendment_count"], json!(0));
+}
+
+/// 04 §4.1, D-113: at the cap the amendment refuses `amendment-cap-exhausted` before any
+/// external call: the gate inputs are precluded, never unavailable.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn cap_exhausted_makes_no_external_calls() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-cap").await;
+    let order = v.order.order_id;
+    force(&f, order, "amendment_count = 20").await;
+    let calls = external_calls(&f);
+    let high = high_water(&f, order).await;
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-cap-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::AmendmentCapExhausted)),
+        "{settled:?}"
+    );
+    assert_eq!(external_calls(&f), calls);
+    assert_eq!(high_water(&f, order).await, high, "no candidate reserved");
+    // Every other early local guard precludes the gate the same way (an empty delta here).
+    let settled = amend(&f, order, n, json!({"reason": "nothing"}), "am-cap-2")
+        .await
+        .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::AmendmentCapExhausted))
+    );
+    force(&f, order, "amendment_count = 0").await;
+    let settled = amend(&f, order, n, json!({"reason": "nothing"}), "am-cap-3")
+        .await
+        .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::AmendmentEmpty))
+    );
+    let unknown = Uuid::from_u128(0xdead);
+    let settled = amend(
+        &f,
+        order,
+        n,
+        json!({"reason": "r", "lines": [{"op": "remove", "line_id": unknown}]}),
+        "am-cap-4",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::LineNotFound))
+    );
+    let settled = amend(
+        &f,
+        order,
+        n,
+        json!({"reason": "r", "lines": [{"op": "remove", "line_id": v.lines[0].line_id}]}),
+        "am-cap-5",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::NoLines))
+    );
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2")
+            .as_object()
+            .map(|o| {
+                let mut o = o.clone();
+                o.insert("reason".into(), json!(""));
+                Value::Object(o)
+            })
+            .unwrap(),
+        "am-cap-6",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::AmendmentReasonInvalid))
+    );
+    assert_eq!(external_calls(&f), calls);
+    assert_eq!(high_water(&f, order).await, high);
+}
+
+/// D-212: a stale well-formed `If-Match` is the audited, settled `precondition-failed` naming
+/// the current version, with no external call.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn stale_if_match_is_412() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-stale").await;
+    let order = v.order.order_id;
+    let calls = external_calls(&f);
+    let settled = amend(
+        &f,
+        order,
+        n - 1,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-stale-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::PreconditionFailed)),
+        "{settled:?}"
+    );
+    assert_eq!(settled.response.status(), 412);
+    assert_eq!(
+        settled.response.body()["context"]["data"]["current_version"],
+        json!(n)
+    );
+    assert_eq!(external_calls(&f), calls);
+}
+
+/// D-188 E2: the same key replays the settled amendment before any read, date, gate or Pricing
+/// work.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn exact_retry_makes_no_fresh_resolution() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-retry").await;
+    let order = v.order.order_id;
+    let request = change_quantity(v.lines[0].line_id, "2");
+    let first = amend(&f, order, n, request.clone(), "am-retry-1")
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, SettledOutcome::Committed, "{first:?}");
+    let calls = external_calls(&f);
+    let outbox = f.t.outbox().await;
+    let replay = amend(&f, order, n, request, "am-retry-1").await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.response, first.response);
+    assert_eq!(external_calls(&f), calls);
+    assert_eq!(f.t.outbox().await, outbox);
+}
+
+/// U8 / 04 §3.6 step 1: amendment from `in_fulfillment` is a state-admissibility refusal, even
+/// with the cap exhausted.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amend_in_fulfillment_is_not_admissible() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-fulfil").await;
+    let order = v.order.order_id;
+    force(&f, order, "state = 'in_fulfillment', amendment_count = 20").await;
+    let calls = external_calls(&f);
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-fulfil-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::NotAdmissible)),
+        "{settled:?}"
+    );
+    assert_eq!(
+        settled.response.body()["context"]["data"]["state"],
+        json!("in_fulfillment")
+    );
+    assert_eq!(external_calls(&f), calls);
+}
+
+/// Sparse versions (D-188): two burned submit candidates and two burned amendment candidates
+/// leave the committed history 1 → 4 → 7.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sparse_versions_1_4_7() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let v = draft_tagged(&f, 1, "am-sparse").await;
+    let order = v.order.order_id;
+    let line = v.lines[0].line_id;
+    f.acceptance
+        .refuse
+        .lock()
+        .insert(line, CommercialReason::NotSellable);
+    for k in ["am-sparse-s1", "am-sparse-s2"] {
+        let refused = submit(&f, &buyer(), &v, k).await.unwrap();
+        assert_eq!(
+            refused.outcome,
+            SettledOutcome::Refused(Some(Reason::CatalogPredicateFailed))
+        );
+    }
+    f.acceptance.refuse.lock().clear();
+    let settled = submit(&f, &buyer(), &v, "am-sparse-s3").await.unwrap();
+    assert_eq!(settled.response.body()["version"], json!(4));
+    f.acceptance
+        .refuse
+        .lock()
+        .insert(line, CommercialReason::NotSellable);
+    for k in ["am-sparse-a1", "am-sparse-a2"] {
+        let refused = amend(&f, order, 4, change_quantity(line, "2"), k)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.outcome,
+            SettledOutcome::Refused(Some(Reason::CatalogPredicateFailed)),
+            "{refused:?}"
+        );
+    }
+    f.acceptance.refuse.lock().clear();
+    let settled = amend(&f, order, 4, change_quantity(line, "2"), "am-sparse-a3")
+        .await
+        .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(settled.response.body()["version"], json!(7));
+    assert_eq!(
+        versions(&f, order).await,
+        json!([[1, null], [4, 1], [7, 4]])
+    );
+    // Failed attempts do not count toward the cap.
+    assert_eq!(order_row(&f, order).await["amendment_count"], json!(1));
+}
+
+/// A failed amendment attempt burns its candidate and leaves every row of N, N's claims and the
+/// aggregate's commercial facts exactly as they were.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn failed_attempt_leaves_n_byte_identical_and_burns_the_candidate() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 2, "am-burn").await;
+    let order = v.order.order_id;
+    let rows_n = version_rows(&f, order, n).await;
+    let claims_n = live_claims(&f, order).await;
+    let before = order_row(&f, order).await;
+    let high = high_water(&f, order).await;
+    let (versions_n, ..) = committed(&f, order).await;
+    f.acceptance
+        .refuse
+        .lock()
+        .insert(v.lines[1].line_id, CommercialReason::NotSellable);
+    let refused = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-burn-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.outcome,
+        SettledOutcome::Refused(Some(Reason::CatalogPredicateFailed)),
+        "{refused:?}"
+    );
+    assert_eq!(version_rows(&f, order, n).await, rows_n);
+    assert_eq!(live_claims(&f, order).await, claims_n);
+    assert_eq!(committed(&f, order).await.0, versions_n);
+    let after = order_row(&f, order).await;
+    assert_eq!(
+        high_water(&f, order).await,
+        high + 1,
+        "the candidate burned"
+    );
+    for column in [
+        "current_version",
+        "state",
+        "state_entered_at",
+        "amendment_count",
+        "payer_tenant_id",
+        "category",
+        "contract_id",
+    ] {
+        assert_eq!(after[column], before[column], "{column}");
+    }
+}
+
+/// A lost Pricing reply leaves the attempt unsettled; the same-key retry continues under the
+/// frozen inputs (no second gate run) and commits; a lost final response replays exactly.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn lost_response_replays_exactly() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-lost").await;
+    let order = v.order.order_id;
+    let request = change_quantity(v.lines[0].line_id, "2");
+    // The first command and its one retry both lose their reply.
+    f.acceptance.lose_replies.store(2, Ordering::SeqCst);
+    let lost = amend(&f, order, n, request.clone(), "am-lost-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(lost, OrdersError::Unavailable), "{lost:?}");
+    let reads = *f.h.calls.read_lines.lock();
+    let prepared = f.dates.prepared.load(Ordering::SeqCst);
+    lapse_leases(&f, order).await;
+    let settled = amend(&f, order, n, request.clone(), "am-lost-1")
+        .await
+        .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(*f.h.calls.read_lines.lock(), reads, "no fresh gate run");
+    assert_eq!(f.dates.prepared.load(Ordering::SeqCst), prepared);
+    let calls = external_calls(&f);
+    let replay = amend(&f, order, n, request, "am-lost-1").await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.response, settled.response);
+    assert_eq!(external_calls(&f), calls);
+}
+
+/// Stage 4 DESIGN §3: a Workflow result naming N after M exists is `version-conflict` naming
+/// M, decided before Workflow-class admissibility and never converted to a denial.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn stale_workflow_result_naming_n_is_version_conflict_with_m() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-wf").await;
+    let order = v.order.order_id;
+    let required = reflect(&f, order, 7, Trigger::ReflectApprovalRequired, n, "am-wf-r").await;
+    assert!(
+        matches!(required.kind, OutcomeKind::Committed { .. }),
+        "{required:?}"
+    );
+    let settled = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-wf-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let m = settled.response.body()["version"].as_i64().unwrap();
+    // The verdict on N arrives after M exists (the order is `submitted` again).
+    let stale = reflect(&f, order, 9, Trigger::ReflectApprovalGranted, n, "am-wf-g").await;
+    let OutcomeKind::Refused { reason, .. } = stale.kind else {
+        panic!("{stale:?}")
+    };
+    assert_eq!(reason, Reason::VersionConflict);
+    assert_eq!(stale.response.status(), 409);
+    assert_eq!(
+        stale.response.body()["context"]["data"]["current_version"],
+        json!(m)
+    );
+    let row = order_row(&f, order).await;
+    assert_eq!(row["state"], json!("submitted"));
+    assert_eq!(row["current_version"], json!(m));
+}
+
+/// E1 (D-188 step 2): a new amendment execution rechecks, under the reservation lock, that the
+/// amendment is admissible from the locked state and that the locked version is the caller's
+/// expected one; a stale or inadmissible request reserves no candidate and creates no attempt.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amendment_reservation_rechecks_state_and_version_under_the_lock() {
+    use crate::domain::error::EngineError;
+    use crate::infra::storage::repo::idempotency::AttemptInputs;
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-e1").await;
+    let order = v.order.order_id;
+    let request = |version: i64, text: &str| TransitionRequest {
+        order_id: order,
+        trigger: Trigger::Amendment,
+        operation: "amend",
+        expected_version: OrderVersion::try_from(version).unwrap(),
+        expected_draft_revision: None,
+        document: json!({"e1": text}),
+        proposed: None,
+        caller_reason: Some("r".into()),
+        idempotency_key: key(text),
+        correlation_id: None,
+        execution: None,
+    };
+    let inputs = || AttemptInputs {
+        prepared_draft_revision: None,
+        proposed_arrangement: json!({}),
+        authorization_fact_fingerprint: "facts".into(),
+        original_principal: json!({}),
+        proof_reference: None,
+        date_policy_basis: json!({}),
+        commercial_subject_id: Uuid::from_u128(1),
+        commercial_subject_type: "user".into(),
+        commercial_subject_tenant_id: Uuid::from_u128(2),
+    };
+    let attempts_before = attempts(&f, order).await;
+    let high = high_water(&f, order).await;
+    let stale = f
+        .engine
+        .prepare_commercial_attempt(&buyer(), &request(n - 1, "am-e1-1"), inputs(), |_| {
+            Ok(json!({}))
+        })
+        .await;
+    assert!(
+        matches!(stale, Err(EngineError::Refused(Reason::PreconditionFailed))),
+        "{stale:?}"
+    );
+    force(&f, order, "state = 'in_fulfillment'").await;
+    let inadmissible = f
+        .engine
+        .prepare_commercial_attempt(&buyer(), &request(n, "am-e1-2"), inputs(), |_| {
+            Ok(json!({}))
+        })
+        .await;
+    assert!(
+        matches!(
+            inadmissible,
+            Err(EngineError::Refused(Reason::NotAdmissible))
+        ),
+        "{inadmissible:?}"
+    );
+    assert_eq!(high_water(&f, order).await, high);
+    assert_eq!(attempts(&f, order).await, attempts_before);
+}
+
+/// A payer the resource relationship confirms: M is committed under the proposed arrangement
+/// (the PEP-authorized payer on the aggregate and the version), and the complete claim set moves
+/// to the new payer's tuple while N's tuple becomes released history.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amend_changes_the_payer_and_replaces_the_claim_tuple() {
+    let other = Uuid::from_u128(31);
+    let mut stubs = two_line_fixture();
+    let profile = stubs.payer_profiles[&PAYER].clone();
+    stubs.payer_profiles.insert(other, profile);
+    let f = setup_with(stubs, 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-payer-ok").await;
+    let order = v.order.order_id;
+    let settled = amend(
+        &f,
+        order,
+        n,
+        json!({"reason": "new payer", "header": {"payer_tenant_id": other}}),
+        "am-payer-ok-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let m = settled.response.body()["version"].as_i64().unwrap();
+    assert_eq!(order_row(&f, order).await["payer_tenant_id"], json!(other));
+    assert_eq!(
+        f.t.json(&format!(
+            "SELECT to_jsonb(payer_tenant_id) AS j FROM bss_orders__order_version \
+             WHERE order_id='{order}' AND version={m}"
+        ))
+        .await,
+        json!(other)
+    );
+    let live = live_claims(&f, order).await;
+    assert_eq!(live.as_array().unwrap().len(), 1, "{live}");
+    assert_eq!(live[0]["payer_tenant_id"], json!(other));
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__inflight_overlap_claim WHERE order_id='{order}' \
+             AND payer_tenant_id='{PAYER}' AND released_at IS NOT NULL"
+        ))
+        .await,
+        1
+    );
+    // The reads compose M under the new payer.
+    let read = f.t.reads().get(&buyer(), order).await.unwrap();
+    assert_eq!(read.order.payer_tenant_id, other);
+}
+
+/// An added line gets a new identity reserved at M's transition, and a recovered attempt
+/// re-merges the same delta with the attempt's own added id (never a fresh one), so the commit
+/// admits exactly the frozen lines; the retained line keeps its id.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn added_line_identity_survives_recovery() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-add").await;
+    let order = v.order.order_id;
+    let retained = v.lines[0].line_id;
+    let add = serde_json::to_value(super::submit::line()).unwrap();
+    let request = json!({"reason": "one more", "lines": [{"op": "add", "line": add}]});
+    f.acceptance.lose_replies.store(2, Ordering::SeqCst);
+    let lost = amend(&f, order, n, request.clone(), "am-add-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(lost, OrdersError::Unavailable), "{lost:?}");
+    let frozen: Vec<Uuid> =
+        f.t.json(&format!(
+            "SELECT to_jsonb(array(SELECT k FROM jsonb_object_keys(line_requests) k \
+             WHERE k <> 'order' ORDER BY k)) AS j FROM bss_orders__commercial_attempt \
+             WHERE order_id='{order}' AND status IN ('prepared','running')"
+        ))
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(frozen.len(), 2);
+    assert!(frozen.contains(&retained));
+    let added = *frozen.iter().find(|id| **id != retained).unwrap();
+    lapse_leases(&f, order).await;
+    let settled = amend(&f, order, n, request, "am-add-1").await.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let m = settled.response.body()["version"].as_i64().unwrap();
+    let mut lines: Vec<Uuid> =
+        f.t.json(&format!(
+            "SELECT jsonb_agg(line_id) AS j FROM bss_orders__order_line \
+             WHERE order_id='{order}' AND version={m}"
+        ))
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap().parse().unwrap())
+        .collect();
+    lines.sort_unstable();
+    let mut expected = vec![retained, added];
+    expected.sort_unstable();
+    assert_eq!(lines, expected);
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__order_line_identity \
+             WHERE order_id='{order}' AND line_id='{added}'"
+        ))
+        .await,
+        1
+    );
+    // N keeps its one line.
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__order_line WHERE order_id='{order}' AND version={n}"
+        ))
+        .await,
+        1
+    );
+}

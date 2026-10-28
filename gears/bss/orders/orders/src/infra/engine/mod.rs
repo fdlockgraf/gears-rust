@@ -912,11 +912,12 @@ impl Engine {
     /// that transaction, and only for a new execution. Its failure aborts the transaction, so no
     /// candidate, attempt or marker link survives it.
     ///
-    /// A new submit execution first rechecks, under the same aggregate lock, that the submit is
-    /// admissible from the locked state and that the locked draft revision is both the caller's
-    /// `expected_draft_revision` and the attempt's `prepared_draft_revision` (E1): a draft edit
-    /// that landed after the slice's read answers the same unsettled refusal the ordinary path
-    /// decides (`version-conflict`, `precondition-failed` or `not-admissible`) and the whole
+    /// A new execution first rechecks, under the same aggregate lock, that the trigger is
+    /// admissible from the locked state and that the locked version is the caller's expected one;
+    /// a submit also that the locked draft revision is both the caller's `expected_draft_revision`
+    /// and the attempt's `prepared_draft_revision` (E1). A draft edit, an amendment or a state
+    /// change that landed after the slice's read answers the same unsettled refusal the ordinary
+    /// path decides (`version-conflict`, `precondition-failed` or `not-admissible`) and the whole
     /// transaction rolls back, so no candidate is allocated and no attempt or claim survives.
     ///
     /// # Errors
@@ -1144,23 +1145,30 @@ impl Engine {
                         // E2: a recovery never starts an execution; the fresh claim rolls back.
                         DurableStart::Recover => return Err(Abort::NothingToResume),
                         DurableStart::Commercial(inputs, lines) => {
-                            // E1: the draft revision and admissibility under this lock.
-                            if trigger == Trigger::Submit {
-                                let revisions = DraftRevisions::Draft {
+                            // E1: admissibility from the locked state and the expected
+                            // version under this lock, and for submit the draft revision too.
+                            let revisions = match trigger {
+                                Trigger::Submit => DraftRevisions::Draft {
                                     client: client_revision,
                                     prepared: inputs.prepared_draft_revision.ok_or(
                                         Abort::Integration("submit without a draft revision"),
                                     )?,
-                                };
-                                if let Err(refusal) = transition::admit(
-                                    &engine.registries.table,
-                                    trigger,
-                                    &aggregate_facts(locked.row())?,
-                                    expected_version,
-                                    revisions,
-                                )? {
-                                    return Err(Abort::UnreservedRefusal(refusal.reason()));
+                                },
+                                Trigger::Amendment => DraftRevisions::NotApplicable,
+                                _ => {
+                                    return Err(Abort::Integration(
+                                        "a commercial attempt for another trigger",
+                                    ));
                                 }
+                            };
+                            if let Err(refusal) = transition::admit(
+                                &engine.registries.table,
+                                trigger,
+                                &aggregate_facts(locked.row())?,
+                                expected_version,
+                                revisions,
+                            )? {
+                                return Err(Abort::UnreservedRefusal(refusal.reason()));
                             }
                             // A failed snapshot aborts before the attempt insert; the
                             // rollback releases the candidate and the fresh claim.
