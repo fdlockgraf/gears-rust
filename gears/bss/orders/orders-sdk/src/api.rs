@@ -2,6 +2,7 @@
 //! (early S6-01/S6-04) and the typed submit entry point.
 use crate::{
     OrdersError,
+    amend::AmendOrder,
     authoring::{AddLine, CreateMeta, CreateOrder, HeaderPatch, LinePatch, OrderView},
     models::{CallMeta, DraftRevision, TransitionResult},
     preview::{PreviewBasket, PreviewResult},
@@ -135,6 +136,21 @@ pub trait OrdersV1: Send + Sync {
         ctx: &SecurityContext,
         order_id: Uuid,
         expected_draft_revision: DraftRevision,
+        meta: CallMeta,
+    ) -> Result<TransitionResult, OrdersError>;
+
+    /// Amend a submitted, pending-approval or approved order: a delta onto the committed version
+    /// named by `meta.expected_version` (`If-Match`), under an explanation (S4-03). A stale
+    /// version is the audited `precondition-failed`; the engine decides every other refusal.
+    ///
+    /// # Errors
+    /// `expected-version-required` or `request-invalid` for a malformed request, an Orders
+    /// refusal, or an infrastructure/unavailable failure.
+    async fn amend(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: AmendOrder,
         meta: CallMeta,
     ) -> Result<TransitionResult, OrdersError>;
 

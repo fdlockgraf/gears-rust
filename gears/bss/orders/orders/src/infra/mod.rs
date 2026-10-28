@@ -1,5 +1,7 @@
 // Internal capability and scoped adapters are consumed by the engine, draft service, reads and
 // workers (S2-04/09/11, S6-01). Business operations remain unavailable until they are delivered.
+/// Amendment service (S4-03 stub; S4-04 delivers it).
+pub mod amend;
 /// The managed producer binding and its readiness (S2-08).
 pub mod broker;
 /// Draft authoring (S2-09): the service REST and the local SDK share.

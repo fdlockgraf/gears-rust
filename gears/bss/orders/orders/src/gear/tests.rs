@@ -1230,12 +1230,11 @@ async fn boot_binds_the_gate_ports_and_names_every_missing_provider() -> anyhow:
 #[ignore = "requires Docker (testcontainers)"]
 async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
     use bss_orders_sdk::catalog::Reason;
+    use sea_orm::ConnectionTrait as _;
     let (_container, port) = pg_container::start_postgres().await?;
-    let db = toolkit_db::connect_db(
-        &format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
-        toolkit_db::ConnectOpts::default(),
-    )
-    .await?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let db = toolkit_db::connect_db(&url, toolkit_db::ConnectOpts::default()).await?;
+    let raw = sea_orm::Database::connect(url).await?;
     let gear = BssOrdersGear::default();
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
     // A per-run copy of the shipped example fixture, as the e2e suite writes its own.
@@ -1357,6 +1356,126 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             expect(error),
             "{headers:?} {body}"
         );
+    }
+
+    // S4-03: the amendment route is mounted under the same development delivery, outside the
+    // census, with its headers and problem responses documented.
+    let amend_route = crate::api::rest::wire::route("amend").unwrap();
+    assert_eq!(
+        amend_route.path,
+        "/bss-orders/v1/orders/{orderId}/amendments"
+    );
+    let amend_doc = &document["paths"][amend_route.path]["post"];
+    assert_eq!(amend_doc["operationId"], json!("bss_orders.amend"));
+    assert_eq!(amend_doc["requestBody"]["required"], json!(true));
+    let params: Vec<_> = amend_doc["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    for name in [
+        "orderid",
+        "if-match",
+        "idempotency-key",
+        "x-delegation-proof-ref",
+    ] {
+        assert!(params.contains(&name.to_owned()), "{name} in {params:?}");
+    }
+    for status in ["200", "400", "412", "429", "503"] {
+        assert!(amend_doc["responses"][status].is_object(), "{status}");
+    }
+    assert!(!crate::api::rest::DELIVERED_OPERATIONS.contains(&"amend"));
+    crate::api::rest::validate_delivered()?;
+
+    let amend_path = amend_route
+        .path
+        .replace("{orderId}", &Uuid::from_u128(3).to_string());
+    let amend = |headers: &[(&str, &str)], body: &'static str| {
+        let mut request =
+            axum::http::Request::post(&amend_path).header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(axum::body::Body::from(body)).unwrap();
+        tower::ServiceExt::oneshot(
+            router.clone().layer(axum::Extension(caller.clone())),
+            request,
+        )
+    };
+    let line_a = "00000000-0000-0000-0000-00000000000a";
+    let twice: &'static str = Box::leak(
+        json!({"reason": "r", "lines": [
+            {"op": "remove", "line_id": line_a}, {"op": "remove", "line_id": line_a}
+        ]})
+        .to_string()
+        .into_boxed_str(),
+    );
+    let amend_valid = r#"{"reason":"bigger plan","header":{"display_label":"x"}}"#;
+    for (headers, body, error) in [
+        // No If-Match: 428 before the key, the body and the service.
+        (
+            &[key][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // An unparseable If-Match is the same 428.
+        (
+            &[("if-match", "1"), key][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // An unknown key is refused at the boundary.
+        (
+            &[if_match, key][..],
+            r#"{"reason":"r","x":1}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A line named twice is refused at the boundary.
+        (
+            &[if_match, key][..],
+            twice,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A missing reason is not a boundary failure: it reaches the (stub) service, which
+        // answers unavailable. The audited `amendment-reason-invalid` refusal is the real
+        // service's (S4-04).
+        (
+            &[if_match, key][..],
+            r#"{"lines":[{"op":"remove","line_id":"00000000-0000-0000-0000-00000000000a"}]}"#,
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+        // A well-formed request reaches the stub.
+        (
+            &[if_match, key][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+    ] {
+        let response = amend(headers, body).await?;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            answered(status, &bytes),
+            expect(error),
+            "{headers:?} {body}"
+        );
+    }
+    // Neither the boundary refusals nor the stub wrote an audit, access-log or idempotency row.
+    for table in [
+        "bss_orders__transition_audit",
+        "bss_orders__read_access_log",
+        "bss_orders__idempotency",
+    ] {
+        let count = raw
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table}"),
+            ))
+            .await?
+            .unwrap()
+            .try_get::<i64>("", "n")?;
+        assert_eq!(count, 0, "{table}");
     }
     Ok(())
 }

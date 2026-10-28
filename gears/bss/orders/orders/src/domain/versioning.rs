@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use toolkit_macros::domain_model;
 
+use bss_orders_sdk::amend::{AmendLine, AmendOrder};
 use bss_orders_sdk::authoring::{AddLine, Category, DraftLine, HeaderPatch, LinePatch};
 use bss_orders_sdk::catalog::Reason;
 use uuid::Uuid;
@@ -163,6 +164,26 @@ pub enum MergeError {
 }
 
 impl AmendmentDelta {
+    /// The delta an SDK [`AmendOrder`] names; the explanation is the engine guard's input, not
+    /// part of the delta.
+    #[must_use]
+    pub fn from_request(request: &AmendOrder) -> Self {
+        Self {
+            header: request.header.clone().unwrap_or_default(),
+            lines: request
+                .lines
+                .iter()
+                .map(|op| match op {
+                    AmendLine::Add { line } => LineDelta::Add(line.clone()),
+                    AmendLine::Change { line_id, patch } => {
+                        LineDelta::Change(*line_id, patch.clone())
+                    }
+                    AmendLine::Remove { line_id } => LineDelta::Remove(*line_id),
+                })
+                .collect(),
+        }
+    }
+
     /// Boundary well-formedness: no line id is named twice. It depends on nothing but the body,
     /// so the boundary decides it, as it does every other malformed authoring body (D-252).
     ///

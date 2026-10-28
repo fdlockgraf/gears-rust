@@ -19,6 +19,7 @@
     clippy::option_option,
     reason = "a PATCH body distinguishes an omitted field, a null that clears it and a new value"
 )]
+use bss_orders_sdk::amend::{AmendLine, AmendOrder};
 use bss_orders_sdk::authoring::{
     AddLine, AuthoredTerm, AuthoringInvalid, BillingCycle, CalendarDate, Category, CreateOrder,
     Currency, DraftLine, HeaderPatch, LinePatch, OrderHeader, OrderView, Quantity, SelectedItem,
@@ -340,6 +341,58 @@ pub struct SubmitBody {
     pub expected_draft_revision: bss_orders_sdk::models::DraftRevision,
 }
 
+/// A line added by an amendment: the shape of [`OrdersAddLine`] without the draft revision (an
+/// amendment targets a committed version, not a draft).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAmendAddLine {
+    pub plan_id: Uuid,
+    pub plan_revision_id: Uuid,
+    pub selected_items: Vec<OrdersSelectedItem>,
+    pub currency: String,
+    #[serde(default)]
+    pub contract_effective_date: Option<String>,
+    #[serde(default)]
+    pub service_activation_date: Option<String>,
+    #[serde(default)]
+    pub acceptance_due_date: Option<String>,
+    #[serde(default)]
+    pub term_duration: Option<OrdersAuthoredTerm>,
+    #[serde(default, deserialize_with = "cycle")]
+    pub billing_cycle: Option<String>,
+}
+
+/// One amendment line operation, selected by `op`: `add`, `change` or `remove`.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(tag = "op", deny_unknown_fields)]
+pub enum OrdersAmendLine {
+    /// Add a line.
+    Add { line: OrdersAmendAddLine },
+    /// Change the named fields of a retained line of the committed version.
+    Change {
+        line_id: Uuid,
+        patch: OrdersLineFields,
+    },
+    /// Remove a line of the committed version.
+    Remove { line_id: Uuid },
+}
+
+/// Amendment body (S4-03). `If-Match` names the committed version amended; the reason is
+/// guarded by the engine (`amendment-reason-invalid`), so an absent one decodes as empty.
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAmendOrder {
+    /// Explanation, 1-4096 characters.
+    #[serde(default)]
+    pub reason: String,
+    /// Order-level fields to change.
+    #[serde(default)]
+    pub header: Option<OrdersHeaderFields>,
+    /// Line operations by stable line id; a line id is named at most once.
+    #[serde(default)]
+    pub lines: Vec<OrdersAmendLine>,
+}
+
 /// Optional line `DELETE` body.
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]
@@ -410,6 +463,54 @@ impl TryFrom<OrdersAddLine> for AddLine {
             acceptance_due_date: date(body.acceptance_due_date, "acceptance_due_date")?,
             term_duration: body.term_duration.map(AuthoredTerm::from),
             billing_cycle: billing_cycle(body.billing_cycle)?,
+        })
+    }
+}
+
+impl TryFrom<OrdersAmendAddLine> for AddLine {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersAmendAddLine) -> Result<Self, Self::Error> {
+        Ok(Self {
+            plan_id: body.plan_id,
+            plan_revision_id: body.plan_revision_id,
+            selected_items: items(body.selected_items)?,
+            currency: Currency::try_from(body.currency)?,
+            contract_effective_date: date(body.contract_effective_date, "contract_effective_date")?,
+            service_activation_date: date(body.service_activation_date, "service_activation_date")?,
+            acceptance_due_date: date(body.acceptance_due_date, "acceptance_due_date")?,
+            term_duration: body.term_duration.map(AuthoredTerm::from),
+            billing_cycle: billing_cycle(body.billing_cycle)?,
+        })
+    }
+}
+
+impl TryFrom<OrdersAmendLine> for AmendLine {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersAmendLine) -> Result<Self, Self::Error> {
+        Ok(match body {
+            OrdersAmendLine::Add { line } => Self::Add {
+                line: AddLine::try_from(line)?,
+            },
+            OrdersAmendLine::Change { line_id, patch } => Self::Change {
+                line_id,
+                patch: LinePatch::try_from(patch)?,
+            },
+            OrdersAmendLine::Remove { line_id } => Self::Remove { line_id },
+        })
+    }
+}
+
+impl TryFrom<OrdersAmendOrder> for AmendOrder {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersAmendOrder) -> Result<Self, Self::Error> {
+        Ok(Self {
+            reason: body.reason,
+            header: body.header.map(HeaderPatch::try_from).transpose()?,
+            lines: body
+                .lines
+                .into_iter()
+                .map(AmendLine::try_from)
+                .collect::<Result<_, _>>()?,
         })
     }
 }

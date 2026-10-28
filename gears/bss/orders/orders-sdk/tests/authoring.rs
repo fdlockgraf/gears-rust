@@ -174,3 +174,60 @@ fn a_line_states_one_quantity_on_every_item() {
     };
     assert_eq!(patch.validate(), Err(AuthoringInvalid("quantity")));
 }
+
+/// The amendment request (S4-03): `snake_case` (D-206), `op`-tagged line operations, every
+/// level `deny_unknown_fields`; the header patch and line patch are the capture authoring types.
+#[test]
+fn amend_request_round_trips_and_rejects_unknown_keys() {
+    use bss_orders_sdk::amend::{AmendLine, AmendOrder};
+    use bss_orders_sdk::authoring::HeaderPatch;
+    let removed = Uuid::from_u128(7);
+    let changed = Uuid::from_u128(8);
+    let request = AmendOrder {
+        reason: "customer asked for a larger plan".to_owned(),
+        header: Some(HeaderPatch {
+            display_label: Some(Some("renewal".to_owned())),
+            ..HeaderPatch::default()
+        }),
+        lines: vec![
+            AmendLine::Add { line: line() },
+            AmendLine::Change {
+                line_id: changed,
+                patch: LinePatch {
+                    currency: Some(Currency::try_from("EUR".to_owned()).unwrap()),
+                    ..LinePatch::default()
+                },
+            },
+            AmendLine::Remove { line_id: removed },
+        ],
+    };
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(wire["lines"][0]["op"], "add");
+    assert_eq!(wire["lines"][1]["op"], "change");
+    assert_eq!(wire["lines"][1]["line_id"], changed.to_string());
+    assert_eq!(wire["lines"][2]["op"], "remove");
+    assert_eq!(wire["header"]["display_label"], "renewal");
+    let back: AmendOrder = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(back, request);
+
+    // Omitted header and lines default; the reason alone decodes (the engine guards it).
+    let bare: AmendOrder = serde_json::from_value(serde_json::json!({"reason": "r"})).unwrap();
+    assert_eq!(bare.header, None);
+    assert!(bare.lines.is_empty());
+
+    // Unknown keys are refused at the request, the header, and every line operation.
+    let mut top = wire.clone();
+    top["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<AmendOrder>(top).is_err());
+    let mut header = wire.clone();
+    header["header"]["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<AmendOrder>(header).is_err());
+    for index in 0..3 {
+        let mut op = wire.clone();
+        op["lines"][index]["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<AmendOrder>(op).is_err(), "{index}");
+    }
+    let mut unknown_op = wire;
+    unknown_op["lines"][2]["op"] = serde_json::json!("replace");
+    assert!(serde_json::from_value::<AmendOrder>(unknown_op).is_err());
+}

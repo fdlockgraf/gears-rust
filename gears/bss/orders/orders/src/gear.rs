@@ -99,6 +99,9 @@ pub struct BssOrdersGear {
     /// The submit service (S3-12), under the same development-delivery condition as `preview`;
     /// the REST route (M3b, D-238) and the local SDK delegate to it, `None` in every other build.
     submit: ArcSwapOption<crate::infra::gate::submit::SubmitService>,
+    /// The amendment service (S4-03 stub), under the same development-delivery condition; the
+    /// REST route and the local SDK delegate to it, `None` in every other build.
+    amend: ArcSwapOption<crate::infra::amend::AmendService>,
 }
 
 /// Submit's development acceptance double (M2-6): with the `gate-dev-stubs` feature and the stubs
@@ -164,6 +167,7 @@ impl Default for BssOrdersGear {
             gate: Arc::new(ArcSwapOption::from(None)),
             preview: ArcSwapOption::from(None),
             submit: ArcSwapOption::from(None),
+            amend: ArcSwapOption::from(None),
         }
     }
 }
@@ -616,6 +620,10 @@ impl Gear for BssOrdersGear {
                 ))
             })
             .transpose()?;
+        // S4-03 (D-231): the amendment stub rides the submit service's development delivery.
+        let amend = submit
+            .is_some()
+            .then(|| Arc::new(crate::infra::amend::AmendService::stub()));
         let throttle = runtime._config.throttle_settings()?;
         // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows and
         // policy elections (S4-07, D-250) with the deployment, and startup refuses a missing or
@@ -647,7 +655,8 @@ impl Gear for BssOrdersGear {
                     Arc::clone(&reads),
                 )
                 .with_preview(preview.clone())
-                .with_submit(submit.clone()),
+                .with_submit(submit.clone())
+                .with_amend(amend.clone()),
             ));
         self.limiter
             .store(Some(crate::infra::throttle::PerOrderLimiter::new(throttle)));
@@ -655,6 +664,7 @@ impl Gear for BssOrdersGear {
         self.gate.store(Some(gate));
         self.preview.store(preview);
         self.submit.store(submit);
+        self.amend.store(amend);
         self.capture.store(Some(capture));
         self.reads.store(Some(reads));
         self.runtime.store(Some(runtime));
@@ -701,8 +711,15 @@ impl RestApiCapability for BssOrdersGear {
         }
         if let Some(submit) = self.submit.load_full() {
             router = router.merge(crate::api::rest::gate::submit_router(
-                submit, limiter, openapi,
+                submit,
+                Arc::clone(&limiter),
+                openapi,
             ));
+            if let Some(amend) = self.amend.load_full() {
+                router = router.merge(crate::api::rest::amend::amend_router(
+                    amend, limiter, openapi,
+                ));
+            }
         }
         Ok(router)
     }

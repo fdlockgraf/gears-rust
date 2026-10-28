@@ -5,6 +5,7 @@
 //! generated wire bindings of the SDK catalog ([`wire`]) own every HTTP fact (D-219). The S3-11
 //! Preview route ([`gate`]) is mounted only in the development build (M2-1) and is not part of
 //! the census.
+pub mod amend;
 pub mod capture;
 pub mod dto;
 pub mod error;
