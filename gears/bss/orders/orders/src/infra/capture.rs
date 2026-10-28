@@ -405,10 +405,7 @@ impl CaptureService {
             .transition(
                 caller,
                 request,
-                &AdminPreparation {
-                    edit,
-                    updated_by: caller.ctx().subject_id().to_string(),
-                },
+                &AdminPreparation::new(edit, caller.ctx().subject_id().to_string()),
             )
             .await?;
         Ok(Settled::from_outcome(outcome))
@@ -495,34 +492,34 @@ pub fn fingerprint_document(value: &impl serde::Serialize) -> Result<Value, Orde
 }
 
 /// Row 3's preparation: the named values as changes (the engine reconciles them with the stored
-/// values under the lock), the line-membership fact from the snapshot and the writer.
-struct AdminPreparation {
+/// values under the lock), the target line whose membership the engine checks at the same locked
+/// read, and the writer.
+pub struct AdminPreparation {
     edit: AdminEdit,
     updated_by: String,
 }
+impl AdminPreparation {
+    /// Row 3's preparation for `edit`, written as `updated_by`.
+    #[must_use]
+    pub fn new(edit: AdminEdit, updated_by: String) -> Self {
+        Self { edit, updated_by }
+    }
+}
 #[async_trait]
 impl Preparation for AdminPreparation {
-    async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
-        let line_member = match self.edit.line_id {
-            None => true,
-            Some(id) => {
-                view.draft_lines.iter().any(|row| row.line_id == id)
-                    || view.committed_line_ids.contains(&id)
-            }
-        };
+    async fn prepare(&self, _: &PreparationView) -> Result<Prepared, PrepareError> {
         let mut prepared = Prepared::new(AggregateContribution::None);
         prepared.guards = AdminGuardFacts {
-            line_member,
+            line: self.edit.line_id,
             all_administrative: true,
         }
         .bindings();
         prepared.admin_changes = self.edit.named_changes();
-        prepared.documents = line_member.then(|| {
-            Arc::new(AdminWriter {
-                edit: self.edit.clone(),
-                updated_by: self.updated_by.clone(),
-            }) as Arc<dyn DocumentWriter>
-        });
+        prepared.admin_line = self.edit.line_id;
+        prepared.documents = Some(Arc::new(AdminWriter {
+            edit: self.edit.clone(),
+            updated_by: self.updated_by.clone(),
+        }) as Arc<dyn DocumentWriter>);
         Ok(prepared)
     }
 }

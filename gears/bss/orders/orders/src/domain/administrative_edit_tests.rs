@@ -92,7 +92,7 @@ fn guards_refuse_in_contract_order() {
         ..HeaderPatch::default()
     })
     .named_changes();
-    let run = |guards: AdminGuardFacts, administrative: &[AdminChange]| {
+    let run = |guards: AdminGuardFacts, administrative: &[AdminChange], lines: &[Uuid]| {
         let d = decide_with(
             &table,
             &registry,
@@ -104,6 +104,7 @@ fn guards_refuse_in_contract_order() {
             &crate::domain::transition::Inputs::new(),
             OffsetDateTime::from_unix_timestamp(1_790_000_100).unwrap(),
             administrative,
+            lines,
         )
         .unwrap();
         match d {
@@ -113,21 +114,37 @@ fn guards_refuse_in_contract_order() {
         }
     };
     assert_eq!(registry.row_guards(RowId::of(3)).len(), 3);
-    let ok = AdminGuardFacts {
-        line_member: true,
+    let order = AdminGuardFacts {
+        line: None,
         all_administrative: true,
     };
-    assert_eq!(run(ok, &change), None);
+    assert_eq!(run(order, &change, &[]), None);
+    // A line edit is a member exactly when the target is among the locked lines.
+    let target = AdminGuardFacts {
+        line: Some(line()),
+        all_administrative: true,
+    };
+    assert_eq!(run(target, &change, &[line()]), None);
+    assert_eq!(
+        run(target, &change, &[Uuid::from_u128(78)]),
+        Some(Reason::LineNotFound)
+    );
     // Membership precedes classification and the change guard.
     let none = AdminGuardFacts {
-        line_member: false,
+        line: Some(line()),
         all_administrative: false,
     };
-    assert_eq!(run(none, &[]), Some(Reason::LineNotFound));
+    assert_eq!(run(none, &[], &[]), Some(Reason::LineNotFound));
     let commercial = AdminGuardFacts {
-        line_member: true,
+        line: Some(line()),
         all_administrative: false,
     };
-    assert_eq!(run(commercial, &[]), Some(Reason::CommercialFieldImmutable));
-    assert_eq!(run(ok, &[]), Some(Reason::AdministrativeEditUnchanged));
+    assert_eq!(
+        run(commercial, &[], &[line()]),
+        Some(Reason::CommercialFieldImmutable)
+    );
+    assert_eq!(
+        run(order, &[], &[]),
+        Some(Reason::AdministrativeEditUnchanged)
+    );
 }

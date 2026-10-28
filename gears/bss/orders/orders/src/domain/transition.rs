@@ -15,6 +15,7 @@ use toolkit_macros::domain_model;
 
 use bss_orders_sdk::catalog::{OrderState, Reason, Trigger};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use super::audit::AdminChange;
 use super::contributions::AggregateFacts;
@@ -77,6 +78,10 @@ pub struct GuardSubject<'a> {
     /// engine's locked read, unchanged fields dropped (04 §3.6 step 2). The change guard refuses
     /// `administrative-edit-unchanged` when it is empty; empty on every other row.
     pub administrative: &'a [AdminChange],
+    /// Row 3 line edits only: the order's line identities at the engine's locked read — the
+    /// working lines in `draft`, the lines committed at the locked current version otherwise
+    /// (04 §3.6: membership is checked under the lock). Empty on every other row.
+    pub admin_lines: &'a [Uuid],
 }
 
 /// A guard predicate's result.
@@ -247,8 +252,8 @@ pub enum DecisionError {
     /// for one of them.
     #[error("draft revisions are required exactly for draft-mutate and submit")]
     DraftRevisions,
-    /// Administrative changes were supplied for a row other than the administrative-edit row, or
-    /// missing for it.
+    /// Administrative changes or line memberships were supplied for a row other than the
+    /// administrative-edit row.
     #[error("administrative changes belong to the administrative-edit row exactly")]
     Administrative,
 }
@@ -371,13 +376,15 @@ pub fn decide<'t>(
         inputs,
         transition_time,
         &[],
+        &[],
     )
 }
 
-/// [`decide`] with row 3's administrative changes as reconciled at the engine's locked read.
+/// [`decide`] with row 3's administrative changes as reconciled at the engine's locked read and,
+/// for a line edit, the order's line identities read under the same lock.
 ///
 /// # Errors
-/// Binding/input contract violations, or administrative changes on another trigger.
+/// Binding/input contract violations, or administrative changes or lines on another trigger.
 #[expect(
     clippy::too_many_arguments,
     reason = "the pure transition decision takes every input of §3.4 explicitly (state table, \
@@ -395,8 +402,11 @@ pub fn decide_with<'t>(
     inputs: &Inputs,
     transition_time: OffsetDateTime,
     administrative: &[AdminChange],
+    admin_lines: &[Uuid],
 ) -> Result<Decision<'t>, DecisionError> {
-    if trigger != Trigger::AdministrativeEdit && !administrative.is_empty() {
+    if trigger != Trigger::AdministrativeEdit
+        && (!administrative.is_empty() || !admin_lines.is_empty())
+    {
         return Err(DecisionError::Administrative);
     }
     let row = match admit(table, trigger, locked, expected_version, revisions)? {
@@ -412,6 +422,7 @@ pub fn decide_with<'t>(
         transition_time,
         inputs,
         administrative,
+        admin_lines,
     };
     if let Some(decision) = evaluate(guards, bindings, &subject)? {
         return Ok(decision);
@@ -456,6 +467,7 @@ pub fn decide_create(
         transition_time,
         inputs,
         administrative: &[],
+        admin_lines: &[],
     };
     Ok(match evaluate(guards, bindings, &subject)? {
         Some(

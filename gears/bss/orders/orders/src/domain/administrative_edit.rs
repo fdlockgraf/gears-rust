@@ -2,7 +2,8 @@
 //!
 //! An administrative-only `PATCH` selects `administrative-edit` (row 3): last write wins per
 //! field, no version, no event, one audit entry per changed field (D-117). This module is pure:
-//! the named values of one request and the three row-3 guards over facts the slice resolved.
+//! the named values of one request and the three row-3 guards. Membership is decided over the
+//! lines the engine reads under the aggregate lock, never over a preparation snapshot.
 //! The prior values are never trusted from here: the engine re-reads them under the aggregate
 //! lock and reconciles (`contributions::reconcile_administrative`, D-142, D-149).
 use std::sync::Arc;
@@ -101,12 +102,14 @@ impl AdminEdit {
     }
 }
 
-/// The facts the three row-3 guards decide over.
+/// The facts the three row-3 guards decide over. Line membership is not one of them: the
+/// membership guard compares the target with the lines the engine read under the aggregate lock
+/// (`GuardSubject::admin_lines`), never with a preparation snapshot.
 #[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct AdminGuardFacts {
-    /// The target line is a member of the order (always true for an order edit).
-    pub line_member: bool,
+    /// The target line; `None` for an order edit (always a member).
+    pub line: Option<Uuid>,
     /// Every named field is administrative (boundary classification already refused unknown
     /// fields; a commercial field never reaches row 3).
     pub all_administrative: bool,
@@ -121,8 +124,11 @@ impl AdminGuardFacts {
         GuardBindings::new()
             .bind(
                 MEMBERSHIP,
-                move |_: &super::transition::GuardSubject<'_>| {
-                    if membership.line_member {
+                move |subject: &super::transition::GuardSubject<'_>| {
+                    if membership
+                        .line
+                        .is_none_or(|line| subject.admin_lines.contains(&line))
+                    {
                         GuardVerdict::Pass
                     } else {
                         GuardVerdict::Fail(Reason::LineNotFound)

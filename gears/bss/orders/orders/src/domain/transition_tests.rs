@@ -552,6 +552,23 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         &resolved(&registry, 21),
         t(),
         &change,
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(err, DecisionError::Administrative);
+    // Locked line memberships belong to row 3 exactly, too.
+    let err = decide_with(
+        &table,
+        &registry,
+        Trigger::Hold,
+        &facts,
+        facts.current_version,
+        DraftRevisions::NotApplicable,
+        &bindings(&registry, 21, &[]),
+        &resolved(&registry, 21),
+        t(),
+        &[],
+        &[uuid::Uuid::from_u128(77)],
     )
     .unwrap_err();
     assert_eq!(err, DecisionError::Administrative);
@@ -576,6 +593,7 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         &resolved(&registry, 3),
         t(),
         &change,
+        &[],
     )
     .unwrap();
     assert!(matches!(d, Decision::Admitted(_)));

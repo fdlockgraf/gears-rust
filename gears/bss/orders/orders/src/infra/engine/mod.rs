@@ -102,6 +102,9 @@ pub struct Prepared {
     pub event: Option<Arc<dyn EventSpec>>,
     /// Administrative changes (row 3 only), audited one entry per changed field (D-117).
     pub admin_changes: Vec<AdminChange>,
+    /// Row 3 line edits only: the target line. The engine reads the order's lines under the
+    /// aggregate lock for the membership guard (04 §3.6), never from the preparation view.
+    pub admin_line: Option<Uuid>,
     /// The reached gate assessment snapshot stored with the response (S3 owns its contents).
     pub assessment: Option<Value>,
     /// The gate's diagnostic run, written by the engine on a composite-gate refusal, an
@@ -125,6 +128,7 @@ impl Prepared {
             documents: None,
             event: None,
             admin_changes: Vec::new(),
+            admin_line: None,
             assessment: None,
             diagnostics: None,
             line_id: None,
@@ -142,9 +146,6 @@ pub struct PreparationView {
     pub prepared_draft_revision: Option<i64>,
     /// Draft operations: the working lines of that snapshot.
     pub draft_lines: Vec<draft_content::Model>,
-    /// Administrative edits: the line identities committed at the current version, for the
-    /// line-membership guard (S4-05); empty for every other trigger.
-    pub committed_line_ids: Vec<Uuid>,
     /// A recovered D-188/D-198 execution's frozen inputs, loaded before any fresh assessment.
     pub frozen: Option<Frozen>,
 }
@@ -488,7 +489,6 @@ impl Engine {
             facts: creation_facts(&request, Uuid::nil()),
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
-            committed_line_ids: Vec::new(),
             frozen: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
@@ -760,7 +760,6 @@ impl Engine {
             facts,
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
-            committed_line_ids: Vec::new(),
             frozen: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
@@ -1380,21 +1379,9 @@ impl Engine {
                             AuthorizedRead::NotVisible => return Ok(Err(Reason::OrderNotFound)),
                         }
                     };
-                    let administrative = trigger == Trigger::AdministrativeEdit;
-                    let draft_lines = if draft || administrative {
+                    let draft_lines = if draft {
                         children::draft_content_for_order(tx, target.access_scope(), row.order_id)
                             .await?
-                    } else {
-                        Vec::new()
-                    };
-                    let committed_line_ids = if administrative {
-                        children::committed_line_ids(
-                            tx,
-                            target.access_scope(),
-                            row.order_id,
-                            row.current_version,
-                        )
-                        .await?
                     } else {
                         Vec::new()
                     };
@@ -1402,7 +1389,6 @@ impl Engine {
                         facts: aggregate_facts(&row)?,
                         prepared_draft_revision: draft.then_some(row.draft_revision),
                         draft_lines,
-                        committed_line_ids,
                         frozen,
                     }))
                 })
@@ -2472,6 +2458,12 @@ async fn existing_body<'a>(
     } else {
         Vec::new()
     };
+    // Row 3 line edits: membership is the line set at this locked read (04 §3.6), so a
+    // concurrent removal or addition after preparation cannot be decided on a stale snapshot.
+    let admin_lines = match (a.trigger, a.prepared.admin_line) {
+        (Trigger::AdministrativeEdit, Some(_)) => locked_line_ids(&locked, &facts).await?,
+        _ => Vec::new(),
+    };
     let registries = &inner.registries;
     let decision = transition::decide_with(
         &registries.table,
@@ -2484,6 +2476,7 @@ async fn existing_body<'a>(
         &a.prepared.inputs,
         t,
         &administrative,
+        &admin_lines,
     )?;
     let execution_id = owned.record().execution_id;
     let settle = Settle {
@@ -3144,6 +3137,27 @@ pub(super) async fn locked_line_admin<'a>(
         id,
     )
     .await
+}
+
+/// The order's line identities at this locked read (row 3 line membership, 04 §3.6): the working
+/// lines in `draft`, otherwise the lines committed at the locked current version.
+async fn locked_line_ids<'a>(
+    locked: &LockedOrder<'a, DbTx<'a>>,
+    facts: &AggregateFacts,
+) -> Result<Vec<Uuid>, ScopeError> {
+    let id = locked.row().order_id;
+    let scope = toolkit_security::AccessScope::for_resources(vec![id]);
+    if facts.state == OrderState::Draft {
+        Ok(
+            children::draft_content_for_order(locked.transaction(), &scope, id)
+                .await?
+                .into_iter()
+                .map(|row| row.line_id)
+                .collect(),
+        )
+    } else {
+        children::committed_line_ids(locked.transaction(), &scope, id, facts.current_version).await
+    }
 }
 
 /// Row 3's named changes reconciled with the administrative values stored at this locked read.
