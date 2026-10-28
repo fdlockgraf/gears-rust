@@ -1,5 +1,7 @@
 //! Pure Orders domain rules. The application services that enter the engine live in `infra`.
 
+/// Administrative order and line edits (S4-05): named values, row-3 guards.
+pub mod administrative_edit;
 pub mod audit;
 /// Draft capture (S2-09): trigger selection, capture guards and authored term geometry.
 pub mod capture;

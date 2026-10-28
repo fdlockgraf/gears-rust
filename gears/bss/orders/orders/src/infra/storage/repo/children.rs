@@ -493,6 +493,26 @@ pub async fn committed_content_for_lines(
         .all(runner)
         .await
 }
+/// The line identities of exactly the committed `version` (administrative-edit membership, S4-05).
+pub async fn committed_line_ids(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Vec<Uuid>, ScopeError> {
+    Ok(entity::order_line::Entity::find()
+        .inner_join(order::Entity)
+        .filter(entity::order_line::Column::OrderId.eq(id))
+        .filter(entity::order_line::Column::Version.eq(version))
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await?
+        .into_iter()
+        .map(|line| line.line_id)
+        .collect())
+}
 /// Totals of exactly the snapshot's current commercial version.
 pub async fn committed_totals(
     runner: &impl DBRunner,

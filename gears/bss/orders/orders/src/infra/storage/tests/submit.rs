@@ -350,9 +350,9 @@ impl SellabilityV1 for Scripted {
     }
 }
 
-struct Fixture {
-    t: T,
-    capture: CaptureService,
+pub(super) struct Fixture {
+    pub(super) t: T,
+    pub(super) capture: CaptureService,
     submit: SubmitService,
     h: Harness,
     dates: Arc<TodayDates>,
@@ -364,7 +364,7 @@ struct Fixture {
 
 // Multi-line commercial scenarios intentionally admit both lines on the fixture's shared SKU.
 // Cardinality refusal itself remains covered by the dedicated gate/overlap tests.
-fn two_line_fixture() -> StubFixture {
+pub(super) fn two_line_fixture() -> StubFixture {
     let mut f = fixture();
     for occupancy in f.occupancy.values_mut() {
         let crate::domain::gate::answers::OccupancyObservation::LegacyActiveV1(occupancy) =
@@ -384,7 +384,7 @@ async fn setup(stubs: StubFixture, per_minute: u32) -> Fixture {
 }
 
 /// The service over a fresh container; `bound` binds the scripted acceptance double.
-async fn setup_with(stubs: StubFixture, per_minute: u32, bound: bool) -> Fixture {
+pub(super) async fn setup_with(stubs: StubFixture, per_minute: u32, bound: bool) -> Fixture {
     setup_with_bindings(stubs, per_minute, bound, None).await
 }
 
@@ -626,7 +626,7 @@ async fn draft_tagged_items(f: &Fixture, lines: usize, tag: &str, multikey: bool
     }
     f.t.reads().get(&buyer(), id).await.unwrap()
 }
-async fn draft(f: &Fixture, lines: usize) -> OrderView {
+pub(super) async fn draft(f: &Fixture, lines: usize) -> OrderView {
     draft_tagged(f, lines, "m26").await
 }
 
@@ -658,7 +658,7 @@ async fn submit_with(
     .await
     .map_err(OrdersError::from)
 }
-async fn submit(
+pub(super) async fn submit(
     f: &Fixture,
     caller: &Caller,
     v: &OrderView,

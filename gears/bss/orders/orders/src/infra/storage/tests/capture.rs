@@ -763,7 +763,7 @@ async fn structural_and_field_refusals_follow_the_declared_precedence() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn outside_draft_inadmissibility_wins_and_administrative_edits_stay_unavailable() {
+async fn outside_draft_inadmissibility_wins_and_administrative_edits_are_row_3() {
     let t = T::new().await;
     let svc = t.service();
     let id = create(&t, &svc, "c-1").await;
@@ -804,52 +804,45 @@ async fn outside_draft_inadmissibility_wins_and_administrative_edits_stay_unavai
         .await
         .unwrap();
     assert_eq!(refused(&r), Reason::NotAdmissible);
-    // Administrative-only edits select administrative-edit (S4-05, undelivered): unavailable
-    // with no authorization, audit, registry row or write, in draft and outside it.
+    // An administrative-only edit is delivered (S4-05): it commits on a draft too, as row 3
+    // (no draft revision, no version), and an unknown draft line is `line-not-found`.
     let draft = create(&t, &svc, "c-2").await;
-    for target in [id, draft] {
-        let audits = t.audits(target).await;
-        let registry = t.registry().await;
-        let row = t.order_row(target).await;
-        let header = svc
-            .patch_order(
-                &buyer(),
-                target,
-                HeaderPatch {
-                    external_reference: Some(Some("PO-1".into())),
-                    ..HeaderPatch::default()
-                },
-                &write("adm-1", 1, None),
-            )
-            .await;
-        assert!(
-            matches!(header, Err(OrdersError::Unavailable)),
-            "{header:?}"
-        );
-        let line_edit = svc
-            .patch_line(
-                &buyer(),
-                target,
-                u(5),
-                LinePatch {
-                    display_label: Some(Some("x".into())),
-                    ..LinePatch::default()
-                },
-                &write("adm-2", 1, None),
-            )
-            .await;
-        assert!(matches!(line_edit, Err(OrdersError::Unavailable)));
-        assert_eq!(t.audits(target).await, audits);
-        assert_eq!(t.registry().await, registry);
-        assert_eq!(t.order_row(target).await, row);
-        assert_eq!(
-            t.n(&format!(
-                "SELECT count(*) AS n FROM bss_orders__order_admin WHERE order_id='{target}'"
-            ))
-            .await,
-            0
-        );
-    }
+    let before = t.order_row(draft).await;
+    let r = svc
+        .patch_order(
+            &buyer(),
+            draft,
+            HeaderPatch {
+                external_reference: Some(Some("PO-1".into())),
+                ..HeaderPatch::default()
+            },
+            &write("adm-1", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.response.status(), 200, "{r:?}");
+    assert_eq!(
+        t.order_row(draft).await["draft_revision"],
+        before["draft_revision"]
+    );
+    assert_eq!(
+        t.order_row(draft).await["current_version"],
+        before["current_version"]
+    );
+    let r = svc
+        .patch_line(
+            &buyer(),
+            draft,
+            u(5),
+            LinePatch {
+                display_label: Some(Some("x".into())),
+                ..LinePatch::default()
+            },
+            &write("adm-2", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused(&r), Reason::LineNotFound);
 }
 
 #[tokio::test]
@@ -1264,8 +1257,7 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
         stale.2["context"]["data"],
         json!({"current_version": 1, "draft_revision": 2})
     );
-    // Administrative-only PATCH: 503 Problem, nothing recorded.
-    let registry = t.registry().await;
+    // Administrative-only PATCH (S4-05): row 3 commits on the wire, no version moves.
     let admin = http(
         &router,
         "PATCH",
@@ -1274,9 +1266,7 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
         Some(json!({"fields": {"external_reference": "PO-1"}})),
     )
     .await;
-    assert_eq!(admin.0, 503);
-    assert!(problem(&admin.1));
-    assert_eq!(t.registry().await, registry);
+    assert_eq!(admin.0, 200, "{admin:?}");
     // DELETE without a body omits the revision (409); with the body it removes the member.
     let omitted = http(
         &router,

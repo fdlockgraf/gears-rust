@@ -265,6 +265,8 @@ mod repositories;
 mod roles;
 mod workers;
 
+#[cfg(feature = "gate-dev-stubs")]
+mod administrative;
 mod capture;
 mod dates;
 mod engine;

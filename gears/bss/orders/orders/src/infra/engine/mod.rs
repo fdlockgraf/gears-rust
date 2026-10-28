@@ -142,6 +142,9 @@ pub struct PreparationView {
     pub prepared_draft_revision: Option<i64>,
     /// Draft operations: the working lines of that snapshot.
     pub draft_lines: Vec<draft_content::Model>,
+    /// Administrative edits: the line identities committed at the current version, for the
+    /// line-membership guard (S4-05); empty for every other trigger.
+    pub committed_line_ids: Vec<Uuid>,
     /// A recovered D-188/D-198 execution's frozen inputs, loaded before any fresh assessment.
     pub frozen: Option<Frozen>,
 }
@@ -485,6 +488,7 @@ impl Engine {
             facts: creation_facts(&request, Uuid::nil()),
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
+            committed_line_ids: Vec::new(),
             frozen: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
@@ -756,6 +760,7 @@ impl Engine {
             facts,
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
+            committed_line_ids: Vec::new(),
             frozen: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
@@ -1375,9 +1380,21 @@ impl Engine {
                             AuthorizedRead::NotVisible => return Ok(Err(Reason::OrderNotFound)),
                         }
                     };
-                    let draft_lines = if draft {
+                    let administrative = trigger == Trigger::AdministrativeEdit;
+                    let draft_lines = if draft || administrative {
                         children::draft_content_for_order(tx, target.access_scope(), row.order_id)
                             .await?
+                    } else {
+                        Vec::new()
+                    };
+                    let committed_line_ids = if administrative {
+                        children::committed_line_ids(
+                            tx,
+                            target.access_scope(),
+                            row.order_id,
+                            row.current_version,
+                        )
+                        .await?
                     } else {
                         Vec::new()
                     };
@@ -1385,6 +1402,7 @@ impl Engine {
                         facts: aggregate_facts(&row)?,
                         prepared_draft_revision: draft.then_some(row.draft_revision),
                         draft_lines,
+                        committed_line_ids,
                         frozen,
                     }))
                 })
