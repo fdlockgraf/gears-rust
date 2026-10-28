@@ -44,6 +44,13 @@ pub struct OrdersConfig {
     /// valid platform default. No Orders endpoint writes these rows.
     #[serde(default)]
     pub date_policy: Option<DatePolicyConfig>,
+    /// The policy elections this deployment promotes (S4-07, D-250): `acceptance_required` and
+    /// `tolerate_authorization_failure`, per platform and per seller. Absent means no promotion:
+    /// the stored rows stand. A stored row the block no longer names is kept (rows are
+    /// undeletable) and warned at startup; undoing an election means configuring its default
+    /// value explicitly. No Orders endpoint writes these rows.
+    #[serde(default)]
+    pub policy_elections: Option<PolicyElectionsConfig>,
     /// The gear-local per-(caller, order) edge limiter (Foundation §3.7, D-185, Q-26 fallback).
     /// Absent means the design baseline. The per-caller limit is gateway configuration (the
     /// `rl_orders_caller_write` / `rl_orders_workflow_write` zones), not an Orders setting.
@@ -407,6 +414,38 @@ pub struct DatePolicyOverrideConfig {
     pub acceptance_due_required: bool,
 }
 
+/// The promoted policy elections (S4-07, D-250). Only the switches a scope names are promoted;
+/// an unnamed switch keeps whatever row is stored, or stays unset.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyElectionsConfig {
+    /// Change identity recorded as `elected_by`.
+    pub elected_by: String,
+    #[serde(default)]
+    pub platform: PolicySwitches,
+    #[serde(default)]
+    pub sellers: Vec<SellerPolicyConfig>,
+}
+
+/// The two elections one scope may name; `None` leaves the election unpromoted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySwitches {
+    #[serde(default)]
+    pub acceptance_required: Option<bool>,
+    #[serde(default)]
+    pub tolerate_authorization_failure: Option<bool>,
+}
+
+/// One seller's elections.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SellerPolicyConfig {
+    pub seller_tenant_id: uuid::Uuid,
+    #[serde(flatten)]
+    pub switches: PolicySwitches,
+}
+
 /// The declared line cap. The baseline is the design's 200 lines: a capped basket's catalog
 /// resolution stays inside the 250 ms port deadline, and the 64 KiB event bound was proven at 200
 /// lines (S2-08), so a deployment may lower it but never raise it.
@@ -651,6 +690,7 @@ impl OrdersConfig {
         self.admin_text_key()?;
         self.capture_settings()?;
         self.date_policy_plan()?;
+        self.policy_elections_plan()?;
         self.throttle_settings()?;
         self.gate.validate()?;
         Ok(())
@@ -698,6 +738,20 @@ impl OrdersConfig {
         self.date_policy
             .as_ref()
             .map(crate::infra::dates::DatePolicyPlan::from_config)
+            .transpose()
+    }
+
+    /// The validated policy-election promotion, if this deployment carries one (S4-07).
+    ///
+    /// # Errors
+    /// An empty change identity, a nil or duplicated seller, a seller naming no election, or
+    /// more rows than one promotion may carry.
+    pub(crate) fn policy_elections_plan(
+        &self,
+    ) -> anyhow::Result<Option<crate::infra::policy::PolicyPlan>> {
+        self.policy_elections
+            .as_ref()
+            .map(crate::infra::policy::PolicyPlan::from_config)
             .transpose()
     }
 

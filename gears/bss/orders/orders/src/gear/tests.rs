@@ -805,6 +805,94 @@ async fn boot_promotes_the_date_policy_and_refuses_a_missing_default() -> anyhow
     Ok(())
 }
 
+/// S4-07 at boot (D-250): the configured policy elections are promoted after the date policy;
+/// a repeated boot only reads, so a runtime-role connection boots with the same configuration;
+/// a changed promotion without the policy grants refuses startup with nothing written, and an
+/// invalid block refuses it before any write.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn boot_promotes_policy_elections() -> anyhow::Result<()> {
+    use sea_orm::ConnectionTrait;
+    let (_container, port) = pg_container::start_postgres().await?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let db = toolkit_db::connect_db(&url, toolkit_db::ConnectOpts::default()).await?;
+    let raw = sea_orm::Database::connect(url).await?;
+    let gear = Arc::new(BssOrdersGear::default());
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
+    raw.execute_unprepared(
+        "CREATE ROLE test_runtime LOGIN PASSWORD 'fixture' INHERIT; GRANT bss_orders_runtime TO test_runtime",
+    )
+    .await?;
+    let runtime = toolkit_db::connect_db(
+        &format!("postgres://test_runtime:fixture@127.0.0.1:{port}/postgres"),
+        toolkit_db::ConnectOpts::default(),
+    )
+    .await?;
+    let mut cfg = config();
+    cfg["policy_elections"] = json!({
+        "elected_by": "deploy-1",
+        "platform": {"acceptance_required": true},
+        "sellers": [{"seller_tenant_id": "00000000-0000-0000-0000-000000000014",
+            "tolerate_authorization_failure": true}]
+    });
+    let state = || async {
+        raw.query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT string_agg(concat_ws(':', election, scope_id, elected, elected_by, policy_id, elected_at), ',' ORDER BY scope_id NULLS FIRST, election) AS s FROM bss_orders__policy_election",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<Option<String>>("", "s")
+        .unwrap()
+    };
+    let boot = |config: serde_json::Value, db: toolkit_db::Db| async move {
+        let hub = dependencies("complete");
+        let ctx = context(Some(config), Arc::clone(&hub)).with_db(toolkit_db::DBProvider::new(db));
+        let result = BssOrdersGear::default().init(&ctx).await;
+        (result, hub.get::<dyn OrdersV1>().is_ok())
+    };
+    // A changed promotion through the runtime role refuses startup and writes nothing.
+    let (result, published) = boot(cfg.clone(), runtime.clone()).await;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("policy election"), "{error}");
+    assert!(!published);
+    assert_eq!(state().await, None);
+    // The privileged boot promotes; the same configuration again only reads, so the runtime role
+    // boots and the rows (identities and instants included) are unchanged.
+    boot(cfg.clone(), db.clone()).await.0?;
+    let promoted = state().await.unwrap();
+    assert!(
+        promoted.starts_with("acceptance_required:t:deploy-1:"),
+        "{promoted}"
+    );
+    assert!(
+        promoted.contains(
+            ",tolerate_authorization_failure:00000000-0000-0000-0000-000000000014:t:deploy-1:"
+        ),
+        "{promoted}"
+    );
+    let (result, published) = boot(cfg.clone(), runtime.clone()).await;
+    result?;
+    assert!(published);
+    boot(cfg.clone(), db.clone()).await.0?;
+    assert_eq!(state().await.unwrap(), promoted);
+    // An invalid block refuses startup before any write.
+    let mut bad = cfg.clone();
+    bad["policy_elections"]["sellers"][0] =
+        json!({"seller_tenant_id": "00000000-0000-0000-0000-000000000014"});
+    let (result, published) = boot(bad, db.clone()).await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("names no election")
+    );
+    assert!(!published);
+    assert_eq!(state().await.unwrap(), promoted);
+    Ok(())
+}
+
 #[tokio::test]
 async fn unsupported_database_cannot_publish_a_client() -> anyhow::Result<()> {
     let hub = dependencies("complete");

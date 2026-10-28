@@ -49,6 +49,13 @@ bss-orders:
       platform_default:
         service_activation_required: false
         acceptance_due_required: false
+    # S4-07 policy-election channel (D-250). The migrations seed no election and the E2E host runs
+    # as the runtime login without `bss_orders_policy`, so naming an election here would make the
+    # boot insert and refuse startup. The block names none: the boot validates it and reads the
+    # table through the runtime role, writing nothing. A scenario that needs an election grants
+    # `bss_orders_policy` to the host login and names it.
+    policy_elections:
+      elected_by: "e2e"
 # The pre-engine request limiter's gateway half (Foundation contract §3.7, D-185; S2-12),
 # deep-merged into the E2E host's `api-gateway` block. The identity key is the authenticated
 # `subject_id`, so the zones are bound through `ThrottlingSpec { require_security_context: true,

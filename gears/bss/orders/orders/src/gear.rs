@@ -469,6 +469,7 @@ impl Gear for BssOrdersGear {
             "bss-orders: PostgreSQL is required; other backends are unproven"
         );
         let date_policy = config.date_policy_plan()?;
+        let policy_elections = config.policy_elections_plan()?;
         crate::gts::validate_catalog()?;
         crate::authz::validate_census()?;
         // S2-12: only delivered, caller-facing operations are mounted; a delivered route bound to
@@ -614,20 +615,28 @@ impl Gear for BssOrdersGear {
             })
             .transpose()?;
         let throttle = runtime._config.throttle_settings()?;
-        // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows with
-        // the deployment, and startup refuses a missing or invalid platform default. It is the
-        // only init step with a persistent effect, so it runs after every fallible step (the
-        // registry registration, the worker connection attestation, the settings): a start that
-        // fails earlier writes nothing (review finding 186). It is bounded like the registry
-        // step (finding 45). The promotion is one transaction under the namespace lock: an
-        // elapse before its commit rolls it back; one during the commit leaves it either applied
-        // or not, and the next start's compare-and-apply converges on the same plan.
+        // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows and
+        // policy elections (S4-07, D-250) with the deployment, and startup refuses a missing or
+        // invalid date-policy platform default. The two policy promotions are the only init steps
+        // with a persistent effect, so they run after every fallible step (the registry
+        // registration, the worker connection attestation, the settings): a start that fails
+        // earlier writes nothing (review finding 186). Each is bounded like the registry step
+        // (finding 45) and is one transaction: an elapse before its commit rolls it back; one
+        // during the commit leaves it either applied or not, and the next start's
+        // compare-and-apply converges on the same plan. A date policy promoted before a failed
+        // election promotion stays, and converges the same way.
         tokio::time::timeout(
             dependency_timeout,
             crate::infra::dates::install(&runtime.db, date_policy.as_ref()),
         )
         .await
         .context("bss-orders: date policy installation timed out")??;
+        tokio::time::timeout(
+            dependency_timeout,
+            crate::infra::policy::install(&runtime.db, policy_elections.as_ref()),
+        )
+        .await
+        .context("bss-orders: policy election installation timed out")??;
         // Registration is last: failed prerequisites cannot leave a discoverable local client.
         ctx.client_hub()
             .register::<dyn bss_orders_sdk::OrdersV1>(Arc::new(

@@ -39,6 +39,9 @@ pub mod gate;
 /// Full jitter for retry pauses (the producer binding and the gate retry).
 pub mod jitter;
 pub mod maintenance;
+/// Policy-election channel: startup promotion and the election read port (S4-07). Consent
+/// (S4-08) and the begin-fulfillment money guard (S4-10) read the elections.
+pub mod policy;
 /// Authorized reads with access logging (early S6-01/S6-04).
 pub mod read;
 pub mod storage;

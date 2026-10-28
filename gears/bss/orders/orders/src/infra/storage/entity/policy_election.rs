@@ -4,7 +4,16 @@ use toolkit_db_macros::Scopable;
 /// Deployment-promoted policy election at platform or seller scope.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "bss_orders__policy_election")]
-#[secure(no_tenant, resource_col = "policy_id", no_owner, no_type)]
+// `election` addresses the rows the policy channel governs without knowing their fresh
+// `policy_id`s: promotion reads both elections whole (it must see rows the configuration no
+// longer names), and the read port one election (D-250; D-207's `resource_tenant_id` analogue).
+#[secure(
+    no_tenant,
+    resource_col = "policy_id",
+    no_owner,
+    no_type,
+    pep_prop(election = "election")
+)]
 pub struct Model {
     /// Policy identity.
     #[sea_orm(primary_key, auto_increment = false)]
