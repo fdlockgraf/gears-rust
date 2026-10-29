@@ -1515,34 +1515,9 @@ async fn twenty_successes_among_failed_attempts_hit_the_cap() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn claim_collision_after_one_new_reservation_releases_only_new_claims() {
-    let other = Uuid::from_u128(31);
-    let mut stubs = multikey_fixture();
-    let profile = stubs.payer_profiles[&PAYER].clone();
-    stubs.payer_profiles.insert(other, profile);
-    let f = setup_with_bindings(stubs, 10, true, Some(FixedBindings::multikey())).await;
-    let v = draft_tagged_items(&f, 1, "am-collide", true).await;
-    let order = v.order.order_id;
-    let settled = submit(&f, &buyer(), &v, "am-collide-submit").await.unwrap();
-    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
-    let n = settled.response.body()["version"].as_i64().unwrap();
+    let (f, order, n, other, _) = collision_fixture("am-collide").await;
     let claims_n = live_claims(&f, order).await;
     assert_eq!(claims_n.as_array().unwrap().len(), 2, "{claims_n}");
-    // Another order holds the later of the two proposed tuples (`dev-stub-scope` sorts after
-    // `dev-second-scope`), so the first is acquired before the collision.
-    let holder = 0x9877;
-    super::claims::create_for(&f.t.env.db, holder, 31, RESOURCE)
-        .await
-        .unwrap();
-    f.t.env
-        .pg
-        .sql(&format!(
-            "INSERT INTO bss_orders__inflight_overlap_claim VALUES(gen_random_uuid(),'{other}','{}',\
-             'dev-stub-scope','{}',1,clock_timestamp(),NULL)",
-            Uuid::from_u128(RESOURCE),
-            Uuid::from_u128(holder)
-        ))
-        .await
-        .unwrap();
     let high = high_water(&f, order).await;
     let refused = amend(
         &f,
@@ -1580,13 +1555,13 @@ async fn claim_collision_after_one_new_reservation_releases_only_new_claims() {
     );
 }
 
-/// D-188 step 5 atomicity for an amendment's claim cleanup: a payer move releases N's tuple
+/// D-188 step 5 atomicity for a successful claim replacement: a payer move releases N's tuple
 /// after acquiring the new one; a failure injected right after that step rolls the whole commit
 /// back (no M, no new claim, N's claim live, no event, no settlement, the receipt kept), and the
 /// same-key retry commits from the recorded receipt without commanding Pricing again.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn injected_cleanup_failure_rolls_back() {
+async fn injected_failure_after_claim_replacement_rolls_back() {
     let other = Uuid::from_u128(31);
     let mut stubs = two_line_fixture();
     let profile = stubs.payer_profiles[&PAYER].clone();
@@ -1793,5 +1768,119 @@ async fn two_added_lines_keep_their_ids_and_content_through_recovery() {
         ))
         .await,
         2
+    );
+}
+
+/// The payer-move fixture of the collision tests: the multikey line (two overlap scopes), a
+/// second confirmed payer, N submitted, and another order holding the later proposed tuple
+/// (`dev-stub-scope` sorts after `dev-second-scope`).
+async fn collision_fixture(tag: &str) -> (Fixture, Uuid, i64, Uuid, Uuid) {
+    let other = Uuid::from_u128(31);
+    let mut stubs = multikey_fixture();
+    let profile = stubs.payer_profiles[&PAYER].clone();
+    stubs.payer_profiles.insert(other, profile);
+    let f = setup_with_bindings(stubs, 10, true, Some(FixedBindings::multikey())).await;
+    let v = draft_tagged_items(&f, 1, tag, true).await;
+    let order = v.order.order_id;
+    let settled = submit(&f, &buyer(), &v, &format!("{tag}-submit"))
+        .await
+        .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let n = settled.response.body()["version"].as_i64().unwrap();
+    let holder = Uuid::from_u128(0x9877);
+    super::claims::create_for(&f.t.env.db, holder.as_u128(), 31, RESOURCE)
+        .await
+        .unwrap();
+    f.t.env
+        .pg
+        .sql(&format!(
+            "INSERT INTO bss_orders__inflight_overlap_claim VALUES(gen_random_uuid(),'{other}','{}',\
+             'dev-stub-scope','{holder}',1,clock_timestamp(),NULL)",
+            Uuid::from_u128(RESOURCE),
+        ))
+        .await
+        .unwrap();
+    (f, order, n, other, holder)
+}
+
+/// 04 §3.1 step 7: the cleanup of a partial claim collision (releasing the fresh claim this
+/// attempt acquired) is part of the refusal's transaction. A failure injected right after it
+/// rolls everything back: the fresh claim row never existed, N's claims are live, no refusal is
+/// audited or settled and the attempt keeps its receipt. Once the other order leaves flight, the
+/// same-key retry commits from the receipt.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn injected_cleanup_failure_rolls_back() {
+    let (f, order, n, other, holder) = collision_fixture("am-cleanup").await;
+    let claims_n = live_claims(&f, order).await;
+    let audits = f.t.audits(order).await;
+    let candidate = high_water(&f, order).await + 1;
+    let hook = Arc::new(FailAt {
+        point: FaultPoint::Claims,
+        hits: AtomicUsize::new(0),
+    });
+    let faulty = AmendService::new(Arc::new(service_over(
+        &f,
+        f.engine.with_fault(hook.clone()),
+    )));
+    let request = json!({"reason": "new payer", "header": {"payer_tenant_id": other}});
+    let calls = f.acceptance.calls();
+    let answer = amend_as(&faulty, &buyer(), order, n, request.clone(), "am-cleanup-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(answer, OrdersError::Internal), "{answer:?}");
+    assert!(hook.hits.load(Ordering::SeqCst) >= 1, "the cleanup ran");
+    assert_eq!(live_claims(&f, order).await, claims_n);
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__inflight_overlap_claim WHERE order_id='{order}' \
+             AND payer_tenant_id='{other}'"
+        ))
+        .await,
+        0,
+        "the fresh claim and its release rolled back"
+    );
+    assert_eq!(f.t.audits(order).await, audits, "no refusal audited");
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__idempotency WHERE order_id='{order}' \
+             AND operation='amendment' AND status='settled'"
+        ))
+        .await,
+        0
+    );
+    assert_eq!(
+        f.t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE order_id='{order}' \
+             AND operation='amendment' AND status='running' AND candidate_version={candidate}"
+        ))
+        .await,
+        1
+    );
+    let row = order_row(&f, order).await;
+    assert_eq!(row["current_version"], json!(n));
+    assert_eq!(row["payer_tenant_id"], json!(PAYER));
+    // The other order leaves flight; the same-key retry commits from the recorded receipt.
+    f.t.env
+        .pg
+        .sql(&format!(
+            "UPDATE bss_orders__inflight_overlap_claim SET released_at = now() \
+             WHERE order_id='{holder}' AND released_at IS NULL"
+        ))
+        .await
+        .unwrap();
+    lapse_leases(&f, order).await;
+    let settled = amend(&f, order, n, request, "am-cleanup-1").await.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(settled.response.body()["version"], json!(candidate));
+    assert_eq!(f.acceptance.calls(), calls + 1, "no second command");
+    let live = live_claims(&f, order).await;
+    assert_eq!(live.as_array().unwrap().len(), 2, "{live}");
+    assert!(
+        live.as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["payer_tenant_id"] == json!(other)),
+        "{live}"
     );
 }
