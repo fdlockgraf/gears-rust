@@ -377,3 +377,61 @@ async fn policy_rows_cannot_be_deleted_or_rekeyed() -> anyhow::Result<()> {
     assert_eq!(rows(&pg).await, before);
     Ok(())
 }
+
+/// S4-08: the shared resolver over real elections: seller beats platform for both elections, an
+/// election is read only when the earlier term is silent, and unset is required / not tolerated.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_resolver_reads_seller_then_platform_for_both_elections() -> anyhow::Result<()> {
+    use crate::domain::preconditions::{Requirement, RequirementSource};
+    use crate::infra::acceptance::RequirementResolver;
+
+    let pg = Pg::new().await?;
+    let (policy, _) = pg.role("policy").await?;
+    let (runtime, _) = pg.role("runtime").await?;
+    let resolver = RequirementResolver::from_fact(Some(runtime));
+    let (seller, other) = (u(SELLER), u(SELLER + 1));
+    let required = |source| Ok(Requirement::Required(source));
+
+    // Nothing stored: unset requires acceptance and does not tolerate a failed authorization.
+    assert_eq!(
+        resolver.requirement_for(seller, None).await,
+        required(RequirementSource::PlatformDefault)
+    );
+    assert_eq!(resolver.tolerate_failure(seller).await, Ok(false));
+
+    // Platform says not required / tolerate; the seller's silence falls through to it.
+    promote(&policy, &plan(switches(Some(false), Some(true)), &[])).await?;
+    assert_eq!(
+        resolver.requirement_for(seller, None).await,
+        Ok(Requirement::NotRequired)
+    );
+    assert_eq!(resolver.tolerate_failure(seller).await, Ok(true));
+
+    // The seller's own election beats the platform's, for both; another seller still follows it.
+    promote(
+        &policy,
+        &plan(
+            switches(Some(false), Some(true)),
+            &[(SELLER, switches(Some(true), Some(false)))],
+        ),
+    )
+    .await?;
+    assert_eq!(
+        resolver.requirement_for(seller, None).await,
+        required(RequirementSource::Seller)
+    );
+    assert_eq!(resolver.tolerate_failure(seller).await, Ok(false));
+    assert_eq!(
+        resolver.requirement_for(other, None).await,
+        Ok(Requirement::NotRequired)
+    );
+    assert_eq!(resolver.tolerate_failure(other).await, Ok(true));
+
+    // A stated contract term beats a seller election and reads none.
+    assert_eq!(
+        resolver.requirement_for(seller, Some(false)).await,
+        Ok(Requirement::NotRequired)
+    );
+    Ok(())
+}

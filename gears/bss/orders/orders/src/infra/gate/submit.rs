@@ -91,6 +91,7 @@ use crate::domain::gate::totals::total_rows;
 use crate::domain::guards::{GATE_COMPOSITE, InputPort};
 use crate::domain::idempotency::{FingerprintAxes, authorization_fact_fingerprint};
 use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, InputState, Inputs};
+use crate::infra::acceptance::RequirementResolver;
 use crate::infra::capture::{Settled, fingerprint_document};
 use crate::infra::dates::proposed_date;
 use crate::infra::engine::{
@@ -581,7 +582,12 @@ impl SubmitService {
             execution,
             frozen,
             cancel,
-            |reserved| Ok(SubmitPreparation { reserved, policy }),
+            |reserved| {
+                Ok(SubmitPreparation {
+                    reserved,
+                    resolver: RequirementResolver::from_fact(policy),
+                })
+            },
         )
         .await
     }

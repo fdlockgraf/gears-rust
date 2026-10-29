@@ -59,10 +59,9 @@ use crate::domain::gate::commercial::{
 use crate::domain::gate::totals::{TotalRow, total_rows};
 use crate::domain::guards::{GATE_COMPOSITE, GUARDS, InputPort};
 use crate::domain::overlap::{ClaimParties, OverlapScopeKey, ProposedClaims};
-use crate::domain::preconditions::{
-    self, Requirement, RequirementSource, acceptance_requirement, recorded_source,
-};
+use crate::domain::preconditions::{self, RequirementSource, recorded_source};
 use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, InputState, Inputs};
+use crate::infra::acceptance::RequirementResolver;
 use crate::infra::dates::admitted_line;
 use crate::infra::engine::documents::{EventEnqueue, EventSpec};
 use crate::infra::engine::{
@@ -70,7 +69,6 @@ use crate::infra::engine::{
 };
 use crate::infra::events::EventEnqueueError;
 use crate::infra::events::payload::{LineRef, OrderSubmitted, SubmitAcceptance};
-use crate::infra::policy::{self, Election, PolicyScope};
 use crate::infra::storage::entity::{
     acceptance, commercial_attempt, draft_content, order_line, resolved_total,
 };
@@ -119,8 +117,9 @@ pub struct ReservedAttempt {
 pub struct SubmitPreparation {
     /// The reserved attempt.
     pub(super) reserved: ReservedAttempt,
-    /// The policy election store (step 7); `None` answers unavailable when an election is read.
-    pub(super) policy: Option<toolkit_db::Db>,
+    /// The consent-requirement resolver (step 7); without a policy store it answers unavailable
+    /// when an election is read.
+    pub(super) resolver: RequirementResolver,
 }
 
 /// The consent a self-service commit records (module doc, step 7).
@@ -755,7 +754,7 @@ impl SubmitPreparation {
                     .ok()?,
                 line_cap,
             ),
-            policy,
+            resolver: RequirementResolver::from_fact(policy),
         })
     }
 
@@ -779,51 +778,17 @@ impl SubmitPreparation {
         ) {
             return Ok(None);
         }
-        let requirement = self.requirement(view.facts.seller_tenant_id).await?;
+        let requirement = self
+            .resolver
+            .requirement_for(
+                view.facts.seller_tenant_id,
+                self.reserved.requests.order.contract_acceptance_required,
+            )
+            .await?;
         Ok(Some(Consent {
             recorded_by: principal.subject_id.hyphenated().to_string(),
             source: recorded_source(requirement),
         }))
-    }
-
-    /// The requirement's precedence (D-251): the frozen contract fact, then the seller's
-    /// election, then the platform's; each election is read only when the earlier term is
-    /// silent.
-    async fn requirement(&self, seller: Uuid) -> Result<Requirement, PrepareError> {
-        let contract = self.reserved.requests.order.contract_acceptance_required;
-        if contract.is_some() {
-            return Ok(acceptance_requirement(contract, None, None));
-        }
-        let seller = self.election(PolicyScope::Seller(seller)).await?;
-        let platform = match seller {
-            Some(_) => None,
-            None => self.election(PolicyScope::Platform).await?,
-        };
-        Ok(acceptance_requirement(None, seller, platform))
-    }
-
-    /// One `acceptance_required` election; a failed read is `Unavailable` (never "no row").
-    async fn election(&self, scope: PolicyScope) -> Result<Option<bool>, PrepareError> {
-        let Some(db) = &self.policy else {
-            tracing::warn!(
-                target: "orders.gate.submit",
-                "bss-orders: no policy election store is bound; a self-service submit answers \
-                 unavailable"
-            );
-            return Err(PrepareError::Unavailable);
-        };
-        policy::election(db, Election::AcceptanceRequired, scope)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    target: "orders.gate.submit",
-                    scope = scope.token(),
-                    error = %error,
-                    "bss-orders: the acceptance election could not be read; submit answers \
-                     unavailable"
-                );
-                PrepareError::Unavailable
-            })
     }
 }
 
