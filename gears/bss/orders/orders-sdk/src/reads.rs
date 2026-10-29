@@ -1,6 +1,7 @@
-//! Read contracts (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`; `models.json`
-//! `ListOrders`, `OrderPage`, `LineList`, `LinePage`). Draft and submitted reads with S6-04
-//! access logging.
+//! Read contracts (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`, and the S4-06 history
+//! reads `list_versions`, `get_version`, `get_acceptance`; `models.json` `ListOrders`,
+//! `OrderPage`, `LineList`, `LinePage`, `VersionList`, `VersionPage`, `OrderVersionView`,
+//! `AcceptanceList`, `AcceptancePage`). Draft and submitted reads with S6-04 access logging.
 //!
 //! Every collection is paged (08 §2.2) in the shared list format (DNA REST `PAGINATION.md`,
 //! D-212): `limit` defaults to 50 and is bounded 1–200; the continuation `cursor` is an opaque
@@ -9,7 +10,7 @@
 //! [`OrderFilters`]; clients cannot select a sort. A read carries no expected version or idempotency key; the only call metadata
 //! is the supplied delegation proof reference, forwarded unvalidated to the PDP and recorded as
 //! *supplied* on the access log (08 §4.4, D-202).
-use crate::authoring::{DraftLine, OrderHeader};
+use crate::authoring::{DraftLine, OrderHeader, SalesPath};
 use crate::catalog::OrderState;
 use crate::models::{DelegationProofRef, DraftRevision, InvalidBoundaryValue, OrderVersion};
 use serde::{Deserialize, Serialize};
@@ -207,6 +208,150 @@ pub struct LinePage {
     pub current_version: OrderVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<DraftRevision>,
+}
+
+/// The version-history request (`models.json` `VersionList`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionList {
+    /// Absent means the default of 50.
+    pub limit: Option<PageSize>,
+    pub cursor: Option<Cursor>,
+}
+
+/// The consent-history request (`models.json` `AcceptanceList`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptanceList {
+    /// Absent means the default of 50.
+    pub limit: Option<PageSize>,
+    pub cursor: Option<Cursor>,
+}
+
+/// Why a committed version was appended (`orders_order_version.reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionReason {
+    /// Version 1, the empty draft.
+    Create,
+    /// The version a submit committed.
+    Submit,
+    /// A version an amendment committed.
+    Amendment,
+}
+impl VersionReason {
+    /// The reason a stored token names; `None` for any other spelling.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "create" => Some(Self::Create),
+            "submit" => Some(Self::Submit),
+            "amendment" => Some(Self::Amendment),
+            _ => None,
+        }
+    }
+}
+
+/// One committed version of the order's history, read from the stored version row (never a
+/// chain or event reconstruction). Reserved or burned candidate numbers are never items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionRecord {
+    pub version: OrderVersion,
+    pub reason: VersionReason,
+    /// The trusted subject that appended the version.
+    pub actor: String,
+    /// The appending subject's tenant.
+    pub actor_tenant_id: Uuid,
+    /// The engine instant the version was appended.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// The caller's explanation; present exactly on an amendment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_reason: Option<String>,
+    /// The predecessor; absent exactly on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<OrderVersion>,
+}
+
+/// Why consent was required when it was recorded (`orders_acceptance.requirement_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementSource {
+    Contract,
+    Seller,
+    PlatformDefault,
+    /// Recorded although no requirement applied.
+    Volunteered,
+}
+impl RequirementSource {
+    /// The source a stored token names; `None` for any other spelling.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "contract" => Some(Self::Contract),
+            "seller" => Some(Self::Seller),
+            "platform_default" => Some(Self::PlatformDefault),
+            "volunteered" => Some(Self::Volunteered),
+            _ => None,
+        }
+    }
+}
+
+/// One recorded consent: the committed version it accepts, the engine instant, the trusted
+/// recording subject, the recording path copied from the order's sales path and the source of
+/// the requirement. Internal recovery evidence is never part of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceRecord {
+    pub accepted_version: OrderVersion,
+    #[serde(with = "time::serde::rfc3339")]
+    pub accepted_at: OffsetDateTime,
+    pub recorded_by: String,
+    pub recording_path: SalesPath,
+    pub requirement_source: RequirementSource,
+}
+
+/// One authorized keyset page of the committed version history in `version` order
+/// (`models.json` `VersionPage`). `current_version` and `current_acceptance` come from the same
+/// consistent snapshot as the items; an absent `current_acceptance` means the current version has
+/// no recorded consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionPage {
+    pub items: Vec<VersionRecord>,
+    pub page_info: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<OrderVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<AcceptanceRecord>,
+}
+
+/// The consent read (`models.json` `AcceptancePage`): the current version, its consent (absent
+/// when none is recorded) and one keyset page of the prior versions' consent records in
+/// `accepted_version` order, all from one consistent snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptancePage {
+    /// Consent records of versions before the current one.
+    pub items: Vec<AcceptanceRecord>,
+    pub page_info: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<OrderVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<AcceptanceRecord>,
+}
+
+/// One exact committed version (`models.json` `OrderVersionView`): its lines with their
+/// immutable commercial evidence and its persisted producer totals, composed at that version.
+/// Version 1 (the empty draft) has no lines and no totals. The mutable administrative projection
+/// (`admin`) is not delivered (D-254).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderVersionView {
+    pub order_id: Uuid,
+    pub version: OrderVersion,
+    pub lines: Vec<DraftLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_total: Option<Vec<CommittedTotal>>,
 }
 
 /// Immutable commercial evidence selected by the committed version, never a live quotation.

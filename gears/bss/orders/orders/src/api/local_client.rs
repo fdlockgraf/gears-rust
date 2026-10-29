@@ -244,6 +244,36 @@ impl OrdersV1 for LocalOrdersClient {
         let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
         self.reads.list_lines(&caller, order_id, &request).await
     }
+    async fn list_versions(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::reads::VersionList,
+        meta: ReadMeta,
+    ) -> Result<bss_orders_sdk::reads::VersionPage, OrdersError> {
+        let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
+        self.reads.list_versions(&caller, order_id, &request).await
+    }
+    async fn get_version(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        version: bss_orders_sdk::models::OrderVersion,
+        meta: ReadMeta,
+    ) -> Result<bss_orders_sdk::reads::OrderVersionView, OrdersError> {
+        let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
+        self.reads.get_version(&caller, order_id, version).await
+    }
+    async fn get_acceptance(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::reads::AcceptanceList,
+        meta: ReadMeta,
+    ) -> Result<bss_orders_sdk::reads::AcceptancePage, OrdersError> {
+        let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
+        self.reads.get_acceptance(&caller, order_id, &request).await
+    }
     async fn submit(
         &self,
         ctx: &SecurityContext,

@@ -29,6 +29,12 @@
 //! Drafts compose from their working set. Submitted orders compose exclusively from their
 //! immutable current version, validated commercial pins and persisted producer totals. Later
 //! lifecycle states remain unavailable until their fulfillment projections are delivered.
+//!
+//! **History reads (S4-06, D-254).** `list_versions`, `get_version` and `get_acceptance` run the
+//! same wrapper (the decision on the current parent precedes any history row), then read the
+//! immutable version and consent rows directly: no chain walk, no event replay, no upstream call.
+//! They compose in every lifecycle state, because a committed version never changes; a version
+//! is composed at that version (its own payer axis, lines, pins and totals).
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -42,13 +48,15 @@ use bss_orders_sdk::catalog::{OrderState, Reason};
 use bss_orders_sdk::commercial::OrderPin;
 use bss_orders_sdk::models::{DraftRevision, OrderVersion};
 use bss_orders_sdk::reads::{
-    Cursor, LineList, LinePage, ListOrders, OrderPage, OrderSummary, PageInfo, PageSize,
+    AcceptanceList, AcceptancePage, AcceptanceRecord, Cursor, LineList, LinePage, ListOrders,
+    OrderPage, OrderSummary, OrderVersionView, PageInfo, PageSize, RequirementSource, VersionList,
+    VersionPage, VersionReason, VersionRecord,
 };
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use serde::Deserialize;
 use toolkit_db::Db;
-use toolkit_db::secure::{TxAccessMode, TxConfig, TxIsolationLevel};
+use toolkit_db::secure::{AccessScope, DBRunner, TxAccessMode, TxConfig, TxIsolationLevel};
 use uuid::Uuid;
 
 use crate::authz::{Action, AuthzFailure, Caller, Pep, Prefetch};
@@ -58,14 +66,15 @@ use crate::domain::gate::commercial::digest_hex;
 use crate::domain::gate::totals::TotalScope;
 use crate::domain::read::ProofDenial;
 use crate::domain::read::{
-    self, AccessOutcome, Collection, CursorBinding, GET_OPERATION, Position, ReadRuleError,
-    Refusal, ServedLog, Target,
+    self, AccessOutcome, Collection, CursorBinding, GET_OPERATION, GET_VERSION_OPERATION, Position,
+    ReadRuleError, Refusal, ServedLog, Target,
 };
 use crate::domain::versioning::{CommittedHeader, CommittedVersion};
 use crate::infra::diagnostics::serde_category;
 use crate::infra::engine::errors::not_delivered;
 use crate::infra::storage::entity::{
-    draft_content, order, order_line, order_line_identity, read_access_log, resolved_total,
+    acceptance, draft_content, order, order_line, order_line_identity, order_version,
+    read_access_log, resolved_total,
 };
 use crate::infra::storage::repo::{self, children, private};
 use crate::infra::storage::scoped::{self, AuthorizedRead, PrivateScope};
@@ -183,21 +192,158 @@ fn snapshot_config() -> TxConfig {
 }
 
 /// What a targeted read loads inside its snapshot.
+#[derive(Clone, Copy)]
 enum Load {
     /// The composed detail: version row, every working line identity and content.
     Detail,
     /// One line page: identities after the cursor, at most `limit`, plus their content.
     Lines { after: Option<Position>, limit: u64 },
+    /// One history page: committed version rows after the number, at most `limit`, plus the
+    /// current version's consent (S4-06).
+    Versions { after: Option<i32>, limit: u64 },
+    /// One committed version: its row, line identities, immutable lines and totals (S4-06).
+    Version(i32),
+    /// One page of prior consent records after the number, at most `limit`, plus the current
+    /// version's consent (S4-06).
+    Acceptances { after: Option<i32>, limit: u64 },
 }
 
-/// The rows of one targeted snapshot.
+/// The rows of one targeted snapshot. Each [`Load`] fills its own members; the rest stay empty.
 struct Snapshot {
     row: order::Model,
-    version: Option<crate::infra::storage::entity::order_version::Model>,
+    version: Option<order_version::Model>,
     identities: Vec<order_line_identity::Model>,
     drafts: Vec<draft_content::Model>,
     committed: Vec<order_line::Model>,
     totals: Vec<resolved_total::Model>,
+    history: Vec<order_version::Model>,
+    consents: Vec<acceptance::Model>,
+    current_consent: Option<acceptance::Model>,
+}
+impl Snapshot {
+    fn of(row: order::Model) -> Self {
+        Self {
+            row,
+            version: None,
+            identities: Vec::new(),
+            drafts: Vec::new(),
+            committed: Vec::new(),
+            totals: Vec::new(),
+            history: Vec::new(),
+            consents: Vec::new(),
+            current_consent: None,
+        }
+    }
+}
+
+/// The order's frozen tenant axes with the payer of the composed version: a committed pin must
+/// name exactly these (the current version's payer is the aggregate's).
+#[derive(Clone, Copy)]
+struct Axes {
+    seller: Uuid,
+    payer: Uuid,
+    resource: Uuid,
+}
+impl Axes {
+    fn current(row: &order::Model) -> Self {
+        Self {
+            seller: row.seller_tenant_id,
+            payer: row.payer_tenant_id,
+            resource: row.resource_tenant_id,
+        }
+    }
+    fn at(row: &order::Model, version: &order_version::Model) -> Self {
+        Self {
+            payer: version.payer_tenant_id,
+            ..Self::current(row)
+        }
+    }
+}
+
+/// Load what `load` names for the authorized current row, inside the snapshot.
+async fn load_rows(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    row: order::Model,
+    load: Load,
+) -> anyhow::Result<Snapshot> {
+    let id = row.order_id;
+    let current = row.current_version;
+    let mut snapshot = Snapshot::of(row);
+    match load {
+        Load::Detail => load_current(tx, scope, &mut snapshot, None, None, true).await?,
+        Load::Lines { after, limit } => {
+            load_current(tx, scope, &mut snapshot, after, Some(limit), false).await?;
+        }
+        Load::Versions { after, limit } => {
+            snapshot.history = repo::read::version_page(tx, scope, id, after, limit).await?;
+            snapshot.current_consent = repo::read::acceptance_of(tx, scope, id, current).await?;
+        }
+        Load::Version(number) => load_version(tx, scope, &mut snapshot, number).await?,
+        Load::Acceptances { after, limit } => {
+            snapshot.consents =
+                repo::read::prior_acceptance_page(tx, scope, id, current, after, limit).await?;
+            snapshot.current_consent = repo::read::acceptance_of(tx, scope, id, current).await?;
+        }
+    }
+    Ok(snapshot)
+}
+
+/// The current composition: draft working lines or the current committed version's lines; the
+/// detail also loads the current version row and, outside draft, its totals.
+async fn load_current(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    snapshot: &mut Snapshot,
+    after: Option<Position>,
+    limit: Option<u64>,
+    detail: bool,
+) -> anyhow::Result<()> {
+    let id = snapshot.row.order_id;
+    let current = snapshot.row.current_version;
+    if detail {
+        snapshot.version = children::version(tx, scope, id, current).await?;
+    }
+    if is_draft(&snapshot.row) {
+        snapshot.identities = repo::read::draft_line_page(tx, scope, id, after, limit).await?;
+        let ids = line_ids(&snapshot.identities);
+        snapshot.drafts = children::draft_content_for_lines(tx, scope, id, &ids).await?;
+    } else {
+        snapshot.identities =
+            repo::read::committed_line_page(tx, scope, id, current, after, limit).await?;
+        let ids = line_ids(&snapshot.identities);
+        snapshot.committed =
+            children::committed_content_for_lines(tx, scope, id, current, &ids).await?;
+        if detail {
+            snapshot.totals = children::committed_totals(tx, scope, id, current).await?;
+        }
+    }
+    Ok(())
+}
+
+/// One committed version's row and, when it exists, its line identities, immutable lines and
+/// totals, all selected by that version number.
+async fn load_version(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    snapshot: &mut Snapshot,
+    number: i32,
+) -> anyhow::Result<()> {
+    let id = snapshot.row.order_id;
+    snapshot.version = children::version(tx, scope, id, number).await?;
+    if snapshot.version.is_some() {
+        snapshot.identities =
+            repo::read::committed_line_page(tx, scope, id, number, None, None).await?;
+        let ids = line_ids(&snapshot.identities);
+        snapshot.committed =
+            children::committed_content_for_lines(tx, scope, id, number, &ids).await?;
+        snapshot.totals = children::committed_totals(tx, scope, id, number).await?;
+    }
+    Ok(())
+}
+
+fn line_ids(identities: &[order_line_identity::Model]) -> Vec<Uuid> {
+    identities.iter().map(|i| i.line_id).collect()
 }
 
 /// Outcome of one authorized snapshot attempt.
@@ -371,7 +517,11 @@ impl ReadService {
                     payer_tenant_id: version.payer_tenant_id,
                     contract_id: version.contract_id,
                 },
-                lines: compose_committed_lines(row, &snapshot.identities, &snapshot.committed)?,
+                lines: compose_committed_lines(
+                    Axes::current(row),
+                    &snapshot.identities,
+                    &snapshot.committed,
+                )?,
             },
         };
         self.served_point(&parts, caller, GET_OPERATION, row)
@@ -527,13 +677,145 @@ impl ReadService {
         let lines = if is_draft(&snapshot.row) {
             compose_lines(&identities, &snapshot.drafts)?
         } else {
-            compose_committed_lines(&snapshot.row, &identities, &snapshot.committed)?
+            compose_committed_lines(
+                Axes::current(&snapshot.row),
+                &identities,
+                &snapshot.committed,
+            )?
         };
         let page = LinePage {
             items: lines,
             page_info: PageInfo::forward(next_cursor, page_size),
             current_version: version_of(snapshot.row.current_version)?,
             draft_revision: draft_revision(&snapshot.row)?,
+        };
+        self.served_point(&parts, caller, operation, &snapshot.row)
+            .await?;
+        Ok(page)
+    }
+
+    /// *List Versions* (S4-06; DESIGN §7): one keyset page of the committed version rows in
+    /// version order through the current scoped parent, with the current version and its consent
+    /// from the same snapshot. Committed rows only: a burned candidate leaves a gap, never a
+    /// placeholder.
+    ///
+    /// # Errors
+    /// As [`Self::get`], plus `cursor-invalid` before the access decision.
+    pub async fn list_versions(
+        &self,
+        caller: &Caller,
+        order_id: Uuid,
+        request: &VersionList,
+    ) -> Result<VersionPage, OrdersError> {
+        Self::check_proof(caller)?;
+        let page_size = request.limit.unwrap_or_default();
+        let hash = read::no_filters_hash();
+        let binding = child_binding(caller, Collection::Versions, order_id, &hash);
+        let after = decode_number(request.cursor.as_ref(), binding)?;
+        let parts = self.parts()?;
+        let operation = Collection::Versions.operation();
+        let load = Load::Versions {
+            after,
+            limit: read::fetch_limit(page_size),
+        };
+        let snapshot = self
+            .targeted(&parts, caller, operation, order_id, &load)
+            .await?;
+        let (rows, more) = read::split_page(snapshot.history, page_size);
+        let next_cursor = number_cursor(more, rows.last().map(|row| row.version), binding)?;
+        let page = VersionPage {
+            items: rows.iter().map(version_record).collect::<Result<_, _>>()?,
+            page_info: PageInfo::forward(next_cursor, page_size),
+            current_version: Some(version_of(snapshot.row.current_version)?),
+            current_acceptance: snapshot
+                .current_consent
+                .as_ref()
+                .map(acceptance_record)
+                .transpose()?,
+        };
+        self.served_point(&parts, caller, operation, &snapshot.row)
+            .await?;
+        Ok(page)
+    }
+
+    /// *Read One Version* (S4-06; DESIGN §7): the exact committed `version`, composed at that
+    /// version from its stored rows. An authorized order that never committed `version` (a
+    /// reserved or burned candidate included) is `version-not-found`; that answer discloses the
+    /// authorized order, so the served-log decision applies to it as to a found version (D-254).
+    ///
+    /// # Errors
+    /// As [`Self::get`], plus `version-not-found`.
+    pub async fn get_version(
+        &self,
+        caller: &Caller,
+        order_id: Uuid,
+        version: OrderVersion,
+    ) -> Result<OrderVersionView, OrdersError> {
+        Self::check_proof(caller)?;
+        let number = i32::try_from(i64::from(version))
+            .map_err(|_| OrdersError::Refused(Reason::RequestInvalid))?;
+        let parts = self.parts()?;
+        let snapshot = self
+            .targeted(
+                &parts,
+                caller,
+                GET_VERSION_OPERATION,
+                order_id,
+                &Load::Version(number),
+            )
+            .await?;
+        let Some(stored) = snapshot.version.as_ref() else {
+            self.served_point(&parts, caller, GET_VERSION_OPERATION, &snapshot.row)
+                .await?;
+            return Err(OrdersError::Refused(Reason::VersionNotFound));
+        };
+        let view = compose_version(&snapshot, stored)?;
+        self.served_point(&parts, caller, GET_VERSION_OPERATION, &snapshot.row)
+            .await?;
+        Ok(view)
+    }
+
+    /// *Read Acceptance* (S4-06; DESIGN §7): the current version, its consent or its absence,
+    /// and one keyset page of the prior versions' consent records, from one snapshot. Consent
+    /// records only: no recovery or attempt evidence.
+    ///
+    /// # Errors
+    /// As [`Self::get`], plus `cursor-invalid` before the access decision.
+    pub async fn get_acceptance(
+        &self,
+        caller: &Caller,
+        order_id: Uuid,
+        request: &AcceptanceList,
+    ) -> Result<AcceptancePage, OrdersError> {
+        Self::check_proof(caller)?;
+        let page_size = request.limit.unwrap_or_default();
+        let hash = read::no_filters_hash();
+        let binding = child_binding(caller, Collection::Acceptances, order_id, &hash);
+        let after = decode_number(request.cursor.as_ref(), binding)?;
+        let parts = self.parts()?;
+        let operation = Collection::Acceptances.operation();
+        let load = Load::Acceptances {
+            after,
+            limit: read::fetch_limit(page_size),
+        };
+        let snapshot = self
+            .targeted(&parts, caller, operation, order_id, &load)
+            .await?;
+        let (rows, more) = read::split_page(snapshot.consents, page_size);
+        let next_cursor =
+            number_cursor(more, rows.last().map(|row| row.accepted_version), binding)?;
+        let page = AcceptancePage {
+            items: rows
+                .iter()
+                .map(acceptance_record)
+                .collect::<Result<_, _>>()?,
+            page_info: PageInfo::forward(next_cursor, page_size),
+            current_version: Some(version_of(snapshot.row.current_version)?),
+            current_acceptance: snapshot
+                .current_consent
+                .as_ref()
+                .map(acceptance_record)
+                .transpose()?,
         };
         self.served_point(&parts, caller, operation, &snapshot.row)
             .await?;
@@ -605,10 +887,7 @@ impl ReadService {
     ) -> Result<Attempt, OrdersError> {
         let order_id = authorized.facts().order_id();
         let authorized = authorized.clone();
-        let load = match load {
-            Load::Detail => None,
-            Load::Lines { after, limit } => Some((*after, *limit)),
-        };
+        let load = *load;
         parts
             .db
             .transaction_ref_mapped_with_config(snapshot_config(), move |tx| {
@@ -619,57 +898,8 @@ impl ReadService {
                             return Ok::<_, anyhow::Error>(Attempt::Restart);
                         }
                     };
-                    let scope = authorized.access_scope();
-                    let (after, limit) = load.map_or((None, None), |(a, l)| (a, Some(l)));
-                    let version = if load.is_none() {
-                        children::version(tx, scope, row.order_id, row.current_version).await?
-                    } else {
-                        None
-                    };
-                    let (identities, drafts, committed, totals) = if is_draft(&row) {
-                        let identities =
-                            repo::read::draft_line_page(tx, scope, row.order_id, after, limit)
-                                .await?;
-                        let ids = identities.iter().map(|i| i.line_id).collect::<Vec<_>>();
-                        let drafts =
-                            children::draft_content_for_lines(tx, scope, row.order_id, &ids)
-                                .await?;
-                        (identities, drafts, Vec::new(), Vec::new())
-                    } else {
-                        let identities = repo::read::committed_line_page(
-                            tx,
-                            scope,
-                            row.order_id,
-                            row.current_version,
-                            after,
-                            limit,
-                        )
-                        .await?;
-                        let ids = identities.iter().map(|i| i.line_id).collect::<Vec<_>>();
-                        let committed = children::committed_content_for_lines(
-                            tx,
-                            scope,
-                            row.order_id,
-                            row.current_version,
-                            &ids,
-                        )
-                        .await?;
-                        let totals = if load.is_none() {
-                            children::committed_totals(tx, scope, row.order_id, row.current_version)
-                                .await?
-                        } else {
-                            Vec::new()
-                        };
-                        (identities, Vec::new(), committed, totals)
-                    };
-                    Ok(Attempt::Loaded(Box::new(Snapshot {
-                        row,
-                        version,
-                        identities,
-                        drafts,
-                        committed,
-                        totals,
-                    })))
+                    let snapshot = load_rows(tx, authorized.access_scope(), row, load).await?;
+                    Ok(Attempt::Loaded(Box::new(snapshot)))
                 })
             })
             .await
@@ -789,6 +1019,45 @@ fn decode(
         .map(|token| read::decode_cursor(token, binding))
         .transpose()
         .map_err(|_| OrdersError::Refused(Reason::CursorInvalid))
+}
+
+/// The binding of a per-order collection token.
+fn child_binding<'a>(
+    caller: &Caller,
+    collection: Collection,
+    order_id: Uuid,
+    filters_hash: &'a str,
+) -> CursorBinding<'a> {
+    CursorBinding {
+        collection,
+        parent: Some(order_id),
+        subject_id: caller.ctx().subject_id(),
+        subject_tenant_id: caller.ctx().subject_tenant_id(),
+        filters_hash,
+    }
+}
+
+fn decode_number(
+    cursor: Option<&Cursor>,
+    binding: CursorBinding<'_>,
+) -> Result<Option<i32>, OrdersError> {
+    cursor
+        .map(|token| read::decode_number_cursor(token, binding))
+        .transpose()
+        .map_err(|_| OrdersError::Refused(Reason::CursorInvalid))
+}
+
+fn number_cursor(
+    more: bool,
+    last: Option<i32>,
+    binding: CursorBinding<'_>,
+) -> Result<Option<Cursor>, OrdersError> {
+    match (more, last) {
+        (true, Some(number)) => read::encode_number_cursor(binding, number)
+            .map(Some)
+            .map_err(|_| integration("history cursor")),
+        _ => Ok(None),
+    }
 }
 
 fn next_cursor(
@@ -920,7 +1189,11 @@ fn compose_view(snapshot: &Snapshot) -> Result<OrderView, OrdersError> {
     let lines = if is_draft(row) {
         compose_lines(&snapshot.identities, &snapshot.drafts)?
     } else {
-        compose_committed_lines(row, &snapshot.identities, &snapshot.committed)?
+        compose_committed_lines(
+            Axes::current(row),
+            &snapshot.identities,
+            &snapshot.committed,
+        )?
     };
     if !is_draft(row) {
         validate_totals(&lines, &snapshot.totals)?;
@@ -945,6 +1218,69 @@ fn compose_view(snapshot: &Snapshot) -> Result<OrderView, OrdersError> {
         },
         lines,
         draft_revision: draft_revision(row)?,
+    })
+}
+
+fn version_record(row: &order_version::Model) -> Result<VersionRecord, OrdersError> {
+    Ok(VersionRecord {
+        version: version_of(row.version)?,
+        reason: VersionReason::from_token(&row.reason)
+            .ok_or_else(|| integration("version reason"))?,
+        actor: row.actor.clone(),
+        actor_tenant_id: row.actor_tenant_id,
+        created_at: row.created_at,
+        amendment_reason: row.amendment_reason.clone(),
+        supersedes_version: row.supersedes_version.map(version_of).transpose()?,
+    })
+}
+
+fn acceptance_record(row: &acceptance::Model) -> Result<AcceptanceRecord, OrdersError> {
+    Ok(AcceptanceRecord {
+        accepted_version: version_of(row.accepted_version)?,
+        accepted_at: row.accepted_at,
+        recorded_by: row.recorded_by.clone(),
+        recording_path: SalesPath::from_token(&row.recording_path)
+            .ok_or_else(|| integration("acceptance recording path"))?,
+        requirement_source: RequirementSource::from_token(&row.requirement_source)
+            .ok_or_else(|| integration("acceptance requirement source"))?,
+    })
+}
+
+/// Compose one committed version at that version: its lines under its own payer axis, and its
+/// persisted totals validated as on the current read. Version 1 (`create`) is the empty draft:
+/// no lines and no totals.
+fn compose_version(
+    snapshot: &Snapshot,
+    version: &order_version::Model,
+) -> Result<OrderVersionView, OrdersError> {
+    let row = &snapshot.row;
+    let lines = compose_committed_lines(
+        Axes::at(row, version),
+        &snapshot.identities,
+        &snapshot.committed,
+    )?;
+    let reason =
+        VersionReason::from_token(&version.reason).ok_or_else(|| integration("version reason"))?;
+    let resolved_total = if reason == VersionReason::Create {
+        if !lines.is_empty() || !snapshot.totals.is_empty() {
+            return Err(integration("create version content"));
+        }
+        None
+    } else {
+        validate_totals(&lines, &snapshot.totals)?;
+        Some(
+            snapshot
+                .totals
+                .iter()
+                .map(committed_total)
+                .collect::<Result<_, _>>()?,
+        )
+    };
+    Ok(OrderVersionView {
+        order_id: row.order_id,
+        version: version_of(version.version)?,
+        lines,
+        resolved_total,
     })
 }
 
@@ -1074,7 +1410,7 @@ fn ensure_readable(row: &order::Model) -> Result<(), OrdersError> {
 }
 
 fn compose_committed_lines(
-    parent: &order::Model,
+    axes: Axes,
     identities: &[order_line_identity::Model],
     rows: &[order_line::Model],
 ) -> Result<Vec<DraftLine>, OrdersError> {
@@ -1085,15 +1421,12 @@ fn compose_committed_lines(
                 .iter()
                 .find(|row| row.line_id == identity.line_id)
                 .ok_or_else(|| integration("committed membership"))?;
-            committed_line(parent, row)
+            committed_line(axes, row)
         })
         .collect()
 }
 
-fn committed_line(
-    parent: &order::Model,
-    row: &order_line::Model,
-) -> Result<DraftLine, OrdersError> {
+fn committed_line(parent: Axes, row: &order_line::Model) -> Result<DraftLine, OrdersError> {
     let fail = |check, cause: Option<&dyn std::fmt::Display>| {
         committed_integration(row.order_id, row.line_id, check, cause)
     };
@@ -1108,12 +1441,9 @@ fn committed_line(
     // Validate the independent row selection, not merely a self-consistent receipt; the first
     // failing check is the one logged.
     let checks = [
-        (axes.seller_tenant_id == parent.seller_tenant_id, "seller"),
-        (axes.payer_tenant_id == parent.payer_tenant_id, "payer"),
-        (
-            axes.resource_tenant_id == parent.resource_tenant_id,
-            "resource",
-        ),
+        (axes.seller_tenant_id == parent.seller, "seller"),
+        (axes.payer_tenant_id == parent.payer, "payer"),
+        (axes.resource_tenant_id == parent.resource, "resource"),
         (query.order_id == row.order_id, "order"),
         (query.line_id == row.line_id, "line"),
         (

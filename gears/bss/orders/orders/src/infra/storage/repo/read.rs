@@ -3,9 +3,12 @@
 //! strict cursor boundary in SQL before `ORDER BY`/`LIMIT`; nothing is post-filtered. Child
 //! reads bind to the current scoped parent through the aggregate join; draft membership is a
 //! SQL predicate on the working set, so a removed draft identity is never a current line.
+//! The S4-06 history pages (D-254) key on the committed version number, unique per order.
 use super::{AccessScope, DBRunner, EntityTrait, ScopeError, SecureEntityExt, Uuid, order};
 use crate::domain::read::Position;
-use crate::infra::storage::entity::{draft_content, order_line_identity};
+use crate::infra::storage::entity::{
+    acceptance, draft_content, order_line_identity, order_version,
+};
 use bss_orders_sdk::reads::OrderFilters;
 use sea_orm::sea_query::Query;
 use sea_orm::{ColumnTrait, Condition, QueryFilter, QueryOrder, QuerySelect};
@@ -141,5 +144,85 @@ pub async fn committed_line_page(
         .scope_with(&AccessScope::for_resources(vec![order_id]))
         .and_scope_for::<order::Entity>(scope)
         .all(runner)
+        .await
+}
+
+/// One page of the current parent's committed version rows strictly after version `after`, in
+/// version order, at most `limit` rows (the caller passes page size + 1). The stored rows are
+/// the committed versions only: a reserved or burned candidate has no row (D-188).
+///
+/// # Errors
+/// Scope/store failure.
+pub async fn version_page(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    order_id: Uuid,
+    after: Option<i32>,
+    limit: u64,
+) -> Result<Vec<order_version::Model>, ScopeError> {
+    use order_version::Column;
+    let mut query = order_version::Entity::find()
+        .inner_join(order::Entity)
+        .filter(Column::OrderId.eq(order_id));
+    if let Some(after) = after {
+        query = query.filter(Column::Version.gt(after));
+    }
+    query
+        .order_by_asc(Column::Version)
+        .limit(limit)
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![order_id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await
+}
+
+/// One page of the consent records of versions before `current` (the prior records), strictly
+/// after version `after`, in version order, at most `limit` rows.
+///
+/// # Errors
+/// Scope/store failure.
+pub async fn prior_acceptance_page(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    order_id: Uuid,
+    current: i32,
+    after: Option<i32>,
+    limit: u64,
+) -> Result<Vec<acceptance::Model>, ScopeError> {
+    use acceptance::Column;
+    let mut query = acceptance::Entity::find()
+        .inner_join(order::Entity)
+        .filter(Column::OrderId.eq(order_id))
+        .filter(Column::AcceptedVersion.lt(current));
+    if let Some(after) = after {
+        query = query.filter(Column::AcceptedVersion.gt(after));
+    }
+    query
+        .order_by_asc(Column::AcceptedVersion)
+        .limit(limit)
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![order_id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await
+}
+
+/// The consent recorded for exactly `version`, if any.
+///
+/// # Errors
+/// Scope/store failure.
+pub async fn acceptance_of(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    order_id: Uuid,
+    version: i32,
+) -> Result<Option<acceptance::Model>, ScopeError> {
+    acceptance::Entity::find_by_id((order_id, version))
+        .inner_join(order::Entity)
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![order_id]))
+        .and_scope_for::<order::Entity>(scope)
+        .one(runner)
         .await
 }

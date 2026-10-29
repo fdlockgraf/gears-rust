@@ -273,6 +273,8 @@ mod capture;
 mod dates;
 mod engine;
 mod events;
+#[cfg(feature = "gate-dev-stubs")]
+mod history;
 mod platform;
 mod policy;
 mod reads;

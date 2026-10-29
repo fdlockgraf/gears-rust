@@ -20,7 +20,8 @@ use uuid::Uuid;
 /// The current token version; a token of any other version is `cursor-invalid`.
 const CURSOR_VERSION: u8 = 1;
 
-/// The paged collections delivered by the early S6-01 subset, each with its immutable sort.
+/// The paged collections, each with its immutable sort: the early S6-01 subset and the S4-06
+/// history reads (D-254).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +31,11 @@ pub enum Collection {
     /// The per-order line read: `(created_at, line_id)` ascending over the line identity,
     /// joined to the current (draft working) membership.
     Lines,
+    /// The committed version history: `version` ascending (S4-06). Committed numbers are unique
+    /// per order and only grow, so the number alone is the keyset.
+    Versions,
+    /// The prior consent records: `accepted_version` ascending (S4-06), one record per version.
+    Acceptances,
 }
 impl Collection {
     /// The S1-02 catalog operation identifier, stored in `orders_read_access_log.operation`.
@@ -38,6 +44,8 @@ impl Collection {
         match self {
             Self::Orders => "list",
             Self::Lines => "list_lines",
+            Self::Versions => "list_versions",
+            Self::Acceptances => "get_acceptance",
         }
     }
     /// The declared sort, part of the token binding (clients cannot select another).
@@ -46,12 +54,23 @@ impl Collection {
         match self {
             Self::Orders => "created_at,order_id",
             Self::Lines => "created_at,line_id",
+            Self::Versions => "version",
+            Self::Acceptances => "accepted_version",
         }
+    }
+    /// Whether the keyset is a committed version number (D-254) rather than an
+    /// `(instant, identity)` [`Position`].
+    #[must_use]
+    pub const fn numbered(self) -> bool {
+        matches!(self, Self::Versions | Self::Acceptances)
     }
 }
 
 /// The catalog operation identifier of the point read.
 pub const GET_OPERATION: &str = "get";
+
+/// The catalog operation identifier of the one-version read (S4-06).
+pub const GET_VERSION_OPERATION: &str = "get_version";
 
 /// The keyset position of the last returned row: its creation instant in microseconds since
 /// the Unix epoch (the stored `timestamptz` precision, preserved exactly) and its identity
@@ -117,7 +136,9 @@ pub struct CursorBinding<'a> {
 }
 
 /// The stored token. Short keys keep the opaque token small; `deny_unknown_fields` makes an
-/// extra field a structural failure.
+/// extra field a structural failure. Exactly one keyset member is present: `k` (an
+/// `(instant, identity)` position) on the order and line collections, `n` (a committed version
+/// number) on the history collections (D-254); the order and line tokens are spelled as before.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Token {
@@ -128,9 +149,51 @@ struct Token {
     t: Uuid,
     f: String,
     o: String,
-    k: Position,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    k: Option<Position>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    n: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     r: Option<i32>,
+}
+impl Token {
+    fn issue(binding: CursorBinding<'_>) -> Self {
+        Self {
+            v: CURSOR_VERSION,
+            c: binding.collection,
+            p: binding.parent,
+            s: binding.subject_id,
+            t: binding.subject_tenant_id,
+            f: binding.filters_hash.to_owned(),
+            o: binding.collection.sort().to_owned(),
+            k: None,
+            n: None,
+            r: None,
+        }
+    }
+    fn encode(&self) -> Result<Cursor, ReadRuleError> {
+        let raw = serde_json::to_vec(self).map_err(|_| ReadRuleError::CursorInvalid)?;
+        Cursor::try_from(URL_SAFE_NO_PAD.encode(raw)).map_err(|_| ReadRuleError::CursorInvalid)
+    }
+    /// Structure, version and request binding; the keyset member is the caller's check.
+    fn decode(cursor: &Cursor, binding: CursorBinding<'_>) -> Result<Self, ReadRuleError> {
+        let invalid = ReadRuleError::CursorInvalid;
+        let raw = URL_SAFE_NO_PAD
+            .decode(cursor.as_str())
+            .map_err(|_| invalid)?;
+        let token: Self = serde_json::from_slice(&raw).map_err(|_| invalid)?;
+        if token.v != CURSOR_VERSION
+            || token.c != binding.collection
+            || token.p != binding.parent
+            || token.s != binding.subject_id
+            || token.t != binding.subject_tenant_id
+            || token.f != binding.filters_hash
+            || token.o != binding.collection.sort()
+        {
+            return Err(invalid);
+        }
+        Ok(token)
+    }
 }
 
 /// The normalized-filter hash the order-list token binds to: SHA-256 over the canonical JSON
@@ -185,19 +248,51 @@ pub fn encode_cursor_version(
     position: Position,
     version: Option<i32>,
 ) -> Result<Cursor, ReadRuleError> {
-    let token = Token {
-        v: CURSOR_VERSION,
-        c: binding.collection,
-        p: binding.parent,
-        s: binding.subject_id,
-        t: binding.subject_tenant_id,
-        f: binding.filters_hash.to_owned(),
-        o: binding.collection.sort().to_owned(),
-        k: position,
+    if binding.collection.numbered() {
+        return Err(ReadRuleError::CursorInvalid);
+    }
+    Token {
+        k: Some(position),
         r: version,
-    };
-    let raw = serde_json::to_vec(&token).map_err(|_| ReadRuleError::CursorInvalid)?;
-    Cursor::try_from(URL_SAFE_NO_PAD.encode(raw)).map_err(|_| ReadRuleError::CursorInvalid)
+        ..Token::issue(binding)
+    }
+    .encode()
+}
+
+/// The continuation token of a history collection, issued from the last returned committed
+/// version number (D-254).
+///
+/// # Errors
+/// `CursorInvalid` for a collection keyed by position or a non-positive number.
+pub fn encode_number_cursor(
+    binding: CursorBinding<'_>,
+    number: i32,
+) -> Result<Cursor, ReadRuleError> {
+    if !binding.collection.numbered() || number < 1 {
+        return Err(ReadRuleError::CursorInvalid);
+    }
+    Token {
+        n: Some(number),
+        ..Token::issue(binding)
+    }
+    .encode()
+}
+
+/// Validate a history token's structure, version and binding to this request and return the
+/// committed version number to continue strictly after (D-139, D-254). Every failure is
+/// `cursor-invalid`.
+///
+/// # Errors
+/// `CursorInvalid`.
+pub fn decode_number_cursor(
+    cursor: &Cursor,
+    binding: CursorBinding<'_>,
+) -> Result<i32, ReadRuleError> {
+    let token = Token::decode(cursor, binding)?;
+    match (binding.collection.numbered(), token.k, token.n, token.r) {
+        (true, None, Some(number), None) if number >= 1 => Ok(number),
+        _ => Err(ReadRuleError::CursorInvalid),
+    }
 }
 
 /// Validate a supplied token's structure, version, precision and binding to this request, and
@@ -249,25 +344,15 @@ pub fn decode_cursor_bound(
     binding: CursorBinding<'_>,
 ) -> Result<DecodedCursor, ReadRuleError> {
     let invalid = ReadRuleError::CursorInvalid;
-    let raw = URL_SAFE_NO_PAD
-        .decode(cursor.as_str())
-        .map_err(|_| invalid)?;
-    let token: Token = serde_json::from_slice(&raw).map_err(|_| invalid)?;
-    if token.v != CURSOR_VERSION
-        || token.c != binding.collection
-        || token.p != binding.parent
-        || token.s != binding.subject_id
-        || token.t != binding.subject_tenant_id
-        || token.f != binding.filters_hash
-        || token.o != binding.collection.sort()
-    {
+    let token = Token::decode(cursor, binding)?;
+    let (false, Some(position), None) = (binding.collection.numbered(), token.k, token.n) else {
         return Err(invalid);
-    }
+    };
     // Precision: the instant must be representable exactly. Its failure is `cursor-invalid`
     // like every other one (D-139), not the internal `Precision`.
-    token.k.instant().map_err(|_| invalid)?;
+    position.instant().map_err(|_| invalid)?;
     Ok(DecodedCursor {
-        position: token.k,
+        position,
         version: token.r,
     })
 }

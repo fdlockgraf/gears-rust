@@ -508,8 +508,8 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
         crate::api::rest::problem(amended.unwrap_err()).status,
         Some(503)
     );
-    // S2-09 mounts exactly the five delivered authoring operations and the early-S6 package
-    // the three draft read operations; nothing else.
+    // S2-09 mounts exactly the five delivered authoring operations, the early-S6 package the
+    // three draft read operations and S4-06 the three history reads (D-254); nothing else.
     let openapi = toolkit::api::OpenApiRegistryImpl::new();
     let router = gear.register_rest(&ctx, axum::Router::new(), &openapi)?;
     let document =
@@ -532,7 +532,10 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
             "DELETE /bss-orders/v1/orders/{orderId}/lines/{lineId}",
             "GET /bss-orders/v1/orders",
             "GET /bss-orders/v1/orders/{orderId}",
+            "GET /bss-orders/v1/orders/{orderId}/acceptance",
             "GET /bss-orders/v1/orders/{orderId}/lines",
+            "GET /bss-orders/v1/orders/{orderId}/versions",
+            "GET /bss-orders/v1/orders/{orderId}/versions/{version}",
             "PATCH /bss-orders/v1/orders/{orderId}",
             "PATCH /bss-orders/v1/orders/{orderId}/lines/{lineId}",
             "POST /bss-orders/v1/orders",
@@ -763,6 +766,9 @@ async fn assert_delivered_census(
             "get",
             "list",
             "list_lines",
+            "list_versions",
+            "get_version",
+            "get_acceptance",
         ]
         .contains(&op.id)
     }) {

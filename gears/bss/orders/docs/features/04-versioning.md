@@ -537,6 +537,18 @@ because a consumer reconstructing the commercial trail keys on it.
 
 <!-- /contract -->
 
+**Implementation status (S4-06, D-254).** Delivered in production (the route census):
+`GET /orders/{orderId}/versions` (`OrdersV1::list_versions`),
+`GET /orders/{orderId}/versions/{version}` (`OrdersV1::get_version`) and
+`GET /orders/{orderId}/acceptance` (`OrdersV1::get_acceptance`), on the common read wrapper with
+current-parent `order × read` authorization before any history row is read and the access-log
+decision table under each catalog operation id. Versions are read directly from the stored
+version rows (no chain or event reconstruction); the history page is keyed by the committed
+version number, so a burned candidate is a gap, never a placeholder, and reading one is an
+authorized `version-not-found`. A version is composed at that version (its own payer axis,
+lines, pins and totals). The mutable administrative projection (`admin` on `OrderVersionView`)
+and the administrative history (audit trail) are not part of these reads.
+
 <a id="contract-04-4-6"></a>
 
 <!-- contract:04-versioning:4.6 -->

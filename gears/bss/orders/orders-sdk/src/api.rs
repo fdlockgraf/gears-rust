@@ -1,12 +1,17 @@
 //! Incremental local SDK surface: draft authoring (S2-09), the authorized draft reads
-//! (early S6-01/S6-04) and the typed submit entry point.
+//! (early S6-01/S6-04), the version and consent history reads (S4-06) and the typed submit entry
+//! point.
 use crate::{
     OrdersError,
     amend::AmendOrder,
     authoring::{AddLine, CreateMeta, CreateOrder, HeaderPatch, LinePatch, OrderView},
+    models::OrderVersion,
     models::{CallMeta, DraftRevision, TransitionResult},
     preview::{PreviewBasket, PreviewResult},
-    reads::{LineList, LinePage, ListOrders, OrderPage, ReadMeta},
+    reads::{
+        AcceptanceList, AcceptancePage, LineList, LinePage, ListOrders, OrderPage,
+        OrderVersionView, ReadMeta, VersionList, VersionPage,
+    },
 };
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
@@ -126,6 +131,48 @@ pub trait OrdersV1: Send + Sync {
         request: LineList,
         meta: ReadMeta,
     ) -> Result<LinePage, OrdersError>;
+
+    /// One authorized page of the order's committed version history in version order (S4-06):
+    /// committed rows only, never a placeholder for a burned candidate, with the current version
+    /// and its consent from the same snapshot. Authorized on the current parent first.
+    ///
+    /// # Errors
+    /// As [`Self::get`] plus `page-size-exceeded` and `cursor-invalid`.
+    async fn list_versions(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: VersionList,
+        meta: ReadMeta,
+    ) -> Result<VersionPage, OrdersError>;
+
+    /// One exact committed version, composed at that version (S4-06). The S1-02 catalog lists
+    /// this operation on `OrdersWorkflowSeamV1`, which the SDK does not define; it is served here
+    /// for every `order × read` caller, as `get` is (D-254).
+    ///
+    /// # Errors
+    /// As [`Self::get`]; `version-not-found` for an authorized order that never committed
+    /// `version` (a reserved or burned candidate included).
+    async fn get_version(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        version: OrderVersion,
+        meta: ReadMeta,
+    ) -> Result<OrderVersionView, OrdersError>;
+
+    /// The consent read (S4-06): the current version, its consent or its absence, and one page of
+    /// the prior versions' consent records.
+    ///
+    /// # Errors
+    /// As [`Self::get`] plus `page-size-exceeded` and `cursor-invalid`.
+    async fn get_acceptance(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: AcceptanceList,
+        meta: ReadMeta,
+    ) -> Result<AcceptancePage, OrdersError>;
 
     /// Submit exactly the observed draft revision under the real caller context.
     ///

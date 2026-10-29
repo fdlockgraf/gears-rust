@@ -1,5 +1,7 @@
-//! The three early S6-01 read routes (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`):
-//! `GET /orders/{orderId}`, `GET /orders` and `GET /orders/{orderId}/lines`.
+//! The read routes (08 §3.3; S1-02 catalog): the early S6-01 `get`, `list`, `list_lines`
+//! (`GET /orders/{orderId}`, `GET /orders`, `GET /orders/{orderId}/lines`) and the S4-06 history
+//! reads `list_versions`, `get_version`, `get_acceptance` (`GET /orders/{orderId}/versions`,
+//! `GET /orders/{orderId}/versions/{version}`, `GET /orders/{orderId}/acceptance`; D-254).
 //!
 //! The query is the shared list format (DNA REST `PAGINATION.md`, D-212): `limit`, `cursor` and,
 //! on the order list, an `OData` `$filter`; a page answers `items` and `page_info`.
@@ -22,7 +24,9 @@ use axum::{Extension, Router};
 use bss_orders_sdk::OrdersError;
 use bss_orders_sdk::catalog::{OrderState, Reason};
 use bss_orders_sdk::models::OrderVersion;
-use bss_orders_sdk::reads::{Cursor, LineList, ListOrders, OrderFilters, PageSize};
+use bss_orders_sdk::reads::{
+    AcceptanceList, Cursor, LineList, ListOrders, OrderFilters, PageSize, VersionList,
+};
 use serde::Serialize;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::{OperationBuilder, ResponseHeaderSpec, ResponseHeaderType};
@@ -31,7 +35,10 @@ use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue, parse_odata_filter
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::dto::{OrdersLinePage, OrdersOrderPage, OrdersOrderView, ResponseUnencodable};
+use super::dto::{
+    OrdersAcceptancePage, OrdersLinePage, OrdersOrderPage, OrdersOrderVersionView, OrdersOrderView,
+    OrdersVersionPage, ResponseUnencodable,
+};
 use super::error::ApiResult;
 use crate::authz::Caller;
 use crate::infra::read::{self, ReadService};
@@ -242,6 +249,26 @@ fn line_request(uri: &Uri) -> Result<LineList, OrdersError> {
     Ok(LineList { limit, cursor })
 }
 
+/// The validated query of a per-order history page (no filters), in the flow's order.
+fn history_request(uri: &Uri) -> Result<(Option<PageSize>, Option<Cursor>), OrdersError> {
+    let query = query(uri)?;
+    let limit = limit(&query)?;
+    no_filters(&query)?;
+    let cursor = cursor(&query)?;
+    Ok((limit, cursor))
+}
+
+/// The `{version}` path segment: a committed version is a positive SQL integer written in
+/// decimal digits; anything else is `request-invalid` before the access decision.
+fn version_segment(text: &str) -> Result<OrderVersion, OrdersError> {
+    let invalid = || refused(Reason::RequestInvalid);
+    if text.is_empty() || text.len() > 10 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let number = text.parse::<i32>().map_err(|_| invalid())?;
+    OrderVersion::try_from(i64::from(number)).map_err(|_| invalid())
+}
+
 fn etag_value(version: OrderVersion) -> HeaderValue {
     HeaderValue::from_str(&format!("\"{}\"", i64::from(version)))
         .unwrap_or_else(|_| HeaderValue::from_static("\"0\""))
@@ -311,6 +338,51 @@ async fn list_lines(
     Ok(served(Some(etag), &wire::<_, OrdersLinePage>(page)?))
 }
 
+async fn list_versions(
+    Extension(service): Extension<Arc<ReadService>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Path(order_id): Path<Uuid>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> ApiResult<Response> {
+    let caller = super::caller(ctx, &headers)?;
+    let (limit, cursor) = history_request(&uri)?;
+    let page = service
+        .list_versions(&caller, order_id, &VersionList { limit, cursor })
+        .await?;
+    let etag = page.current_version;
+    Ok(served(etag, &wire::<_, OrdersVersionPage>(page)?))
+}
+
+async fn get_version(
+    Extension(service): Extension<Arc<ReadService>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Path((order_id, version)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let caller = super::caller(ctx, &headers)?;
+    let version = version_segment(&version)?;
+    let view = service.get_version(&caller, order_id, version).await?;
+    // No ETag: the read version is not necessarily the current one `If-Match` must name.
+    Ok(served(None, &wire::<_, OrdersOrderVersionView>(view)?))
+}
+
+async fn get_acceptance(
+    Extension(service): Extension<Arc<ReadService>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Path(order_id): Path<Uuid>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> ApiResult<Response> {
+    let caller = super::caller(ctx, &headers)?;
+    let (limit, cursor) = history_request(&uri)?;
+    let page = service
+        .get_acceptance(&caller, order_id, &AcceptanceList { limit, cursor })
+        .await?;
+    let etag = page.current_version;
+    Ok(served(etag, &wire::<_, OrdersAcceptancePage>(page)?))
+}
+
 fn etag() -> ResponseHeaderSpec {
     ResponseHeaderSpec::new(
         "ETag",
@@ -329,7 +401,7 @@ const CURSOR_DOC: &str = "Opaque continuation from the previous page's next_curs
                           failing structure, version, precision or its binding to this request \
                           is 400 CURSOR_INVALID";
 
-/// Register the three read routes and attach the shared service once (`ToolKit` REST rule).
+/// Register the read routes and attach the shared service once (`ToolKit` REST rule).
 pub fn router(service: Arc<ReadService>, openapi: &dyn OpenApiRegistry) -> Router {
     let router = Router::new();
     let router = OperationBuilder::get("/bss-orders/v1/orders/{orderId}")
@@ -407,7 +479,75 @@ pub fn router(service: Arc<ReadService>, openapi: &dyn OpenApiRegistry) -> Route
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
+    let router = history_routes(router, openapi);
     router.layer(Extension(service))
+}
+
+/// The S4-06 history routes (D-254): `order × read` on the current parent, in every state.
+fn history_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    let router = OperationBuilder::get("/bss-orders/v1/orders/{orderId}/versions")
+        .operation_id("bss_orders.list_versions")
+        .summary("List the order's committed versions")
+        .description(
+            "One authorized keyset page of the committed version history in version order, read              from the stored version rows (never a chain walk or event replay): version, reason              (create, submit, amendment), actor, actor tenant, engine timestamp,              amendment_reason and supersedes_version. Reserved or burned candidate numbers are              gaps, never placeholder items. current_version and current_acceptance (absent: no              consent recorded) come from the same snapshot; the ETag is the current version.              Authorization is decided on the current order first: a reader without access gets              404 ORDER_NOT_FOUND, exactly as for a missing order. History permission is order              read; it does not grant audit-trail access.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("orderId", "Order identity")
+        .query_param_typed(LIMIT, false, LIMIT_DOC, "integer")
+        .query_param(CURSOR, false, CURSOR_DOC)
+        .param(super::delegation_proof_param())
+        .handler(list_versions)
+        .json_response_with_schema::<OrdersVersionPage>(openapi, StatusCode::OK, "Authorized page")
+        .response_header(etag())
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    let router = OperationBuilder::get("/bss-orders/v1/orders/{orderId}/versions/{version}")
+        .operation_id("bss_orders.get_version")
+        .summary("Read one committed version")
+        .description(
+            "The exact committed version composed at that version from its stored rows: its              lines with the complete immutable commercial evidence and its persisted producer              totals (version 1, the empty draft, has neither). 404 VERSION_NOT_FOUND for an              authorized order that never committed the version, a reserved or burned candidate              included; 404 ORDER_NOT_FOUND for a missing or hidden order. A version that is not              a positive integer is 400 REQUEST_INVALID. No ETag: the version read is not              necessarily the current one. The administrative projection is not delivered.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("orderId", "Order identity")
+        .path_param("version", "Committed version number (positive integer)")
+        .param(super::delegation_proof_param())
+        .handler(get_version)
+        .json_response_with_schema::<OrdersOrderVersionView>(
+            openapi,
+            StatusCode::OK,
+            "Committed version",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    OperationBuilder::get("/bss-orders/v1/orders/{orderId}/acceptance")
+        .operation_id("bss_orders.get_acceptance")
+        .summary("Read the order's consent")
+        .description(
+            "The current version, its recorded consent (absent: none recorded) and one keyset              page of the prior versions' consent records in version order: accepted_version,              accepted_at, recorded_by, recording_path and requirement_source. Consent is per              version: an amended version starts without one. Internal recovery evidence is              never returned. The ETag is the current version.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("orderId", "Order identity")
+        .query_param_typed(LIMIT, false, LIMIT_DOC, "integer")
+        .query_param(CURSOR, false, CURSOR_DOC)
+        .param(super::delegation_proof_param())
+        .handler(get_acceptance)
+        .json_response_with_schema::<OrdersAcceptancePage>(
+            openapi,
+            StatusCode::OK,
+            "Current consent and prior records",
+        )
+        .response_header(etag())
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi)
 }
 
 #[cfg(test)]

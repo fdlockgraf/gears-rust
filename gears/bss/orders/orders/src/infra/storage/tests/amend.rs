@@ -78,7 +78,7 @@ async fn amend_as(
     .await
 }
 
-async fn amend(
+pub(super) async fn amend(
     f: &Fixture,
     order: Uuid,
     version: i64,
@@ -89,7 +89,7 @@ async fn amend(
 }
 
 /// A submitted order of `lines` lines: the draft view (its line ids are N's) and N.
-async fn submitted(f: &Fixture, lines: usize, tag: &str) -> (OrderView, i64) {
+pub(super) async fn submitted(f: &Fixture, lines: usize, tag: &str) -> (OrderView, i64) {
     let v = draft_tagged(f, lines, tag).await;
     let settled = submit(f, &buyer(), &v, &format!("{tag}-submit"))
         .await
@@ -100,7 +100,7 @@ async fn submitted(f: &Fixture, lines: usize, tag: &str) -> (OrderView, i64) {
 }
 
 /// A delta changing line `line`'s quantity to `quantity`.
-fn change_quantity(line: Uuid, quantity: &str) -> Value {
+pub(super) fn change_quantity(line: Uuid, quantity: &str) -> Value {
     json!({"reason": "bigger plan", "lines": [{"op": "change", "line_id": line,
         "patch": {"selected_items": [{"item_id": crate::infra::gate::tests::orchestrate::ITEM,
             "quantity": quantity}]}}]})
@@ -119,7 +119,7 @@ fn external_calls(f: &Fixture) -> usize {
         + f.acceptance.calls()
 }
 
-async fn order_row(f: &Fixture, order: Uuid) -> Value {
+pub(super) async fn order_row(f: &Fixture, order: Uuid) -> Value {
     f.t.json(&format!(
         "SELECT to_jsonb(o) AS j FROM bss_orders__order o WHERE order_id='{order}'"
     ))

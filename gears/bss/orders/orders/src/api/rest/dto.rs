@@ -3,7 +3,8 @@
 //! is generated from them. Each request body converts into its SDK authoring type with
 //! `TryFrom`, so the SDK serde shape (kept for in-process callers and stored data) is not the HTTP
 //! contract (TOOLKIT-CORE-001). The read responses ([`OrdersOrderView`], [`OrdersOrderPage`],
-//! [`OrdersLinePage`]) are converted from the SDK read results with `TryFrom` and serialized; every
+//! [`OrdersLinePage`] and the S4-06 history responses [`OrdersVersionPage`],
+//! [`OrdersOrderVersionView`], [`OrdersAcceptancePage`]) are converted from the SDK read results with `TryFrom` and serialized; every
 //! scalar is spelled by the SDK's own serializer, so the bytes are the SDK serialization's
 //! (`orders/tests/rest_responses.rs` pins that). The write responses are not converted: a settled
 //! write answers its stored SDK snapshot byte for byte, so a same-key replay is identical to the
@@ -30,7 +31,10 @@ use bss_orders_sdk::preview::{
     DiscountView, ExactMoneyView, MoneyView, PinOutcomeView, PreviewBasket, PreviewLine,
     PreviewResult,
 };
-use bss_orders_sdk::reads::{LinePage, OrderPage, OrderSummary, PageInfo};
+use bss_orders_sdk::reads::{
+    AcceptancePage, AcceptanceRecord, LinePage, OrderPage, OrderSummary, OrderVersionView,
+    PageInfo, VersionPage, VersionRecord,
+};
 use serde::Deserialize as _;
 use uuid::Uuid;
 
@@ -683,6 +687,77 @@ pub struct OrdersLinePage {
     pub draft_revision: Option<i64>,
 }
 
+/// One committed version of the history (S4-06): the stored version row only.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionRecord {
+    pub version: i64,
+    /// `create`, `submit` or `amendment`.
+    pub reason: String,
+    /// The trusted subject that appended the version.
+    pub actor: String,
+    pub actor_tenant_id: Uuid,
+    /// The engine instant the version was appended.
+    pub created_at: String,
+    /// The caller's explanation; present exactly on an amendment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_reason: Option<String>,
+    /// The predecessor; absent exactly on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<i64>,
+}
+
+/// One recorded consent (S4-06); never internal recovery evidence.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAcceptanceRecord {
+    pub accepted_version: i64,
+    pub accepted_at: String,
+    pub recorded_by: String,
+    /// `self_service` or `partner_placed`, copied from the order's sales path.
+    pub recording_path: String,
+    /// `contract`, `seller`, `platform_default` or `volunteered`.
+    pub requirement_source: String,
+}
+
+/// One authorized keyset page of the committed version history in version order, with the
+/// current version and its consent (absent: none recorded) from the same snapshot.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionPage {
+    pub items: Vec<OrdersVersionRecord>,
+    pub page_info: OrdersPageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<OrdersAcceptanceRecord>,
+}
+
+/// The consent read: the current version, its consent (absent: none recorded) and one keyset
+/// page of the prior versions' consent records.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAcceptancePage {
+    pub items: Vec<OrdersAcceptanceRecord>,
+    pub page_info: OrdersPageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<OrdersAcceptanceRecord>,
+}
+
+/// One exact committed version composed at that version: its lines with their immutable
+/// evidence and its persisted totals (absent on version 1, the empty draft).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersOrderVersionView {
+    pub order_id: Uuid,
+    pub version: i64,
+    pub lines: Vec<OrdersDraftLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_total: Option<Vec<OrdersCommittedTotal>>,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Read responses: SDK read result -> REST DTO
 
@@ -878,6 +953,91 @@ impl TryFrom<LinePage> for OrdersLinePage {
             page_info: page.page_info.into(),
             current_version: page.current_version.into(),
             draft_revision: page.draft_revision.map(i64::from),
+        })
+    }
+}
+
+impl TryFrom<VersionRecord> for OrdersVersionRecord {
+    type Error = ResponseUnencodable;
+    fn try_from(record: VersionRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            version: record.version.into(),
+            reason: spelled(&record.reason, "reason")?,
+            actor: record.actor,
+            actor_tenant_id: record.actor_tenant_id,
+            created_at: instant(record.created_at, "created_at")?,
+            amendment_reason: record.amendment_reason,
+            supersedes_version: record.supersedes_version.map(i64::from),
+        })
+    }
+}
+
+impl TryFrom<AcceptanceRecord> for OrdersAcceptanceRecord {
+    type Error = ResponseUnencodable;
+    fn try_from(record: AcceptanceRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            accepted_version: record.accepted_version.into(),
+            accepted_at: instant(record.accepted_at, "accepted_at")?,
+            recorded_by: record.recorded_by,
+            recording_path: spelled(&record.recording_path, "recording_path")?,
+            requirement_source: spelled(&record.requirement_source, "requirement_source")?,
+        })
+    }
+}
+
+fn consents(
+    records: Vec<AcceptanceRecord>,
+) -> Result<Vec<OrdersAcceptanceRecord>, ResponseUnencodable> {
+    records
+        .into_iter()
+        .map(OrdersAcceptanceRecord::try_from)
+        .collect()
+}
+
+impl TryFrom<VersionPage> for OrdersVersionPage {
+    type Error = ResponseUnencodable;
+    fn try_from(page: VersionPage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: page
+                .items
+                .into_iter()
+                .map(OrdersVersionRecord::try_from)
+                .collect::<Result<_, _>>()?,
+            page_info: page.page_info.into(),
+            current_version: page.current_version.map(i64::from),
+            current_acceptance: page
+                .current_acceptance
+                .map(OrdersAcceptanceRecord::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<AcceptancePage> for OrdersAcceptancePage {
+    type Error = ResponseUnencodable;
+    fn try_from(page: AcceptancePage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: consents(page.items)?,
+            page_info: page.page_info.into(),
+            current_version: page.current_version.map(i64::from),
+            current_acceptance: page
+                .current_acceptance
+                .map(OrdersAcceptanceRecord::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<OrderVersionView> for OrdersOrderVersionView {
+    type Error = ResponseUnencodable;
+    fn try_from(view: OrderVersionView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            order_id: view.order_id,
+            version: view.version.into(),
+            lines: lines(view.lines)?,
+            resolved_total: view
+                .resolved_total
+                .map(|rows| rows.into_iter().map(Into::into).collect()),
         })
     }
 }

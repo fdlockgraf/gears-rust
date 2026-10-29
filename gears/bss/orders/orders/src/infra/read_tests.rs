@@ -127,7 +127,7 @@ fn identity(line_id: Uuid) -> order_line_identity::Model {
 
 #[test]
 fn a_consistent_committed_line_composes_with_its_pin() {
-    let line = committed_line(&parent(), &row()).expect("the golden pair composes");
+    let line = committed_line(Axes::current(&parent()), &row()).expect("the golden pair composes");
     assert_eq!(line.line_id, id(0xc));
     assert_eq!(line.selected_items.len(), 3);
     let committed = line.committed.expect("a committed line carries its pin");
@@ -137,7 +137,7 @@ fn a_consistent_committed_line_composes_with_its_pin() {
 }
 
 fn line_of(row: &order_line::Model) -> DraftLine {
-    committed_line(&parent(), row).expect("the golden pair composes")
+    committed_line(Axes::current(&parent()), row).expect("the golden pair composes")
 }
 
 type Corruption = fn(&mut order::Model, &mut order_line::Model);
@@ -176,7 +176,10 @@ fn every_single_field_corruption_of_a_committed_line_is_integration() {
         let (mut parent, mut row) = (parent(), row());
         corrupt(&mut parent, &mut row);
         assert!(
-            matches!(committed_line(&parent, &row), Err(OrdersError::Integration)),
+            matches!(
+                committed_line(Axes::current(&parent), &row),
+                Err(OrdersError::Integration)
+            ),
             "{name}"
         );
     }
@@ -192,7 +195,7 @@ fn a_missing_digest_column_is_integration() {
         let mut row = row();
         corrupt(&mut row);
         assert!(matches!(
-            committed_line(&parent(), &row),
+            committed_line(Axes::current(&parent()), &row),
             Err(OrdersError::Integration)
         ));
     }
@@ -202,11 +205,11 @@ fn a_missing_digest_column_is_integration() {
 fn a_committed_identity_without_its_row_is_integration() {
     let identities = [identity(id(0xc)), identity(id(0xd))];
     assert!(matches!(
-        compose_committed_lines(&parent(), &identities, &[row()]),
+        compose_committed_lines(Axes::current(&parent()), &identities, &[row()]),
         Err(OrdersError::Integration)
     ));
     assert_eq!(
-        compose_committed_lines(&parent(), &identities[..1], &[row()])
+        compose_committed_lines(Axes::current(&parent()), &identities[..1], &[row()])
             .expect("the member composes")
             .len(),
         1
@@ -293,7 +296,7 @@ fn a_committed_refusal_logs_the_row_identity_and_the_first_failing_check() {
     for (_, corrupt) in CORRUPTIONS {
         let (mut parent, mut row) = (parent(), row());
         corrupt(&mut parent, &mut row);
-        assert!(committed_line(&parent, &row).is_err());
+        assert!(committed_line(Axes::current(&parent), &row).is_err());
     }
     logs_assert(|lines: &[&str]| {
         let read: Vec<_> = lines

@@ -166,7 +166,8 @@ fn malformed_tokens_are_cursor_invalid() {
         t: u(10),
         f: hash.clone(),
         o: Collection::Orders.sort().to_owned(),
-        k: position(),
+        k: Some(position()),
+        n: None,
         r: None,
     };
     let mut json = serde_json::to_value(&valid).unwrap();
@@ -438,4 +439,104 @@ fn a_version_less_line_token_is_bound_to_the_creation_version() {
     )
     .unwrap();
     assert_eq!(bound.line_version(), 4);
+}
+
+fn history(collection: Collection, hash: &str) -> CursorBinding<'_> {
+    CursorBinding {
+        collection,
+        parent: Some(u(5)),
+        subject_id: u(1),
+        subject_tenant_id: u(10),
+        filters_hash: hash,
+    }
+}
+
+/// S4-06 (D-254): the history collections continue after a committed version number, bound to
+/// collection, parent, principal and the empty filters like every other token; a number token
+/// is never a timestamp token and the reverse.
+#[test]
+fn history_cursors_carry_the_version_number_and_keep_the_binding() {
+    let hash = no_filters_hash();
+    assert_eq!(Collection::Versions.operation(), "list_versions");
+    assert_eq!(Collection::Acceptances.operation(), "get_acceptance");
+    for collection in [Collection::Versions, Collection::Acceptances] {
+        let token = encode_number_cursor(history(collection, &hash), 4).unwrap();
+        assert_eq!(
+            decode_number_cursor(&token, history(collection, &hash)).unwrap(),
+            4
+        );
+        // Bound to the parent, the principal and the collection.
+        let other_parent = CursorBinding {
+            parent: Some(u(6)),
+            ..history(collection, &hash)
+        };
+        let other_subject = CursorBinding {
+            subject_id: u(2),
+            ..history(collection, &hash)
+        };
+        for binding in [other_parent, other_subject] {
+            assert_eq!(
+                decode_number_cursor(&token, binding),
+                Err(ReadRuleError::CursorInvalid)
+            );
+        }
+        // A number token is not a timestamp token.
+        assert_eq!(
+            decode_cursor(&token, history(collection, &hash)),
+            Err(ReadRuleError::CursorInvalid)
+        );
+    }
+    let versions = encode_number_cursor(history(Collection::Versions, &hash), 4).unwrap();
+    assert_eq!(
+        decode_number_cursor(&versions, history(Collection::Acceptances, &hash)),
+        Err(ReadRuleError::CursorInvalid)
+    );
+    // A timestamp collection refuses a number token; a number collection a timestamp token.
+    assert_eq!(
+        encode_number_cursor(history(Collection::Lines, &hash), 4),
+        Err(ReadRuleError::CursorInvalid)
+    );
+    let lines = encode_cursor(history(Collection::Lines, &hash), position()).unwrap();
+    assert_eq!(
+        decode_number_cursor(&lines, history(Collection::Lines, &hash)),
+        Err(ReadRuleError::CursorInvalid)
+    );
+    assert_eq!(
+        encode_cursor(history(Collection::Versions, &hash), position()),
+        Err(ReadRuleError::CursorInvalid)
+    );
+    // A non-positive number is structurally invalid on both sides.
+    assert_eq!(
+        encode_number_cursor(history(Collection::Versions, &hash), 0),
+        Err(ReadRuleError::CursorInvalid)
+    );
+    let forged = |json: &str| Cursor::try_from(URL_SAFE_NO_PAD.encode(json)).unwrap();
+    let base = format!(
+        r#""c":"versions","p":"{}","s":"{}","t":"{}","f":"{hash}","o":"version""#,
+        u(5),
+        u(1),
+        u(10)
+    );
+    for bad in [
+        format!(r#"{{"v":1,{base},"n":0}}"#),
+        format!(r#"{{"v":1,{base},"n":-3}}"#),
+        format!(r#"{{"v":1,{base}}}"#),
+        format!(
+            r#"{{"v":1,{base},"n":2,"k":{{"at_micros":1,"id":"{}"}}}}"#,
+            u(1)
+        ),
+    ] {
+        assert_eq!(
+            decode_number_cursor(&forged(&bad), history(Collection::Versions, &hash)),
+            Err(ReadRuleError::CursorInvalid),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        decode_number_cursor(
+            &forged(&format!(r#"{{"v":1,{base},"n":2}}"#)),
+            history(Collection::Versions, &hash)
+        ),
+        Ok(2)
+    );
 }
