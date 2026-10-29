@@ -283,6 +283,8 @@ mod platform;
 mod policy;
 mod reads;
 #[cfg(feature = "gate-dev-stubs")]
+mod stage4;
+#[cfg(feature = "gate-dev-stubs")]
 mod submit;
 mod throttling;
 

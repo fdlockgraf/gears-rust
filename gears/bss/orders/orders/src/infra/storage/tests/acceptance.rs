@@ -52,9 +52,9 @@ use toolkit_security::SecurityContext;
 
 const ACCEPTANCE_RT: &str = "gts.cf.bss.orders.acceptance.v1~";
 /// The resource tenant's customer: may read and record consent, never authored the order.
-const CUSTOMER: (u128, u128) = (110, 10);
+pub(super) const CUSTOMER: (u128, u128) = (110, 10);
 /// A partner of another tenant placing orders for the resource tenant.
-const PARTNER: (u128, u128) = (111, 11);
+pub(super) const PARTNER: (u128, u128) = (111, 11);
 /// A resource-tenant member with `order × read` only: no `acceptance × record` grant.
 const MEMBER: (u128, u128) = (112, 10);
 /// A seller operator: reads the seller's orders, never records the customer's consent.
@@ -106,7 +106,7 @@ pub(super) struct World {
     pub(super) f: Fixture,
     pub(super) stubs: StubFixture,
     pub(super) engine: Arc<Engine>,
-    capture: CaptureService,
+    pub(super) capture: CaptureService,
     pub(super) submit: Arc<SubmitService>,
     pub(super) reads: ReadService,
 }

@@ -285,7 +285,7 @@ pub(super) struct Scripted {
     calls: Mutex<Vec<(String, Uuid)>>,
     pub(super) refuse: Mutex<BTreeMap<Uuid, CommercialReason>>,
     pub(super) lose_replies: AtomicUsize,
-    lapsed: AtomicBool,
+    pub(super) lapsed: AtomicBool,
     /// Run on every call with the running call count, outside every lock of the double.
     pub(super) on_call: Mutex<Option<OnCall>>,
 }
@@ -376,7 +376,10 @@ pub(super) struct Fixture {
 // Multi-line commercial scenarios intentionally admit both lines on the fixture's shared SKU.
 // Cardinality refusal itself remains covered by the dedicated gate/overlap tests.
 pub(super) fn two_line_fixture() -> StubFixture {
-    let mut f = fixture();
+    admit_two(fixture())
+}
+/// `f` with its occupancy limit raised to two, so two lines on the fixture's one SKU are admitted.
+pub(super) fn admit_two(mut f: StubFixture) -> StubFixture {
     for occupancy in f.occupancy.values_mut() {
         let crate::domain::gate::answers::OccupancyObservation::LegacyActiveV1(occupancy) =
             occupancy

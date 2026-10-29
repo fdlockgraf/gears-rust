@@ -140,7 +140,7 @@ async fn version_rows(f: &Fixture, order: Uuid, version: i64) -> Value {
 }
 
 /// Live claims of `order` (the claim set N holds).
-async fn live_claims(f: &Fixture, order: Uuid) -> Value {
+pub(super) async fn live_claims(f: &Fixture, order: Uuid) -> Value {
     f.t.json(&format!(
         "SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY claim_id), '[]') AS j \
          FROM bss_orders__inflight_overlap_claim c WHERE order_id='{order}' AND released_at IS NULL"
@@ -167,7 +167,7 @@ fn workflow() -> Caller {
 
 /// A Workflow approval reflection of `order` at `version` (row 7, 8 or 9) with the row's guards
 /// bound passing (the S5-03 owner's predicates are not this package's).
-async fn reflect(
+pub(super) async fn reflect(
     f: &Fixture,
     order: Uuid,
     row: u8,

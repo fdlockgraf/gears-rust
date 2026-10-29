@@ -62,7 +62,7 @@ impl Preparation for DeadlineDouble<'_> {
 
 /// A resolver reading the contract's `acceptance_required` as `stated` (the development contract
 /// stub), with the world's policy store or, for an outage, none.
-fn resolver(w: &World, stated: Option<bool>, store: bool) -> RequirementResolver {
+pub(super) fn resolver(w: &World, stated: Option<bool>, store: bool) -> RequirementResolver {
     resolver_over(
         w,
         Arc::new(ContractsStub::new(Arc::new(contract_fixture(stated)))),
@@ -91,7 +91,7 @@ fn workflow_engine(w: &World, order: Uuid) -> Engine {
 }
 
 /// Row 11 by the Workflow service, with `outcome` as the request body.
-async fn begin(
+pub(super) async fn begin(
     w: &World,
     resolver: &RequirementResolver,
     order: Uuid,
