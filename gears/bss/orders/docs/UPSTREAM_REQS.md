@@ -567,6 +567,41 @@ separately from TCV (Workflow D-199). The worktree's `admission-control` gear is
 admission, not this capability; Seam Atlas N4/D05 use the word admission for both, and its
 `AdmissionReadV1` is not consumed by this gear (D-175).
 
+**Refresh (2026-10-29, Stage 4 S4-09/S4-11).** There is no Payments gear, no design PR and no
+assigned owner, so this block is the requirement a future Payments specification must meet. Workflow
+presents the outcome; Lifecycle has no payment port (D-175, D-256). Nothing here is delivered or
+evidenced by a development double.
+
+1. **Idempotent authorize and read-by-request.** `authorize` is idempotent on `request_ref`: a
+   repeat with the same binding returns the original outcome and never submits a second charge. A
+   read `get(request_ref)` returns the current outcome without side effects, so a lost reply
+   (including after the provider committed) is recovered by reading, not by re-authorizing.
+2. **`request_ref` binding.** The request is bound to the Workflow intent key, the order id, the
+   order version, the payer tenant and the currency. A repeat naming any different bound value is
+   refused as a conflict (item 5), never silently accepted or re-bound.
+3. **Authoritative amount.** The amount to authorize carries its provenance (the source and
+   revision that produced it) and is never the order's TCV or any total Orders computed for
+   display. Where the offer is postpaid there is **no amount**: the request states an explicit
+   `postpaid` policy and Payments answers per its own rule. An amount without provenance is refused.
+4. **States.** `authorized`, `pending`, `failed { reason }` and **`unknown`** (the provider outcome
+   is not known: transport lost, provider timeout or unreconciled). `unknown` is neither `failed`
+   nor `pending`; it is never forwarded as a decline and the same request is read again until it
+   resolves into one of the other three or the caller escalates.
+5. **Conflict and replacement.** A request for an order version whose earlier request is not
+   conclusive is not issued as a new request: the earlier one is read first. A replacement
+   authorization is a new `request_ref` and is permitted only after the earlier request is
+   conclusively `failed` or explicitly cancelled by Payments; the earlier request is then closed
+   and never later reported `authorized` for the same binding. A different amendment version is a
+   different binding.
+6. **Grants.** Authorize and read are separate permissions held by the Workflow service principal
+   only; a read must not disclose instrument or account detail beyond the outcome, the reason class
+   and the bound identifiers. Orders and Lifecycle hold no grant on this capability.
+7. **Audit.** Every authorize, read that changes the observed outcome, replacement and closure
+   is recorded with `request_ref`, the bound order/version, the requesting principal and the
+   outcome, and is retrievable by `request_ref`.
+8. **Owner.** Unassigned. Until a Payments capability exists with this contract, the begin-fulfillment
+   payment guard has no real provider, and the S4-09/S4-11 gates stay open.
+
 ### 2.6 Orders Workflow
 
 **Recheck and progress integration (OL-29/30/59).** Reuse Workflow PRD §6.1's owning-SDK
@@ -951,6 +986,22 @@ the shared follow-up above, not to a new Orders-built mechanism. See
 values are a keyed `hmac-sha256:v1:<key_id>:<hex>` under required Orders configuration, replacing
 the S2-06 unkeyed digest. Privacy/Legal still owns whether a keyed pseudonym of that content may
 be retained and for how long; the minimizer is one replaceable function if that answer changes it.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-acceptance-surface`
+
+**Q-30 acceptance surface for partner-placed orders (open; refreshed 2026-10-29).** Orders bars
+the placing and selling parties from recording acceptance on a partner-placed order
+([05 §4.2](features/05-preconditions.md#contract-05-4-2)), so only a principal of the order's
+`resourceTenantId` can record it. **Open question for the platform and identity owners: who
+presents the acceptance action to that resource-tenant principal, and how does the principal get a
+credential when the end customer has none at the point of sale?** Orders owns neither the surface
+nor the onboarding. Nothing in this repository provides one. Orders offers **no operator workaround**:
+no delegated, operator-attested or elevated recording route exists, deliberately (D-31). Until an
+owner answers, partner-placed scope is **not releasable**: such an order rests in `approved` until
+its TTL expires it, unless the seller's scope is promoted with the election
+`acceptance_required: false` (D-133), which is an explicit commercial decision about evidence and
+not a fallback. The authz-pdp design PR raises the same question. Tracked as Q-30 in
+[`DECISIONS.md`](./DECISIONS.md); Stage 4 readiness register (DESIGN, D-257).
 
 ### 2.9 Platform authorization policy
 

@@ -228,6 +228,8 @@ election read answers `unavailable` and commits nothing. The row and the `OrderS
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-acceptance`
 
+> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+
 The system **MUST** implement both acceptance flows, current-version uniqueness, stored-actor checks and authorized history without inferred consent.
 
 **Implements**: `cpt-cf-bss-orders-flow-preconditions-submit-acceptance`, `cpt-cf-bss-orders-flow-preconditions-record-acceptance`, `cpt-cf-bss-orders-algo-preconditions-requirement`, `cpt-cf-bss-orders-algo-preconditions-record`.
@@ -238,6 +240,8 @@ The system **MUST** implement both acceptance flows, current-version uniqueness,
 ### 5.2 Policy and money-guard implementation
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-money-gate`
+
+> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** implement policy precedence, safe unset values and fail-closed outages, with the risk flag written only by admitted begin-fulfillment. Deliver policy rows through deployment promotion requested via platform operations; no runtime write endpoint or new PDP action exists. Enforce platform-key uniqueness with `NULLS NOT DISTINCT` and the scope/nullability rules in the design. Instrument authorization outcomes separately, tolerated admissions, acceptance latency and recording-party/unevaluable refusals with the design's alerts.
 

@@ -2,6 +2,9 @@
 
 The S2 foundation milestone is delivered (S2-01–S2-12 plus the early S6-01/S6-04 draft reads): **authorized draft capture and draft inspection** run through the real engine, PEP, sealed audit, idempotency registry and the bound Event Broker producer on PostgreSQL. Preview, submit, amendments, holds, cancel and the Workflow seams are registered contracts whose routes are not mounted and whose SDK methods answer `unavailable` until their packages deliver them. The optional example-server feature is `bss-orders` (it links Event Broker, the standalone cluster plugin and the SQLite event-log backend); it is absent from the server's default features.
 
+**Stage 4 status (2026-10-29): locally complete with development doubles; open pending real providers.** Amend, record-acceptance, history reads, administrative edits and the begin-fulfillment guard run locally against doubles; the four Stage 4 DoDs stay unchecked. Open limits: Q-28 cross-seller transfer, Q-30 acceptance onboarding for partner-placed orders, the Payments owner (none assigned), and durable execution for pending-payment continuation (Workflow Q-10). See the readiness register in [DESIGN.md](docs/DESIGN.md) ("Stage 4 readiness register", D-199, extended by D-257).
+
+
 | Package | Library | Purpose |
 |---|---|---|
 | `cf-gears-bss-orders-sdk` | `bss_orders_sdk` | Shared typed boundary, reason/state/trigger/event identities and planned operation catalog |

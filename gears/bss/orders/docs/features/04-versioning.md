@@ -175,6 +175,8 @@ All amendment rows increment `amendment_count`; no transition resets it. Once M 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-versioning-amendment`
 
+> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+
 The system **MUST** implement §2.1 and §3.1 through the shared engine, retaining its refusal, transaction and replay guarantees.
 
 **Implements**: `cpt-cf-bss-orders-flow-versioning-amend`, `cpt-cf-bss-orders-algo-versioning-append`.
@@ -184,6 +186,8 @@ The system **MUST** implement §2.1 and §3.1 through the shared engine, retaini
 ### 5.2 Administrative and history implementation
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-dod-versioning-history`
+
+> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** preserve the immutable chain, separately audit mutable administrative corrections and supply authorized historical reads. Instrument amendment depth, gate outcomes, stale workflow results and administrative changes; alert on stale-result rate and amended orders dwelling in `submitted` beyond Workflow's reflection lead time.
 
