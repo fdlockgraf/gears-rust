@@ -46,6 +46,11 @@ pub enum InputPort {
     ContractResolution,
     /// Live acceptance requirement (05 §3.3 step 1, *Record Acceptance* step 2).
     AcceptanceRequirement,
+    /// The seller/platform tolerate-failure election of a `failed` authorization (05 §3.3
+    /// `inst-bg-resolve-requirement`, D-256 item 4). Its unavailability is the same
+    /// `acceptance-requirement-unevaluable` as the requirement's: 05 §3.3 step 1 resolves both
+    /// policies before the transaction and routes either outage through the engine.
+    AuthorizationTolerance,
 }
 impl InputPort {
     /// Registered reasons an unresolvable value of this input may carry.
@@ -60,7 +65,9 @@ impl InputPort {
             Self::Occupancy => &[Reason::OverlapPresenceUnevaluable],
             Self::Evaluation => &[Reason::EvaluationUnavailable],
             Self::ContractResolution => &[Reason::ContractResolutionUnavailable],
-            Self::AcceptanceRequirement => &[Reason::AcceptanceRequirementUnevaluable],
+            Self::AcceptanceRequirement | Self::AuthorizationTolerance => {
+                &[Reason::AcceptanceRequirementUnevaluable]
+            }
         }
     }
 }
@@ -323,7 +330,7 @@ pub const GUARDS: &[GuardDecl] = &[
         owner: "S4-10",
         rows: &[11],
         reasons: &["authorization-pending", "authorization-failed"],
-        inputs: &[],
+        inputs: &[P::AuthorizationTolerance],
     },
     GuardDecl {
         name: "gate.binding-deadline",
@@ -684,7 +691,7 @@ impl GuardRegistry {
 }
 
 /// Every input port.
-pub const ALL_PORTS: [InputPort; 9] = [
+pub const ALL_PORTS: [InputPort; 10] = [
     InputPort::Identity,
     InputPort::PricingRevision,
     InputPort::CatalogPredicates,
@@ -694,6 +701,7 @@ pub const ALL_PORTS: [InputPort; 9] = [
     InputPort::Evaluation,
     InputPort::ContractResolution,
     InputPort::AcceptanceRequirement,
+    InputPort::AuthorizationTolerance,
 ];
 
 fn reason_index(reason: Reason) -> usize {

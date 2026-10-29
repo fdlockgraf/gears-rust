@@ -183,9 +183,26 @@ fn engine_reasons_have_only_the_documented_gate_exception_and_inputs_are_declare
     assert!(r.row_inputs(RowId::of(1)).is_empty());
     assert!(r.row_inputs(RowId::of(2)).is_empty());
     assert_eq!(r.row_inputs(RowId::of(4)).len(), 8);
+    // Row 11 (D-256 item 4): the requirement on the consent guard, the tolerance election on
+    // the payment guard; both unavailable inputs carry `acceptance-requirement-unevaluable`.
     assert_eq!(
         r.row_inputs(RowId::of(11)),
-        [InputPort::AcceptanceRequirement].into_iter().collect()
+        [
+            InputPort::AcceptanceRequirement,
+            InputPort::AuthorizationTolerance
+        ]
+        .into_iter()
+        .collect()
+    );
+    let payment = r
+        .row_guards(RowId::of(11))
+        .iter()
+        .find(|g| g.name == "preconditions.payment-authorization")
+        .unwrap();
+    assert_eq!(payment.inputs, [InputPort::AuthorizationTolerance]);
+    assert_eq!(
+        InputPort::AuthorizationTolerance.unevaluable_reasons(),
+        InputPort::AcceptanceRequirement.unevaluable_reasons()
     );
     // M3C Q-A: only the composite gate also owns order-in-flight-for-key.
     // The engine still owns the authoritative claim collision.

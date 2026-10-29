@@ -9,14 +9,15 @@
 //! Two doubles, each labelled where it is used: S5-04's `gate.binding-deadline` is bound to pass
 //! ([`DeadlineDouble`]), and Workflow's approval reflection (row 8, S5-03) is owner SQL
 //! ([`approve`]), as `engine.rs` `seed` does.
-use super::acceptance::{World, customer, meta, partner, policy, record, world};
+use super::acceptance::{Before, Hooked, World, customer, meta, partner, policy, record, world};
 use super::capture::key;
-use super::submit::{ORDER_RT, SELLER, WORKFLOW, contract_fixture, elect, submit_with};
+use super::submit::{ORDER_RT, RESOURCE, SELLER, WORKFLOW, contract_fixture, elect, submit_with};
 use super::*;
 use crate::authz::Caller;
 use crate::authz::test_pdp::{RulesProvider, service, user};
+use crate::domain::preconditions::{Requirement, RequirementSource as Source};
 use crate::domain::transition::{GuardSubject, GuardVerdict};
-use crate::infra::acceptance::RequirementResolver;
+use crate::infra::acceptance::{RequirementResolver, RequirementSubject};
 use crate::infra::amend::AmendService;
 use crate::infra::capture::SettledOutcome;
 use crate::infra::engine::{
@@ -24,6 +25,7 @@ use crate::infra::engine::{
     Prepared, TransitionRequest,
 };
 use crate::infra::fulfillment::BeginFulfillmentPreparation;
+use crate::infra::gate::budget::RunBudget;
 use crate::infra::gate::ports::ContractReads;
 use crate::infra::gate::stubs::ContractsStub;
 use crate::infra::gate::tests::orchestrate::CONTRACT;
@@ -36,6 +38,7 @@ use bss_orders_sdk::models::OrderVersion;
 use bss_orders_sdk::reads::RequirementSource;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
 
 fn workflow() -> Caller {
@@ -60,8 +63,15 @@ impl Preparation for DeadlineDouble<'_> {
 /// A resolver reading the contract's `acceptance_required` as `stated` (the development contract
 /// stub), with the world's policy store or, for an outage, none.
 fn resolver(w: &World, stated: Option<bool>, store: bool) -> RequirementResolver {
-    let contracts: Arc<dyn ContractReads> =
-        Arc::new(ContractsStub::new(Arc::new(contract_fixture(stated))));
+    resolver_over(
+        w,
+        Arc::new(ContractsStub::new(Arc::new(contract_fixture(stated)))),
+        store,
+    )
+}
+
+/// A resolver over `contracts`, with the world's policy store or, for an outage, none.
+fn resolver_over(w: &World, contracts: Arc<dyn ContractReads>, store: bool) -> RequirementResolver {
     RequirementResolver::new(contracts, store.then(|| w.f.t.env.db.clone()))
 }
 
@@ -130,11 +140,15 @@ async fn approve(w: &World, order: Uuid) {
         .unwrap();
 }
 
-/// Set the `tolerate_authorization_failure` election of `seller` (`None` = platform) to
-/// `elected`, as the policy channel's promotion would (D-250): update the row, or insert it.
-/// Election rows are never deleted (the evidence trigger refuses it), so a cell that needs no
-/// row runs before any row of that scope is stored.
+/// Set the `tolerate_authorization_failure` election of `seller` (`None` = platform).
 async fn tolerate(w: &World, seller: Option<Uuid>, elected: bool) {
+    upsert(w, "tolerate_authorization_failure", seller, elected).await;
+}
+
+/// Set `election` of `seller` (`None` = platform) to `elected`, as the policy channel's promotion
+/// would (D-250): update the row, or insert it. Election rows are never deleted (the evidence
+/// trigger refuses it), so a cell that needs no row runs before any row of that scope is stored.
+async fn upsert(w: &World, election: &str, seller: Option<Uuid>, elected: bool) {
     let (scope, scope_id) = match seller {
         Some(id) => ("seller", format!("'{id}'")),
         None => ("platform", "NULL".to_owned()),
@@ -144,7 +158,7 @@ async fn tolerate(w: &World, seller: Option<Uuid>, elected: bool) {
         .pg
         .sql(&format!(
             "INSERT INTO bss_orders__policy_election VALUES('{}',\
-             'tolerate_authorization_failure','{scope}',{scope_id},{elected},'test',\
+             '{election}','{scope}',{scope_id},{elected},'test',\
              clock_timestamp()) ON CONFLICT (election, scope, scope_id) \
              DO UPDATE SET elected=EXCLUDED.elected, elected_at=EXCLUDED.elected_at",
             Uuid::new_v4()
@@ -154,14 +168,19 @@ async fn tolerate(w: &World, seller: Option<Uuid>, elected: bool) {
 }
 
 /// Everything a refusal must leave alone: state, version, dwell clock, the tolerance flag, the
-/// fulfillment generation, version rows, overlap claims, grants and consent rows.
+/// fulfillment generation, version rows, the order's *active* overlap claims, grants and consent
+/// rows. The claim term is meaningful only for an order that still holds its claim
+/// ([`approved_holding`]); the matrix releases every claim (each order of a world claims the same
+/// tuple), so there it is `0` before and after and checks nothing — the refusal tests that keep
+/// the claim are where a claim change would show.
 async fn footprint(w: &World, order: Uuid) -> Value {
     w.f.t
         .json(&format!(
             "SELECT jsonb_build_array(o.state, o.current_version, o.state_entered_at, \
              o.authorization_failure_tolerated_at, o.fulfillment_control_generation, \
              (SELECT count(*) FROM bss_orders__order_version v WHERE v.order_id=o.order_id), \
-             (SELECT count(*) FROM bss_orders__inflight_overlap_claim c WHERE c.order_id=o.order_id), \
+             (SELECT count(*) FROM bss_orders__inflight_overlap_claim c WHERE c.order_id=o.order_id \
+             AND c.released_at IS NULL), \
              (SELECT count(*) FROM bss_orders__fulfillment_grant g WHERE g.order_id=o.order_id), \
              (SELECT count(*) FROM bss_orders__acceptance a WHERE a.order_id=o.order_id)) \
              AS j FROM bss_orders__order o WHERE order_id='{order}'"
@@ -193,10 +212,17 @@ async fn committed_at(w: &World, order: Uuid, trigger: &str) -> Value {
 /// on N when `consent` (the world's contract requires it, source `contract`). Its overlap claim
 /// is released so the next order of the world can submit.
 async fn approved(w: &World, tag: &str, consent: bool) -> (Uuid, i64) {
+    let (order, n) = approved_holding(w, tag, consent).await;
+    w.release(order).await;
+    (order, n)
+}
+
+/// As [`approved`], but the order keeps its active overlap claim: the caller releases it
+/// before the world's next order submits.
+async fn approved_holding(w: &World, tag: &str, consent: bool) -> (Uuid, i64) {
     let (order, n) = w
         .submitted(&partner(), &partner(), Some(CONTRACT), tag)
         .await;
-    w.release(order).await;
     if consent {
         let settled = record(
             &w.recorder(),
@@ -263,9 +289,12 @@ impl Tolerance {
 /// What one matrix cell must answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expect {
-    Admitted { tolerated: bool },
+    Admitted {
+        tolerated: bool,
+    },
     Refused(Reason),
-    Unavailable,
+    /// The settled 503 `acceptance-requirement-unevaluable` of an unreadable tolerance election.
+    Unevaluable,
 }
 
 /// The consent column of the matrix.
@@ -287,16 +316,15 @@ fn payment(outcome: Authorization, tolerance: Tolerance) -> Expect {
         (Authorization::Failed, Tolerance::SellerTrue | Tolerance::PlatformTrue) => {
             Expect::Admitted { tolerated: true }
         }
-        (Authorization::Failed, Tolerance::Outage) => Expect::Unavailable,
+        (Authorization::Failed, Tolerance::Outage) => Expect::Unevaluable,
         (Authorization::Failed, _) => Expect::Refused(Reason::AuthorizationFailed),
     }
 }
 
 fn expected(consent: Consent, outcome: Authorization, tolerance: Tolerance) -> Expect {
     match (consent, outcome, tolerance) {
-        // A tolerance outage is a pre-transaction `unavailable` (nothing is settled), so it
-        // answers before the lock-time consent guard is reached (D-256 item 4).
-        (Consent::RequiredMissing, Authorization::Failed, Tolerance::Outage) => Expect::Unavailable,
+        // A tolerance outage is the payment guard's unresolvable input, so the consent guard,
+        // registered first, answers before it (D-113, D-256 item 4).
         (Consent::RequiredMissing, ..) => Expect::Refused(Reason::AcceptanceRequiredNotRecorded),
         _ => payment(outcome, tolerance),
     }
@@ -308,10 +336,11 @@ fn expected(consent: Consent, outcome: Authorization, tolerance: Tolerance) -> E
 /// before any payment branch; `authorized` admits; `pending` refuses `authorization-pending`;
 /// `failed` admits only on a `true` election (seller first, then platform; unset is `false`),
 /// writing `authorization_failure_tolerated_at` at the committed audit entry's instant, and
-/// refuses `authorization-failed` otherwise. An outage is `unavailable`, never "not tolerated"
-/// and never "tolerated"; authorized and pending never read the election, so the outage cannot
-/// touch them. Every refusal leaves the order `approved` with no claim, grant, version, consent
-/// or event change, and is audited; `unavailable` settles nothing.
+/// refuses `authorization-failed` otherwise. An outage is the payment guard's unresolvable input:
+/// the settled, audited 503 `acceptance-requirement-unevaluable` after the consent guard, never
+/// "not tolerated" and never "tolerated"; authorized and pending never read the election, so the
+/// outage cannot touch them. Every refusal leaves the order `approved` with no grant, version,
+/// consent or event change, and is audited.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_consent_and_payment_matrix() {
@@ -381,30 +410,26 @@ async fn the_consent_and_payment_matrix() {
                 assert_eq!(w.f.t.outbox().await, outbox, "{cell}");
                 assert_eq!(w.f.t.audits(order).await, audits + 1, "{cell}: audited");
             }
-            Expect::Unavailable => {
-                assert_eq!(answer.unwrap_err(), EngineError::Unavailable, "{cell}");
+            Expect::Unevaluable => {
+                let out = answer.unwrap();
+                assert!(
+                    matches!(
+                        out.kind,
+                        OutcomeKind::Refused {
+                            reason: Reason::AcceptanceRequirementUnevaluable,
+                            ..
+                        }
+                    ),
+                    "{cell}: {out:?}"
+                );
+                assert_eq!(out.response.status(), 503, "{cell}");
                 assert_eq!(
                     footprint(&w, order).await,
                     before,
                     "{cell}: nothing changes"
                 );
                 assert_eq!(w.f.t.outbox().await, outbox, "{cell}");
-                assert_eq!(w.f.t.audits(order).await, audits, "{cell}: nothing settles");
-                // The same key is retryable once the store answers (no election row: `false`),
-                // and the lock-time consent guard then answers first.
-                let healthy = resolver(&w, Some(required), true);
-                let retry = begin(&w, &healthy, order, n, outcome, &format!("{tag}-begin"))
-                    .await
-                    .unwrap();
-                let reason = if consent == Consent::RequiredMissing {
-                    Reason::AcceptanceRequiredNotRecorded
-                } else {
-                    Reason::AuthorizationFailed
-                };
-                assert!(
-                    matches!(retry.kind, OutcomeKind::Refused { reason: r, .. } if r == reason),
-                    "{cell}: {retry:?}"
-                );
+                assert_eq!(w.f.t.audits(order).await, audits + 1, "{cell}: audited");
             }
         }
     }
@@ -412,8 +437,7 @@ async fn the_consent_and_payment_matrix() {
 
 /// An unavailable requirement is the unresolvable input `acceptance-requirement-unevaluable`
 /// (503, settled), for the contract port and for the policy store, and the tolerance election
-/// is never read: a failed outcome with no store would otherwise answer unsettled
-/// `unavailable`. The order stays `approved` and the same attempt admits once the input
+/// is never read. The order stays `approved` and the same attempt admits once the input
 /// resolves.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -633,4 +657,307 @@ async fn the_tolerance_flag_is_written_once_and_never_cleared() {
         json!(["on_hold", at]),
         "never cleared"
     );
+}
+
+/// The last audit entry of `order`'s begin-fulfillment attempts: `[outcome, reason, to_state]`.
+async fn last_begin(w: &World, order: Uuid) -> Value {
+    w.f.t
+        .json(&format!(
+            "SELECT jsonb_build_array(outcome, reason, to_state) AS j \
+             FROM bss_orders__transition_audit WHERE order_id='{order}' \
+             AND trigger='begin-fulfillment' ORDER BY sequence DESC LIMIT 1"
+        ))
+        .await
+}
+
+/// D-256 item 4 (05 §3.3 `inst-bg-resolve-requirement`): the tolerance election of a `failed`
+/// outcome is resolved before the transaction, and its outage reaches the engine as the payment
+/// guard's unresolvable input. Consent required and missing is therefore refused
+/// `acceptance-required-not-recorded` first; with consent in place the outage is the settled,
+/// audited 503 `acceptance-requirement-unevaluable` with no state change. `authorized` and
+/// `pending` never read the election, so the outage leaves them unaffected. Each order keeps its
+/// overlap claim while it is refused, so the footprint's claim term is live here.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_tolerance_outage_is_unevaluable_after_the_consent_guard() {
+    let w = world(contract_fixture(Some(true))).await;
+    // No policy store: any election read fails. The contract is stated, so the requirement
+    // itself never reads an election.
+    let down = resolver(&w, Some(true), false);
+
+    // (a) Consent required and missing: the consent guard answers first.
+    let (missing, n) = approved_holding(&w, "bf-tol-a", false).await;
+    let before = footprint(&w, missing).await;
+    let audits = w.f.t.audits(missing).await;
+    let out = begin(&w, &down, missing, n, Authorization::Failed, "bf-tol-a-1")
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out.kind,
+            OutcomeKind::Refused {
+                reason: Reason::AcceptanceRequiredNotRecorded,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(out.response.status(), 400);
+    assert_eq!(footprint(&w, missing).await, before);
+    assert_eq!(w.f.t.audits(missing).await, audits + 1);
+    w.release(missing).await;
+
+    // (b) Consent in place: the settled, audited 503.
+    let (fine, n) = approved_holding(&w, "bf-tol-b", true).await;
+    let before = footprint(&w, fine).await;
+    let (outbox, audits) = (w.f.t.outbox().await, w.f.t.audits(fine).await);
+    let out = begin(&w, &down, fine, n, Authorization::Failed, "bf-tol-b-1")
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out.kind,
+            OutcomeKind::Refused {
+                reason: Reason::AcceptanceRequirementUnevaluable,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(out.response.status(), 503);
+    assert_eq!(
+        footprint(&w, fine).await,
+        before,
+        "no state or claim change"
+    );
+    assert_eq!(w.f.t.outbox().await, outbox);
+    assert_eq!(w.f.t.audits(fine).await, audits + 1, "audited");
+    assert_eq!(
+        last_begin(&w, fine).await,
+        json!(["refused", "acceptance-requirement-unevaluable", "approved"])
+    );
+
+    // (c) Authorized and pending never read the election.
+    let out = begin(&w, &down, fine, n, Authorization::Pending, "bf-tol-b-2")
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out.kind,
+            OutcomeKind::Refused {
+                reason: Reason::AuthorizationPending,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    let out = begin(&w, &down, fine, n, Authorization::Authorized, "bf-tol-b-3")
+        .await
+        .unwrap();
+    assert!(matches!(out.kind, OutcomeKind::Committed { .. }), "{out:?}");
+}
+
+/// The requirement-source axis of row 11 on orders that reference no contract, so the
+/// elections decide: the unset default (required, `platform_default`), an election-read failure
+/// (the settled 503 `acceptance-requirement-unevaluable`, whatever the consent), the platform's
+/// election, the seller's `false` over the platform's `true` (not required) and the seller's
+/// `true`; each with consent missing and present. The outcome is `authorized`, so only the
+/// consent guard decides. Cells run in election-row order (rows are never deleted).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_requirement_source_axis() {
+    #[derive(Debug, Clone, Copy)]
+    enum Axis {
+        Unset,
+        ReadFailure,
+        Platform,
+        SellerFalse,
+        Seller,
+    }
+    let w = world(contract_fixture(Some(true))).await;
+    for (i, source) in [
+        Axis::Unset,
+        Axis::ReadFailure,
+        Axis::Platform,
+        Axis::SellerFalse,
+        Axis::Seller,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match source {
+            Axis::Unset | Axis::ReadFailure => {}
+            Axis::Platform => upsert(&w, "acceptance_required", None, true).await,
+            Axis::SellerFalse => {
+                upsert(&w, "acceptance_required", Some(u(SELLER)), false).await;
+            }
+            Axis::Seller => upsert(&w, "acceptance_required", Some(u(SELLER)), true).await,
+        }
+        let r = resolver_over(
+            &w,
+            Arc::new(ContractsUnavailable),
+            !matches!(source, Axis::ReadFailure),
+        );
+        let resolved = r
+            .requirement(
+                workflow().ctx(),
+                &RequirementSubject {
+                    contract_id: None,
+                    payer_tenant_id: u(RESOURCE),
+                    seller_tenant_id: u(SELLER),
+                },
+                None,
+                &RunBudget::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        let required = match (source, resolved) {
+            (Axis::Unset, Ok(Requirement::Required(Source::PlatformDefault)))
+            | (Axis::Platform, Ok(Requirement::Required(Source::PlatformDefault)))
+            | (Axis::Seller, Ok(Requirement::Required(Source::Seller))) => Some(true),
+            (Axis::SellerFalse, Ok(Requirement::NotRequired)) => Some(false),
+            (Axis::ReadFailure, Err(PrepareError::Unavailable)) => None,
+            other => panic!("{source:?}: {other:?}"),
+        };
+        for consent in [false, true] {
+            let cell = format!("{source:?}/consent={consent}");
+            let tag = format!("bf-src{i}-{consent}");
+            let (order, n) = w.submitted(&partner(), &partner(), None, &tag).await;
+            if consent {
+                let settled = record(&w.recorder(), &customer(), order, n, &format!("{tag}-c"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    settled.outcome,
+                    SettledOutcome::Committed,
+                    "{cell}: {settled:?}"
+                );
+            }
+            approve(&w, order).await;
+            let before = footprint(&w, order).await;
+            let out = begin(
+                &w,
+                &r,
+                order,
+                n,
+                Authorization::Authorized,
+                &format!("{tag}-b"),
+            )
+            .await
+            .unwrap();
+            match (required, consent) {
+                (None, _) => {
+                    assert!(
+                        matches!(
+                            out.kind,
+                            OutcomeKind::Refused {
+                                reason: Reason::AcceptanceRequirementUnevaluable,
+                                ..
+                            }
+                        ),
+                        "{cell}: {out:?}"
+                    );
+                    assert_eq!(out.response.status(), 503, "{cell}");
+                    assert_eq!(footprint(&w, order).await, before, "{cell}");
+                }
+                (Some(true), false) => {
+                    assert!(
+                        matches!(
+                            out.kind,
+                            OutcomeKind::Refused {
+                                reason: Reason::AcceptanceRequiredNotRecorded,
+                                ..
+                            }
+                        ),
+                        "{cell}: {out:?}"
+                    );
+                    assert_eq!(footprint(&w, order).await, before, "{cell}");
+                }
+                (Some(_), _) => {
+                    assert!(
+                        matches!(out.kind, OutcomeKind::Committed { .. }),
+                        "{cell}: {out:?}"
+                    );
+                }
+            }
+            w.release(order).await;
+        }
+    }
+}
+
+/// A consent committed between begin-fulfillment's preparation and the engine's lock is seen:
+/// the consent guard reads the locked current version (D-256 item 3), not a snapshot. The
+/// customer records through the real record-acceptance service from inside the preparation's
+/// live contract read (the `acceptance.rs` race hook), and begin then admits.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn consent_recorded_after_the_preparation_admits() {
+    let w = Arc::new(world(contract_fixture(Some(true))).await);
+    let (order, n) = approved(&w, "bf-race", false).await;
+    let fired = Arc::new(AtomicBool::new(false));
+    let before: Before = {
+        let (w, fired) = (Arc::clone(&w), Arc::clone(&fired));
+        Arc::new(move || {
+            let (w, fired) = (Arc::clone(&w), Arc::clone(&fired));
+            Box::pin(async move {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let settled = record(&w.recorder(), &customer(), order, n, "bf-race-consent")
+                    .await
+                    .unwrap();
+                assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+            })
+        })
+    };
+    let hooked = Arc::new(Hooked {
+        inner: Arc::new(ContractsStub::new(Arc::new(w.stubs.clone()))),
+        before,
+        calls: AtomicUsize::new(0),
+    });
+    let r = resolver_over(&w, hooked.clone(), true);
+    let out = begin(&w, &r, order, n, Authorization::Authorized, "bf-race-begin")
+        .await
+        .unwrap();
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the consent was recorded inside the preparation"
+    );
+    assert!(matches!(out.kind, OutcomeKind::Committed { .. }), "{out:?}");
+    assert_eq!(flag(&w, order).await, json!(["in_fulfillment", null]));
+}
+
+/// A snapshot outside `approved` cannot be admitted, so the preparation reads nothing external
+/// (as record-acceptance short-circuits): the engine refuses by precedence and the contract port
+/// is never called, nor the tolerance election (no store is bound, and a failed outcome would
+/// otherwise read it).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_snapshot_outside_approved_reads_nothing() {
+    let w = world(contract_fixture(Some(true))).await;
+    let (order, n) = w
+        .submitted(&partner(), &partner(), Some(CONTRACT), "bf-na")
+        .await;
+    let counting = Arc::new(Hooked {
+        inner: Arc::new(ContractsStub::new(Arc::new(w.stubs.clone()))),
+        before: Arc::new(|| Box::pin(async {})),
+        calls: AtomicUsize::new(0),
+    });
+    let r = resolver_over(&w, counting.clone(), false);
+    let before = footprint(&w, order).await;
+    let out = begin(&w, &r, order, n, Authorization::Failed, "bf-na-1")
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out.kind,
+            OutcomeKind::Refused {
+                reason: Reason::NotAdmissible,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 0, "no external call");
+    assert_eq!(footprint(&w, order).await, before);
 }

@@ -104,7 +104,7 @@ pub(super) fn partner() -> Caller {
 /// The fixture's engine, gate, dates, authority and Pricing double under [`policy`].
 pub(super) struct World {
     pub(super) f: Fixture,
-    stubs: StubFixture,
+    pub(super) stubs: StubFixture,
     pub(super) engine: Arc<Engine>,
     capture: CaptureService,
     pub(super) submit: Arc<SubmitService>,
@@ -346,11 +346,11 @@ fn record_of(
 
 /// A contract port that runs `before` ahead of every read (a race between the preparation's
 /// live requirement read and the engine's lock), then answers from `inner`.
-type Before = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-struct Hooked {
-    inner: Arc<dyn ContractReads>,
-    before: Before,
-    calls: AtomicUsize,
+pub(super) type Before = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub(super) struct Hooked {
+    pub(super) inner: Arc<dyn ContractReads>,
+    pub(super) before: Before,
+    pub(super) calls: AtomicUsize,
 }
 #[async_trait]
 impl ContractReads for Hooked {

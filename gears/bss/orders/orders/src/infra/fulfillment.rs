@@ -16,7 +16,7 @@ use crate::infra::acceptance::{RequirementResolver, RequirementSubject};
 use crate::infra::engine::{Preparation, PreparationView, PrepareError, Prepared};
 use crate::infra::gate::budget::RunBudget;
 use async_trait::async_trait;
-use bss_orders_sdk::catalog::Reason;
+use bss_orders_sdk::catalog::{OrderState, Reason};
 use bss_orders_sdk::fulfillment::{Authorization, AuthorizationOutcome};
 use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
@@ -27,13 +27,17 @@ const PAYMENT_AUTHORIZATION: &str = "preconditions.payment-authorization";
 
 /// Row 11's preparation (05 §3.3, D-256). Decision order:
 ///
+/// 0. a snapshot outside `approved` cannot be admitted: nothing external is read and the engine
+///    refuses by precedence (both inputs unresolvable should the guards be reached);
 /// 1. before the transaction, the live consent requirement through the one resolver (the
 ///    referenced contract's `acceptance_required` read live, then the seller and platform
 ///    elections). Unavailable is the unresolvable input `acceptance-requirement-unevaluable`
 ///    (503, settled), never a default; nothing else is read then;
 /// 2. before the transaction, and only for a `failed` outcome, the tolerance election (seller,
-///    then platform, unset `false`). A failed read is `unavailable` (the attempt aborts before
-///    any transaction and settles nothing), never "not tolerated" and never "tolerated";
+///    then platform, unset `false`): the input [`InputPort::AuthorizationTolerance`] of the
+///    payment guard. A failed read makes it unresolvable with `acceptance-requirement-unevaluable`
+///    (05 §3.3 `inst-bg-resolve-requirement`), never "not tolerated" and never "tolerated"; being
+///    the second guard's input, it answers only after the consent guard (D-113);
 /// 3. under the aggregate lock, `preconditions.acceptance-recorded`: required and no consent on
 ///    the locked current version ([`GuardSubject::acceptance_recorded`], read by the engine
 ///    under the lock) refuses `acceptance-required-not-recorded`, before any payment branch. Any
@@ -80,10 +84,42 @@ fn consent_guard(requirement: Requirement) -> impl Fn(&GuardSubject<'_>) -> Guar
     }
 }
 
+/// Both inputs unresolvable and both predicates bound fail-closed (consent as required, payment
+/// as undecided): evaluation stops at the consent guard's input (D-113), so neither predicate is
+/// reached and nothing is admitted on unread facts.
+fn unread() -> Prepared {
+    let unevaluable = InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable);
+    let mut prepared = Prepared::new(AggregateContribution::BeginFulfillment { tolerated: false });
+    prepared.inputs = Inputs::new()
+        .with(InputPort::AcceptanceRequirement, unevaluable)
+        .with(InputPort::AuthorizationTolerance, unevaluable);
+    prepared.guards = GuardBindings::new()
+        .bind(
+            ACCEPTANCE_RECORDED,
+            consent_guard(Requirement::Required(RequirementSource::PlatformDefault)),
+        )
+        .bind(PAYMENT_AUTHORIZATION, undecided);
+    prepared
+}
+
+/// The payment predicate when the tolerance input is unresolvable: never reached (D-113), and
+/// bound as "undecided" so it can never read as failed or tolerated.
+fn undecided(_: &GuardSubject<'_>) -> GuardVerdict {
+    GuardVerdict::Fail(Reason::AuthorizationPending)
+}
+
 #[async_trait]
 impl Preparation for BeginFulfillmentPreparation<'_> {
     async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
         let facts = &view.facts;
+        // 0. Not admissible from this snapshot (row 11 starts only at `approved`): the engine
+        //    refuses by precedence before any guard, so nothing external is read. Should the
+        //    guards be reached after all (the order became `approved` between the snapshot and
+        //    the lock) the inputs are unresolvable, never admitted on unread facts. Mirrors
+        //    record-acceptance (`infra/acceptance.rs` `RecordPreparation` step 1).
+        if facts.state != OrderState::Approved {
+            return Ok(unread());
+        }
         let subject = RequirementSubject {
             contract_id: facts.contract_id,
             payer_tenant_id: facts.payer_tenant_id,
@@ -96,26 +132,7 @@ impl Preparation for BeginFulfillmentPreparation<'_> {
             .await
         {
             Ok(requirement) => requirement,
-            Err(PrepareError::Unavailable) => {
-                // The consent guard's input is unresolvable, so evaluation stops there (D-113)
-                // and neither predicate below is reached; the tolerance is not read. Both are
-                // bound fail-closed: the consent as required, the payment as undecided.
-                let mut prepared =
-                    Prepared::new(AggregateContribution::BeginFulfillment { tolerated: false });
-                prepared.inputs = Inputs::new().with(
-                    InputPort::AcceptanceRequirement,
-                    InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
-                );
-                prepared.guards = GuardBindings::new()
-                    .bind(
-                        ACCEPTANCE_RECORDED,
-                        consent_guard(Requirement::Required(RequirementSource::PlatformDefault)),
-                    )
-                    .bind(PAYMENT_AUTHORIZATION, |_: &GuardSubject<'_>| {
-                        GuardVerdict::Fail(Reason::AuthorizationPending)
-                    });
-                return Ok(prepared);
-            }
+            Err(PrepareError::Unavailable) => return Ok(unread()),
             Err(PrepareError::Integration) => return Err(PrepareError::Integration),
         };
         // 2. The tolerance election, only for a conclusive failure.
@@ -129,25 +146,31 @@ impl Preparation for BeginFulfillmentPreparation<'_> {
             None
         };
         let decision = payment_decision(self.outcome, tolerate);
-        let payment = match decision {
-            PaymentDecision::Admit | PaymentDecision::AdmitTolerated => GuardVerdict::Pass,
-            PaymentDecision::Refuse(reason) => GuardVerdict::Fail(reason),
-            PaymentDecision::Unavailable => {
-                tracing::warn!(
-                    target: "orders.acceptance",
-                    order_id = %view.facts.order_id,
-                    "bss-orders: the authorization-failure tolerance could not be read; \
-                     begin-fulfillment is unavailable"
-                );
-                return Err(PrepareError::Unavailable);
-            }
-        };
-        // 3-4. The guards, under the lock.
         let mut prepared = Prepared::new(AggregateContribution::BeginFulfillment {
             tolerated: decision == PaymentDecision::AdmitTolerated,
         });
-        prepared.inputs =
-            Inputs::new().with(InputPort::AcceptanceRequirement, InputState::Resolved);
+        let (tolerance, payment) = match decision {
+            PaymentDecision::Admit | PaymentDecision::AdmitTolerated => {
+                (InputState::Resolved, GuardVerdict::Pass)
+            }
+            PaymentDecision::Refuse(reason) => (InputState::Resolved, GuardVerdict::Fail(reason)),
+            PaymentDecision::Unavailable => {
+                tracing::warn!(
+                    target: "orders.acceptance",
+                    order_id = %facts.order_id,
+                    "bss-orders: the authorization-failure tolerance could not be read; \
+                     begin-fulfillment is unevaluable after the consent guard"
+                );
+                (
+                    InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
+                    GuardVerdict::Fail(Reason::AuthorizationPending),
+                )
+            }
+        };
+        // 3-4. The guards, under the lock, in registration order: consent, then payment.
+        prepared.inputs = Inputs::new()
+            .with(InputPort::AcceptanceRequirement, InputState::Resolved)
+            .with(InputPort::AuthorizationTolerance, tolerance);
         prepared.guards = GuardBindings::new()
             .bind(ACCEPTANCE_RECORDED, consent_guard(requirement))
             .bind(PAYMENT_AUTHORIZATION, move |_: &GuardSubject<'_>| payment);

@@ -183,8 +183,9 @@ pub enum PaymentDecision {
     AdmitTolerated,
     /// A registered refusal: `authorization-pending` or `authorization-failed`.
     Refuse(Reason),
-    /// `failed` while the tolerance election could not be read: the attempt answers
-    /// `unavailable`, never "not tolerated" and never "tolerated".
+    /// `failed` while the tolerance election could not be read: the payment guard's input
+    /// `AuthorizationTolerance` is unresolvable (`acceptance-requirement-unevaluable`, after the
+    /// consent guard; D-256 item 4), never "not tolerated" and never "tolerated".
     Unavailable,
 }
 

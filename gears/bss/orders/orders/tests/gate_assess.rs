@@ -1892,10 +1892,12 @@ fn assert_local_refusal_outranks_outages(i: &AssessmentInput, expected: Reason, 
 
 /// The eight composite-gate inputs, all `Resolved` (D-234 engine presentation).
 fn assert_every_gate_input_resolved(a: &Assessment, ctx: &str) {
-    for input in ALL_PORTS
-        .into_iter()
-        .filter(|p| *p != InputPort::AcceptanceRequirement)
-    {
+    for input in ALL_PORTS.into_iter().filter(|p| {
+        !matches!(
+            p,
+            InputPort::AcceptanceRequirement | InputPort::AuthorizationTolerance
+        )
+    }) {
         assert_eq!(
             a.inputs.get(input),
             Some(InputState::Resolved),

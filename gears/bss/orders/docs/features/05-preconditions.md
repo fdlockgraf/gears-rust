@@ -173,8 +173,9 @@ operation stays an undelivered Workflow seam until Stage 5, and `gate.binding-de
 S5-04's. The outcome is the SDK `AuthorizationOutcome` (`authorized | pending | failed`, no other
 member), so an unknown outcome never reaches tolerance. The live requirement is resolved before
 the transaction through the one resolver (unavailable: `acceptance-requirement-unevaluable`);
-the tolerance election is read only for `failed`, and an outage is `unavailable`, never a
-default. Whether the current version has a consent is read under the aggregate lock, so consent
+the tolerance election is read only for `failed`, and its outage is the payment guard's
+unresolvable input `acceptance-requirement-unevaluable` (settled 503, after the consent guard),
+never a default. Whether the current version has a consent is read under the aggregate lock, so consent
 on a superseded version never admits; any consent counts, `volunteered` included. The order
 column `authorization_failure_tolerated_at`, set once at the admission's transition time, is the
 tolerance evidence: the committed `begin-fulfillment` audit entry has no member that shows it.

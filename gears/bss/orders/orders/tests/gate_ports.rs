@@ -31,11 +31,17 @@ fn feeds_cover_every_engine_input_port_exactly_as_d227_says() {
     let expected: BTreeSet<InputPort> = ALL_PORTS
         .iter()
         .copied()
-        .filter(|p| *p != InputPort::AcceptanceRequirement)
+        .filter(|p| {
+            !matches!(
+                p,
+                InputPort::AcceptanceRequirement | InputPort::AuthorizationTolerance
+            )
+        })
         .collect();
     assert_eq!(
         fed, expected,
-        "AcceptanceRequirement is 05's port, every other port is fed by the gate"
+        "AcceptanceRequirement and AuthorizationTolerance are 05's ports (D-256 item 4), \
+         every other port is fed by the gate"
     );
     assert_eq!(
         GatePort::Resolve.feeds(),

@@ -1398,10 +1398,15 @@ async fn unresolvable_inputs_settle_unevaluable_but_never_mask_earlier_guards() 
     let order = seed(&t, &probe, "seed-u", S::Approved, None).await;
     let engine = t.engine(&[order]);
     let mut p = prepared(11, order, S::Approved, None);
-    p.inputs = Inputs::new().with(
-        crate::domain::guards::InputPort::AcceptanceRequirement,
-        InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
-    );
+    p.inputs = Inputs::new()
+        .with(
+            crate::domain::guards::InputPort::AcceptanceRequirement,
+            InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
+        )
+        .with(
+            crate::domain::guards::InputPort::AuthorizationTolerance,
+            InputState::Resolved,
+        );
     let out = engine
         .transition(
             &workflow(),
