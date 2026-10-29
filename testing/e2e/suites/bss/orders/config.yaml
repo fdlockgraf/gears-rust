@@ -273,60 +273,61 @@ gears:
       rules:
         # Each buyer authors on resource tenant A; one identical rule per buyer identity. The
         # policy names no payer: which payer an order names is a business rule (D-215). Preview
-        # and submit (M3b) are the PEP's `preview`/`submit` actions under the same constraint.
+        # and submit (M3b) and amendments (S4-03) are the PEP's `preview`/`submit`/`amend`
+        # actions under the same constraint.
         - id: "e2e-buyer-1"
           subject: { id: "11111111-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-2"
           subject: { id: "11111112-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-3"
           subject: { id: "11111113-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-4"
           subject: { id: "11111114-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-5"
           subject: { id: "11111115-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-6"
           subject: { id: "11111116-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-7"
           subject: { id: "11111117-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-8"
           subject: { id: "11111118-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }

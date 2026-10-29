@@ -96,18 +96,21 @@ event-broker:
         partitions: 4
 # Orders producer authorization for the e2e policy AuthZ plugin, merged into the E2E host's
 # `bss-orders-test-authz-plugin` block. Event Broker authorizes the concrete event GTS resource.
-# Grant only the delivered submitted event (no wildcard, no allow-all); later lifecycle events
-# need their own grants when delivered. The separate tenant-scope `request` `produce` rule
-# remains confined to the platform root tenant (D-95). A gear test pins both grants to
+# One prefix grant covers the Orders event family, exactly the producer's declared event-type
+# pattern (`OrderSubmitted`, and `OrderAmended` since S4-03/S4-04), as the suite grants Pricing
+# and Products their families (#5383): the plugin matches a `resource_type` ending in `*` as a
+# prefix. It names only the Orders producer and only `produce`; no allow-all. The separate
+# tenant-scope `request` `produce` rule remains confined to the platform root tenant (D-95). A
+# gear test pins both grants to
 # `events.producer_*`.
 bss-orders-test-authz-plugin:
   config:
     unconditional_grants:
-      - id: "orders-producer-submitted-produce"
+      - id: "orders-producer-event-type-produce"
         subject:
           id: "0e0e0000-0000-4000-8000-000000000005"
           tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
-        resource_type: "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~"
+        resource_type: "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.*"
         action: "produce"
     rules:
       - id: "orders-producer-root-tenant-produce"

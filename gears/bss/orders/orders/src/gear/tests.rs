@@ -276,9 +276,10 @@ fn service_principal_identities_are_required_and_fail_closed() {
     }
 }
 
-/// The E2E producer grants name exactly the configured producer principal: an exact unconditional
-/// grant for the concrete submitted event `produce` check and a root-tenant-constrained rule
-/// for the tenant-scope check. The fragment is not a complete policy, so the plugin's required
+/// The E2E producer grants name exactly the configured producer principal: an unconditional
+/// grant for the concrete event `produce` check over the Orders event family (a prefix, so
+/// `OrderSubmitted` and `OrderAmended` both match and no other gear's event does) and a
+/// root-tenant-constrained rule for the tenant-scope check. The fragment is not a complete policy, so the plugin's required
 /// envelope is supplied here only to validate the grants.
 #[test]
 fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
@@ -304,11 +305,16 @@ fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
     );
     assert_eq!(
         (grant.resource_type.as_str(), grant.action.as_str()),
-        (
-            "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~",
-            "produce"
-        )
+        (crate::infra::events::EVENT_TYPE_WILDCARD, "produce")
     );
+    let family = grant.resource_type.trim_end_matches('*');
+    for event in [
+        <crate::infra::events::payload::OrderSubmitted as crate::infra::events::EventKind>::TYPE_ID,
+        <crate::infra::events::payload::OrderAmended as crate::infra::events::EventKind>::TYPE_ID,
+    ] {
+        assert!(event.starts_with(family), "{event}");
+    }
+    assert!(!"gts.cf.core.events.event.v1~cf.bss.pricing.event.v1~".starts_with(family));
     let [rule] = policy.rules.as_slice() else {
         panic!("exactly one tenant-scope rule")
     };
