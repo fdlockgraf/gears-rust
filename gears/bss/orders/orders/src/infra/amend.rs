@@ -195,14 +195,14 @@ impl AmendService {
             ..
         } = snapshot;
         let header = n.header;
-        let adds = delta
-            .lines
-            .iter()
-            .filter(|op| matches!(op, LineDelta::Add(_)))
-            .count();
-        let mut fresh: Vec<Uuid> = (0..adds).map(|_| Uuid::now_v7()).collect();
-        fresh.sort_unstable();
-        let proposal = self.propose(&engine, order_id, &n, &delta, &request.reason, fresh)?;
+        let proposal = self.propose(
+            &engine,
+            order_id,
+            &n,
+            &delta,
+            &request.reason,
+            Allocation::Fresh,
+        )?;
         let structural = proposal.structural();
         let capacity = proposal.item_capacity();
         let local = proposal
@@ -318,15 +318,21 @@ impl AmendService {
                 |reserved| {
                     let proposal = match &n {
                         Some(n) => {
-                            let mut added: Vec<Uuid> = reserved
+                            let added: Vec<Uuid> = reserved
                                 .requests
                                 .lines
                                 .iter()
                                 .map(|l| l.line_id)
                                 .filter(|id| !n.lines.iter().any(|l| l.line_id == *id))
                                 .collect();
-                            added.sort_unstable();
-                            Some(self.propose(engine, order_id, n, delta, reason, added)?)
+                            Some(self.propose(
+                                engine,
+                                order_id,
+                                n,
+                                delta,
+                                reason,
+                                Allocation::Frozen(added),
+                            )?)
                         }
                         None => None,
                     };
@@ -341,8 +347,8 @@ impl AmendService {
             .await
     }
 
-    /// The merge of `delta` onto N with `added` as the added lines' ids in delta order, its
-    /// guard facts and every proposed line's content row (module doc, step 4).
+    /// The merge of `delta` onto N with the added lines' ids from `allocation`, ascending in
+    /// delta order, its guard facts and every proposed line's content row (module doc, step 4).
     fn propose(
         &self,
         engine: &Engine,
@@ -350,18 +356,23 @@ impl AmendService {
         n: &CommittedVersion,
         delta: &AmendmentDelta,
         reason: &str,
-        added: Vec<Uuid>,
+        allocation: Allocation,
     ) -> Result<Proposal, OrdersError> {
         let adds = delta
             .lines
             .iter()
             .filter(|op| matches!(op, LineDelta::Add(_)))
             .count();
-        if added.len() != adds {
-            return Err(integration(
-                "the added line ids are not the delta's additions",
-            ));
-        }
+        let mut added = match allocation {
+            Allocation::Fresh => (0..adds).map(|_| Uuid::now_v7()).collect(),
+            Allocation::Frozen(added) if added.len() == adds => added,
+            Allocation::Frozen(_) => {
+                return Err(integration(
+                    "the added line ids are not the delta's additions",
+                ));
+            }
+        };
+        added.sort_unstable();
         let mut ids = added.into_iter();
         // The count is checked above, so the allocator never runs dry; a nil id would collide
         // with nothing and is refused by the identity's primary key at worst.
@@ -387,6 +398,14 @@ impl AmendService {
             line_cap: self.submit.line_cap(),
         })
     }
+}
+
+/// Where an amendment's added line ids come from.
+enum Allocation {
+    /// A fresh attempt: new time-ordered ids.
+    Fresh,
+    /// A recovered attempt: its own added ids (the frozen line ids that are not N's).
+    Frozen(Vec<Uuid>),
 }
 
 /// Every guard of rows 18–20 bound passing: the binding contract of a refusal the engine settles

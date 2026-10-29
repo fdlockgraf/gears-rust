@@ -1123,7 +1123,10 @@ pub enum RefusalGate {
 pub enum RefusalSubject {
     /// Submit (row 4): `gate.has-lines` and the structural guards over the engine's locked
     /// working draft.
-    Draft,
+    Draft {
+        /// The configured line cap.
+        line_cap: usize,
+    },
     /// An amendment (rows 18–20): the row's request guards, then the structural guards over
     /// the proposed version and its authored-selection capacity.
     Proposed {
@@ -1157,7 +1160,6 @@ pub enum RefusalSubject {
 /// (E3).
 pub struct RefusalPreparation {
     gate: RefusalGate,
-    line_cap: usize,
     subject: RefusalSubject,
 }
 
@@ -1166,18 +1168,13 @@ impl RefusalPreparation {
     fn draft(gate: RefusalGate, line_cap: usize) -> Self {
         Self {
             gate,
-            line_cap,
-            subject: RefusalSubject::Draft,
+            subject: RefusalSubject::Draft { line_cap },
         }
     }
 
     /// An amendment's refusal over its proposed version (rows 18–20).
     pub fn proposed(gate: RefusalGate, subject: RefusalSubject) -> Self {
-        Self {
-            gate,
-            line_cap: 0,
-            subject,
-        }
+        Self { gate, subject }
     }
 }
 
@@ -1186,8 +1183,8 @@ impl Preparation for RefusalPreparation {
     async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
         let mut prepared = Prepared::new(AggregateContribution::None);
         let (row, guards, capacity) = match &self.subject {
-            RefusalSubject::Draft => {
-                let structural = Structural::draft(view, self.line_cap);
+            RefusalSubject::Draft { line_cap } => {
+                let structural = Structural::draft(view, *line_cap);
                 let lines = structural.lines;
                 let own = GuardBindings::new().bind(HAS_LINES, move |_: &GuardSubject<'_>| {
                     if lines == 0 {
