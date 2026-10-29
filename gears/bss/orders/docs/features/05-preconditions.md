@@ -228,7 +228,7 @@ election read answers `unavailable` and commits nothing. The row and the `OrderS
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-acceptance`
 
-> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+> **Status (2026-10-29): locally complete; record-acceptance in the development delivery (D-231, D-255), consent on submit with submit, history reads in production (D-254); open pending real providers.** Unchecked on purpose. Open gates: the Contracts `acceptance_required` SDK (missing; development stub or fail-closed); Q-30 acceptance surface for partner-placed orders (a seller election helps only contract-silent or contract-less orders); production PDP policy restricting `acceptance × record` to resource-tenant members (D-255 item 10); submit's production delivery (D-251 item 9); consent p95 < 1 s unmeasured (S6-06). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** implement both acceptance flows, current-version uniqueness, stored-actor checks and authorized history without inferred consent.
 
@@ -241,7 +241,7 @@ The system **MUST** implement both acceptance flows, current-version uniqueness,
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-money-gate`
 
-> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+> **Status (2026-10-29): locally complete, engine-only (D-256); open pending Stage 5 and real providers.** Unchecked on purpose. Open gates: the Stage 5 route calling the `begin_fulfillment` driver with the outcome in the fingerprinted document (D-256 items 9, 10); S5-04's `gate.binding-deadline` (a test double now); the Payments owner (none assigned) and the Orders Workflow runtime that presents the outcome; durable execution for pending-payment continuation (Workflow Q-10); the Contracts `acceptance_required` SDK; the alerts are documentation only and unratified (D-257 item 4). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** implement policy precedence, safe unset values and fail-closed outages, with the risk flag written only by admitted begin-fulfillment. Deliver policy rows through deployment promotion requested via platform operations; no runtime write endpoint or new PDP action exists. Enforce platform-key uniqueness with `NULLS NOT DISTINCT` and the scope/nullability rules in the design. Instrument authorization outcomes separately, tolerated admissions, acceptance latency and recording-party/unevaluable refusals with the design's alerts.
 

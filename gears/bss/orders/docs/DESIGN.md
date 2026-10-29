@@ -12005,22 +12005,27 @@ One row per Stage 4 operation, at commit `44aa09ef3` (2026-10-29). "Missing" mea
 SDK or runtime exists in this repository; a double named here is a test or development double
 and is **never** evidence. Every gate stays unchecked: no row is passed because its double works.
 Scope: *production* (mounted in every build), *development* (`gate-dev-stubs` feature **and**
-`gate.dev_stubs`, D-231), *engine-only* (no route; driven through `Engine::transition` in tests).
+`gate.dev_stubs`, D-231), *engine-only* (no route; driven through the Stage 5 seam driver
+`infra::fulfillment::begin_fulfillment` in tests, D-256 item 9).
 
 | Operation | Providers: SDK revision or missing | Double used | Principal / grants | Evidence (identity, freshness) | Enabled scope | Gate |
 |---|---|---|---|---|---|---|
 | Amend (`amend`, D-253) | Pricing `bss-pricing-sdk` (in-repo, same revision); Account Management payer profile: missing; Contracts: missing; Subscriptions occupancy/overlap: missing; Rating evaluation: missing; PDP: platform `authz-resolver-sdk` (no deployed policy verified) | Development gate stubs over `gate.dev_stub_fixture` (`infra/gate/stubs.rs`); Pricing development acceptance double; tests: `Scripted` acceptance wrapper, rules PDP | Caller `order × amend` on the target; the proposed payer through the proposed-arrangement decision (D-215); Pricing commands under the configured `gate.commercial_identities[]` client | In-crate PostgreSQL `infra/storage/tests/amend.rs`, `stage4.rs`; no real-provider run | development | [ ] |
-| Record acceptance (`record_acceptance`, D-255) | Contracts `acceptance_required`: missing; policy-election store: Orders-owned (D-250); PDP as above | Development contract stub (`ContractsStub`); outside the development build the fail-closed `ContractsUnavailable` | Resource-tenant user with `acceptance × record`; the recording-party bar on stored version actors | `infra/storage/tests/acceptance.rs`, `signals.rs`; no real-provider run | development | [ ] |
+| Record acceptance (`record_acceptance`, D-255) | Contracts `acceptance_required`: missing; policy-election store: Orders-owned (D-250); PDP as above | Development contract stub (`ContractsStub`); outside the development build the fail-closed `ContractsUnavailable` | Resource-tenant user with `acceptance × record`; the recording-party bar on stored version actors. The bar stops only role actors (creator, submitter, amender), so production PDP policy **must** restrict `acceptance × record` to resource-tenant members (D-255 item 10); the e2e rule `e2e-partner-acceptance` is intentionally over-broad to exercise the bar | `infra/storage/tests/acceptance.rs`, `signals.rs`; no real-provider run | development | [ ] |
 | History reads (`list_versions`, `get_version`, `get_acceptance`, D-254) | None (stored rows only); PDP as above | None | `order × read` on the current parent | `infra/storage/tests/history.rs`; p95 < 200 ms at 20 versions unmeasured (S6-06) | production | [ ] PDP policy and latency evidence |
 | Administrative edit (`patch_order`, `patch_line` admin fields, S4-05) | None; PDP as above; audit minimization key (D-204) | None | `order × edit` | `infra/storage/tests/administrative.rs`, `signals.rs` | production | [ ] PDP policy evidence |
-| Begin-fulfillment guard (row 11, D-256) | Payments authorization: missing (Workflow presents the outcome; Lifecycle has no payment port); Contracts `acceptance_required`: missing; Orders Workflow runtime: missing (specification only); policy-election store: Orders-owned | Development contract stub; S5-04 binding-deadline guard bound passing (`DeadlineDouble`); approval reflection by owner SQL (`approve`) | Configured Workflow service principal with `order × begin-fulfillment` restricted to finite order ids (D-182, D-226) | `infra/storage/tests/fulfillment.rs`, `signals.rs`; no route | engine-only | [ ] |
+| Begin-fulfillment guard (row 11, D-256) | Payments authorization: missing (Workflow presents the outcome; Lifecycle has no payment port); Contracts `acceptance_required`: missing; Orders Workflow runtime: missing (specification only); policy-election store: Orders-owned | Development contract stub; S5-04 binding-deadline guard bound passing (`deadline_double`); approval reflection by owner SQL (`approve`) | Configured Workflow service principal with `order × begin-fulfillment` restricted to finite order ids (D-182, D-226) | `infra/storage/tests/fulfillment.rs`, `signals.rs`; no route | engine-only | [ ] |
 
 **Production scope (S4-12).** Provision-then-collect only. Not implemented here: checkout
 capture, strong customer authentication, alternate-instrument reauthorization UI,
 refund/chargeback and credit scoring. A declined authorization leaves the order `approved`
 (`authorization-failed`) for manual remediation with bounded expiry; there is no new payment
-state. Partner-placed scope requires a customer acceptance surface (Q-30) or an explicitly
-promoted seller election `acceptance_required: false`; there is no automatic scope downgrade.
+state. Partner-placed scope requires a customer acceptance surface (Q-30). A promoted seller
+election `acceptance_required: false` helps only orders whose referenced contract is silent on
+acceptance or that reference no contract: a contract's stated `acceptance_required` decides
+before any election (`RequirementResolver::requirement_for`, D-251, D-255 item 5), so a
+contract-bound order whose contract requires acceptance still needs the surface. There is no
+automatic scope downgrade.
 The four Stage 4 DoDs stay open until real providers exist; the operations are locally complete
 with doubles, not production-ready.
 

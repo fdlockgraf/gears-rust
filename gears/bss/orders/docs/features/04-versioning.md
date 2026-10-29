@@ -175,7 +175,7 @@ All amendment rows increment `amendment_count`; no transition resets it. Once M 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-versioning-amendment`
 
-> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+> **Status (2026-10-29): locally complete in the development delivery (D-231, D-253); open pending real providers.** Unchecked on purpose. Open gates: the gate's providers (Account Management payer profile, Contracts, Subscriptions occupancy and overlap, Rating evaluation; development stubs only); PDP policy evidence for `order × amend` and the proposed-payer decision; production delivery of submit and amendment, which first needs D-251 item 9 (the post-hold election read, the rolling-deploy `FrozenOrder` decoder); Q-28 cross-seller transfer; the Workflow mirror (S3-15). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** implement §2.1 and §3.1 through the shared engine, retaining its refusal, transaction and replay guarantees.
 
@@ -187,7 +187,7 @@ The system **MUST** implement §2.1 and §3.1 through the shared engine, retaini
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-dod-versioning-history`
 
-> **Status (2026-10-29): locally complete with development doubles; open pending real providers.** Unchecked on purpose. Open limits: Q-28 cross-seller transfer, Q-30 onboarding, payment owner (none assigned), durable execution (Q-10). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+> **Status (2026-10-29): production scope, no doubles (D-254, S4-05); open pending evidence.** Unchecked on purpose. Open gates: deployed PDP policy evidence for `order × read` (history) and `order × edit` (administrative edits); history-read p95 < 200 ms at 20 versions, unmeasured (S6-06); the Stage 4 alerts are documentation only and unratified (D-257 item 4). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** preserve the immutable chain, separately audit mutable administrative corrections and supply authorized historical reads. Instrument amendment depth, gate outcomes, stale workflow results and administrative changes; alert on stale-result rate and amended orders dwelling in `submitted` beyond Workflow's reflection lead time.
 
@@ -412,7 +412,7 @@ expected-version checks: amendment cap, `amendment-empty`, `amendment-reason-inv
 `administrative-field-in-amendment`, `tenant-axis-immutable`,
 capture's shared structural guards (`category-not-admitted`, `currency-mixed`, and
 `line-cap-exceeded` over the complete proposed line set), `date-cascade-invalid`, then the gate
-composite. So where a delta names both an administrative field and a commercial-frozen axis, the
+composite (whose predicate 1 checks the payer relationships, D-248). So where a delta names both an administrative field and a commercial-frozen axis, the
 refusal is `administrative-field-in-amendment`; where an empty delta also carries a bad
 explanation, it is `amendment-empty` — the outcome is deterministic rather than
 implementation-dependent. An unclassified field fails startup ([02 §4.3](../DESIGN.md#contract-02-4-3)); there is no runtime
@@ -421,8 +421,11 @@ boundary validation, with `request-invalid` ([01 §4.7](../DESIGN.md#contract-01
 
 **The tenant axes are not uniformly amendable.** `payerTenantId` **MAY** change through an
 amendment **only where the change does not cross seller scope**; a cross-seller payer change
-**MUST** be refused (by gate predicate 1 as `payer-relationship-unconfirmed` where the relationship is not confirmed, D-248), because the paired seller rebinding it
-would require is unavailable — see §2.2 *A payer change must not cross seller scope*.
+**MUST** be refused, because no seller rebinding is possible — see §2.2 *A payer change must not
+cross seller scope*. Payer relationships are checked once, by gate predicate 1 (payer ↔ seller and
+payer ↔ resource, `payer-relationship-unconfirmed`; D-215, D-228, D-248 removed the separate
+amendment guard and its reason): a proposed payer without a confirmed relationship to the order's
+seller is refused there.
 `resourceTenantId` **MUST NOT** change through any path once the order is `submitted`, and
 `sellerTenantId` through any path once the order is created; an amendment delta naming either
 **MUST** be refused with `tenant-axis-immutable`, which also refuses a draft edit naming

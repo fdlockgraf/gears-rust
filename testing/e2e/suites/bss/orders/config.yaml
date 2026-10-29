@@ -401,6 +401,10 @@ gears:
           delegation:
             proof_property: "delegation_proof_ref"
             accepted: ["e2e-proof-ok"]
+        # Intentionally over-broad: grants the partner (a role actor on the orders it places)
+        # `acceptance × record` so the e2e suite exercises the recording-party bar (D-255). The
+        # bar stops only role actors; production PDP policy must restrict `acceptance × record`
+        # to resource-tenant members (D-255 item 10, readiness register).
         - id: "e2e-partner-acceptance"
           subject: { id: "dddddddd-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.acceptance.v1~"

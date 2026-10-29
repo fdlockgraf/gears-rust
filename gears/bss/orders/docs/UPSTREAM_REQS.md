@@ -1000,7 +1000,10 @@ no delegated, operator-attested or elevated recording route exists, deliberately
 owner answers, partner-placed scope is **not releasable**: such an order rests in `approved` until
 its TTL expires it, unless the seller's scope is promoted with the election
 `acceptance_required: false` (D-133), which is an explicit commercial decision about evidence and
-not a fallback. The authz-pdp design PR raises the same question. Tracked as Q-30 in
+not a fallback. That election helps only orders whose referenced contract is silent on acceptance
+or that reference no contract: a contract's stated `acceptance_required` decides before any
+election (D-251, D-255 item 5), so an order under a contract requiring acceptance still needs the
+surface. The authz-pdp design PR raises the same question. Tracked as Q-30 in
 [`DECISIONS.md`](./DECISIONS.md); Stage 4 readiness register (DESIGN, D-257).
 
 ### 2.9 Platform authorization policy
