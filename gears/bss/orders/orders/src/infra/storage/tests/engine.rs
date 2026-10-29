@@ -2982,6 +2982,36 @@ async fn recovery_finds_the_settled_outcome_or_the_reserved_attempt_before_asses
     assert_eq!(replay.response, committed.response);
 }
 
+/// A line edit belongs to row 3 only, as administrative changes do: a non-administrative
+/// preparation naming an administrative line fails closed as an integration failure and writes
+/// nothing (no state change, audit entry, event or settled key).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_administrative_line_on_another_row_is_an_integration_failure() {
+    let t = T::new().await;
+    let probe = t.engine(&[]);
+    let order = seed(&t, &probe, "seed-admin-line", S::Submitted, None).await;
+    let engine = t.engine(&[order]);
+    let before = t.order_row(order).await;
+    let settled = format!(
+        "SELECT count(*) AS n FROM bss_orders__idempotency WHERE order_id='{order}' \
+         AND status='settled'"
+    );
+    let (outbox, audits, keys) = (t.outbox().await, t.audits(order).await, t.n(&settled).await);
+    let mut p = prepared(21, order, S::Submitted, None);
+    p.admin_line = Some(Uuid::now_v7());
+    let req = request(order, Trigger::Hold, "admin-line", version_of(S::Submitted));
+    let err = engine
+        .transition(&buyer(), req, &fixed(p))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EngineError::Integration);
+    assert_eq!(t.order_row(order).await, before);
+    assert_eq!(t.outbox().await, outbox);
+    assert_eq!(t.audits(order).await, audits);
+    assert_eq!(t.n(&settled).await, keys, "no key settled");
+}
+
 /// E3 (M2-6): a non-commercial preparation (submit's pre-reservation refusal path) that meets a
 /// reclaimed reserved attempt fails closed instead of settling the refusal over it: the attempt
 /// stays unresolved, the key unsettled, the candidate unconsumed by a refusal.

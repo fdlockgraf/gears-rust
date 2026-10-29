@@ -192,7 +192,7 @@ impl CaptureService {
     /// Edit the header. Fields alone select the trigger; no state is read to choose it.
     ///
     /// # Errors
-    /// `request-invalid` input, unavailable administrative edits, unsettled refusals and
+    /// `request-invalid` input, unsettled refusals (an administrative edit's included) and
     /// sanitized infrastructure outcomes.
     pub async fn patch_order(
         &self,
@@ -284,7 +284,7 @@ impl CaptureService {
     }
 
     /// Edit a line: commercial fields select `draft-mutate`; administrative-only fields select
-    /// the undelivered `administrative-edit` path.
+    /// the `administrative-edit` path (row 3, S4-05).
     ///
     /// # Errors
     /// As [`Self::patch_order`].

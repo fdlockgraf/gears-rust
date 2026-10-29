@@ -461,7 +461,7 @@ fn facts_classify_every_named_field_with_the_shared_declaration() {
 
 // --- Guard order on row 18 via the engine's decision -------------------------------------------
 
-/// Row 18 through `decide`: the five versioning bindings under test, every other registered
+/// Row 18 through `decide`: the seven versioning bindings under test, every other registered
 /// guard of the row bound to a passing stub (labelled double: the structural and gate guards are
 /// the existing bindings' responsibility).
 fn run(amendment: AmendmentFacts, amendment_count: i32) -> Option<Reason> {

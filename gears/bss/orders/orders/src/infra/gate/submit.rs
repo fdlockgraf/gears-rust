@@ -28,9 +28,12 @@
 //!    on a committed order) skips the gate: the engine settles the state table's
 //!    `not-admissible` (`{"state", "trigger"}`) through [`RefusalPreparation`] before any guard,
 //!    no port is called, and a same-key retry replays it. A narrow race: a held draft makes
-//!    `get_draft` return `None`; a concurrent resume before the engine lock makes the `NotRun`
-//!    admission abort as an integration failure (unsettled, a retry recovers), the same exposure
-//!    as the stale-revision `NotRun` path of step 5;
+//!    `get_draft` return `None`; a concurrent resume before the engine lock lets the `NotRun`
+//!    refusal reach admission, where `check_subflow` aborts it as `Abort::NotDelivered` ("D-188
+//!    commercial attempt required"), answered `unavailable` (unsettled, nothing written, a
+//!    same-key retry recovers), the same exposure as the stale-revision `NotRun` path of step 5.
+//!    Amendments, record-acceptance and begin-fulfillment retry this race once themselves
+//!    (D-253 item 10); submit does not;
 //! 5. a read whose draft revision is not the expected one skips the gate: the engine settles the
 //!    precedence refusal (`draft-revision-conflict` / `version-conflict`) through
 //!    [`RefusalPreparation`] before any guard, and no port is called;

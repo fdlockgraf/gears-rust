@@ -47,7 +47,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 /// The parties and contract of the order whose requirement is resolved.
-#[allow(
+#[expect(
     clippy::struct_field_names,
     reason = "the names are the Contracts port's `ContractQuery` fields"
 )]
@@ -89,7 +89,7 @@ impl RequirementResolver {
     /// # Errors
     /// `Unavailable`: the contract answer is missing, unavailable or lacks the contract, or an
     /// election read failed or has no store.
-    #[allow(
+    #[expect(
         clippy::option_option,
         reason = "the Task 10 contract: `None` reads live, `Some(None)` is a silent held fact"
     )]

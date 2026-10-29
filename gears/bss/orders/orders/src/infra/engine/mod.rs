@@ -2713,7 +2713,13 @@ async fn existing_body<'a>(
     // concurrent removal or addition after preparation cannot be decided on a stale snapshot.
     let admin_lines = match (a.trigger, a.prepared.admin_line) {
         (Trigger::AdministrativeEdit, Some(_)) => locked_line_ids(&locked, &facts).await?,
-        _ => Vec::new(),
+        // As administrative changes (`check_documents`): a line edit belongs to row 3 only.
+        (_, Some(_)) => {
+            return Err(Abort::Integration(
+                "an administrative line belongs to row 3",
+            ));
+        }
+        (_, None) => Vec::new(),
     };
     // Rows 25 and 11: whether the locked current version already has a consent, read under
     // this lock. Row 25 (D-255): of two independent recordings of one version only the first is

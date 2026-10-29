@@ -268,22 +268,6 @@ pub async fn version(
         .one(runner)
         .await
 }
-/// The committed version whose reason is `submit` (D-188: sparse, never assumed to be 2).
-pub async fn submit_version(
-    runner: &impl DBRunner,
-    scope: &AccessScope,
-    id: Uuid,
-) -> Result<Option<entity::order_version::Model>, ScopeError> {
-    entity::order_version::Entity::find()
-        .inner_join(order::Entity)
-        .filter(entity::order_version::Column::OrderId.eq(id))
-        .filter(entity::order_version::Column::Reason.eq("submit"))
-        .secure()
-        .scope_with(&AccessScope::for_resources(vec![id]))
-        .and_scope_for::<order::Entity>(scope)
-        .one(runner)
-        .await
-}
 impl<T: TransactionRunner> LockedOrder<'_, T> {
     pub(crate) async fn insert_order_version(
         &self,

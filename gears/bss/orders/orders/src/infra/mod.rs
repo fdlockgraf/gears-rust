@@ -2,7 +2,7 @@
 // workers (S2-04/09/11, S6-01). Business operations remain unavailable until they are delivered.
 /// The one consent-requirement resolver (S4-08) and the record-acceptance service (S4-08b).
 pub mod acceptance;
-/// Amendment service (S4-03 stub; S4-04 delivers it).
+/// The amendment service (S4-03, S4-04, D-253): development-delivered like submit (D-231).
 pub mod amend;
 /// The managed producer binding and its readiness (S2-08).
 pub mod broker;
