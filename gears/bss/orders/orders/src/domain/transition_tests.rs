@@ -653,7 +653,7 @@ fn stale_authorization_refusal_follows_the_version_precedence() {
 /// S4-08b (D-255): whether the locked current version already has a consent is read under the
 /// aggregate lock and reaches row 25's guards only; on any other row it is a contract violation.
 #[test]
-fn the_locked_acceptance_fact_reaches_only_the_record_acceptance_row() {
+fn the_locked_acceptance_fact_reaches_only_the_consent_rows() {
     let (table, registry) = env();
     let facts = facts(S::Submitted);
     let err = decide_with(
@@ -708,6 +708,52 @@ fn the_locked_acceptance_fact_reaches_only_the_record_acceptance_row() {
             ));
         } else {
             assert!(matches!(d, Decision::Admitted(_)), "{d:?}");
+        }
+    }
+}
+
+/// S4-10 (D-256): row 11 reads the same locked fact, whether the locked current version has a
+/// consent, so the begin-fulfillment consent guard decides on it rather than a pre-lock read.
+#[test]
+fn the_locked_acceptance_fact_reaches_begin_fulfillment() {
+    let (table, registry) = env();
+    let facts = facts(S::Approved);
+    for recorded in [false, true] {
+        let b = bindings(&registry, 11, &[]).bind(
+            "preconditions.acceptance-recorded",
+            |s: &GuardSubject<'_>| {
+                if s.acceptance_recorded {
+                    GuardVerdict::Pass
+                } else {
+                    GuardVerdict::Fail(Reason::AcceptanceRequiredNotRecorded)
+                }
+            },
+        );
+        let d = decide_with(
+            &table,
+            &registry,
+            Trigger::BeginFulfillment,
+            &facts,
+            facts.current_version,
+            DraftRevisions::NotApplicable,
+            &b,
+            &resolved(&registry, 11),
+            t(),
+            &[],
+            &[],
+            recorded,
+        )
+        .unwrap();
+        if recorded {
+            assert!(matches!(d, Decision::Admitted(_)), "{d:?}");
+        } else {
+            assert!(matches!(
+                d,
+                Decision::Guard {
+                    reason: Reason::AcceptanceRequiredNotRecorded,
+                    ..
+                }
+            ));
         }
     }
 }

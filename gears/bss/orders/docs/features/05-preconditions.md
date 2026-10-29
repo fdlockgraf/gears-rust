@@ -167,6 +167,18 @@ version changes. Production delivery remains open.
 4. [ ] For `failed`, resolve `tolerate_authorization_failure` from seller scope then platform scope, with unset meaning false. Refuse `authorization-failed` unless elected.
 5. [ ] If elected, contribute the tolerance decision; the engine writes `authorization_failure_tolerated_at` and audits the admission under the `begin-fulfillment` transition reason. `authorization-failed-tolerated` identifies the admission risk, not a refusal or a replacement audit reason. Never clear the flag or store the authorization outcome, instrument or token as an order fact.
 
+**Implementation note (S4-10, D-256).** Steps 1 to 5 are implemented as row 11's preparation,
+`BeginFulfillmentPreparation` (`infra/fulfillment.rs`), and engine-tested only: the public
+operation stays an undelivered Workflow seam until Stage 5, and `gate.binding-deadline` is
+S5-04's. The outcome is the SDK `AuthorizationOutcome` (`authorized | pending | failed`, no other
+member), so an unknown outcome never reaches tolerance. The live requirement is resolved before
+the transaction through the one resolver (unavailable: `acceptance-requirement-unevaluable`);
+the tolerance election is read only for `failed`, and an outage is `unavailable`, never a
+default. Whether the current version has a consent is read under the aggregate lock, so consent
+on a superseded version never admits; any consent counts, `volunteered` included. The order
+column `authorization_failure_tolerated_at`, set once at the admission's transition time, is the
+tolerance evidence: the committed `begin-fulfillment` audit entry has no member that shows it.
+
 ### 3.4 Pending authorization integration contract
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-algo-preconditions-pending-continuation`

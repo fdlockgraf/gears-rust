@@ -37,6 +37,24 @@ pub mod engine;
 pub mod error_mapping;
 pub mod events;
 pub mod execution;
+/// The begin-fulfillment consent and payment guard (S4-10, D-256): row 11's preparation. The
+/// operation is an undelivered Workflow seam until Stage 5, so only the engine tests drive it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "begin_fulfillment is an undelivered Workflow seam (Stage 5); only the engine \
+                  tests drive the preparation until then (D-256)"
+    )
+)]
+#[cfg_attr(
+    all(test, not(feature = "gate-dev-stubs")),
+    expect(
+        dead_code,
+        reason = "the PostgreSQL tests that drive the preparation need `gate-dev-stubs`"
+    )
+)]
+pub mod fulfillment;
 /// Bounded gate port calls: per-port deadline, single retry, bulkheads and run caps (S3-09).
 /// Preview (S3-11) and submit (S3-12) are the callers.
 pub mod gate;

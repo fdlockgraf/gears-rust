@@ -204,3 +204,57 @@ fn without_an_amendment_only_creator_and_submitter_count() {
         &roles
     ));
 }
+
+/// S4-10 (05 §3.3 steps 3-5, D-256): the payment decision table. `authorized` admits and
+/// `pending` refuses whatever the election; `failed` admits only on an election read as `true`,
+/// refuses on `false`, and is `Unavailable` (never "not tolerated", never "tolerated") when the
+/// election could not be read.
+#[test]
+fn the_payment_decision_table() {
+    use bss_orders_sdk::catalog::Reason;
+    use bss_orders_sdk::fulfillment::Authorization as A;
+    for election in [None, Some(false), Some(true)] {
+        assert_eq!(
+            payment_decision(A::Authorized, election),
+            PaymentDecision::Admit,
+            "{election:?}"
+        );
+        assert_eq!(
+            payment_decision(A::Pending, election),
+            PaymentDecision::Refuse(Reason::AuthorizationPending),
+            "{election:?}"
+        );
+    }
+    assert_eq!(
+        payment_decision(A::Failed, Some(true)),
+        PaymentDecision::AdmitTolerated
+    );
+    assert_eq!(
+        payment_decision(A::Failed, Some(false)),
+        PaymentDecision::Refuse(Reason::AuthorizationFailed)
+    );
+    assert_eq!(
+        payment_decision(A::Failed, None),
+        PaymentDecision::Unavailable
+    );
+}
+
+/// Only a failed outcome reads the tolerance election (05 §3.3 step 4).
+#[test]
+fn only_a_failed_outcome_reads_the_tolerance_election() {
+    use bss_orders_sdk::fulfillment::Authorization as A;
+    assert!(!reads_tolerance(A::Authorized));
+    assert!(!reads_tolerance(A::Pending));
+    assert!(reads_tolerance(A::Failed));
+}
+
+/// The begin-fulfillment consent guard (05 §3.3 step 2): only a required requirement without a
+/// consent on the current version refuses; a volunteered consent counts.
+#[test]
+fn the_begin_fulfillment_consent_guard() {
+    let required = Requirement::Required(RequirementSource::Seller);
+    assert!(consent_missing(required, false));
+    assert!(!consent_missing(required, true));
+    assert!(!consent_missing(Requirement::NotRequired, false));
+    assert!(!consent_missing(Requirement::NotRequired, true));
+}

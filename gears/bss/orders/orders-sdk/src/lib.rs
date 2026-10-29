@@ -20,6 +20,7 @@ pub mod authoring;
 pub mod catalog;
 pub mod commercial;
 pub mod errors;
+pub mod fulfillment;
 pub mod gate_report;
 pub mod models;
 pub mod preview;

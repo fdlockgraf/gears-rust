@@ -68,7 +68,7 @@ fn rule(id: &str, subject: u128, rt: &str, actions: &[&str], property: &str, val
 /// The buyer authors, submits, amends and records on resource tenant 10; the partner does the
 /// same for that tenant (the bar, not the PDP, refuses its recording); the customer records and
 /// reads; the member and the seller operator only read.
-fn policy() -> Value {
+pub(super) fn policy() -> Value {
     let author = ["create", "write", "edit", "read", "submit", "amend"];
     let resource = u(RESOURCE);
     json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s4-08b",
@@ -83,37 +83,39 @@ fn policy() -> Value {
             resource),
         rule("member", MEMBER.0, ORDER_RT, &["read"], "resource_tenant_id", resource),
         rule("seller", SELLER_OPERATOR.0, ORDER_RT, &["read"], "seller_tenant_id", u(SELLER)),
+        // S4-10 (`fulfillment.rs`): the buyer holds an order in fulfillment.
+        rule("buyer-hold", BUYER.0, ORDER_RT, &["hold"], "resource_tenant_id", resource),
     ]})
 }
 
 fn caller(who: (u128, u128)) -> Caller {
     user(who.0, who.1)
 }
-fn buyer() -> Caller {
+pub(super) fn buyer() -> Caller {
     caller(BUYER)
 }
-fn customer() -> Caller {
+pub(super) fn customer() -> Caller {
     caller(CUSTOMER)
 }
-fn partner() -> Caller {
+pub(super) fn partner() -> Caller {
     with_proof(&caller(PARTNER), "proof-partner")
 }
 
 /// The fixture's engine, gate, dates, authority and Pricing double under [`policy`].
-struct World {
-    f: Fixture,
+pub(super) struct World {
+    pub(super) f: Fixture,
     stubs: StubFixture,
-    engine: Arc<Engine>,
+    pub(super) engine: Arc<Engine>,
     capture: CaptureService,
-    submit: Arc<SubmitService>,
-    reads: ReadService,
+    pub(super) submit: Arc<SubmitService>,
+    pub(super) reads: ReadService,
 }
 
 fn slot(engine: &Arc<Engine>) -> Arc<ArcSwapOption<Engine>> {
     Arc::new(ArcSwapOption::from(Some(Arc::clone(engine))))
 }
 
-async fn world(stubs: StubFixture) -> World {
+pub(super) async fn world(stubs: StubFixture) -> World {
     let f = Box::pin(setup_with(stubs.clone(), 600, true)).await;
     let pdp: Arc<dyn AuthZResolverApi> = RulesProvider::from_policy(policy());
     let engine = Arc::new(f.t.engine(Arc::clone(&pdp)));
@@ -151,7 +153,7 @@ async fn world(stubs: StubFixture) -> World {
 
 impl World {
     /// The record-acceptance service over this world's engine and `contracts`.
-    fn recorder_with(
+    pub(super) fn recorder_with(
         &self,
         engine: Arc<Engine>,
         contracts: Arc<dyn ContractReads>,
@@ -162,18 +164,23 @@ impl World {
         )
     }
     /// The record-acceptance service reading the world's stubbed contracts.
-    fn recorder(&self) -> AcceptanceService {
+    pub(super) fn recorder(&self) -> AcceptanceService {
         self.recorder_with(
             Arc::clone(&self.engine),
             Arc::new(ContractsStub::new(Arc::new(self.stubs.clone()))),
         )
     }
-    fn amender(&self) -> AmendService {
+    pub(super) fn amender(&self) -> AmendService {
         AmendService::new(Arc::clone(&self.submit))
     }
 
     /// A one-line draft created by `author` (on `contract`), as `author` reads it.
-    async fn draft(&self, author: &Caller, contract: Option<Uuid>, tag: &str) -> OrderView {
+    pub(super) async fn draft(
+        &self,
+        author: &Caller,
+        contract: Option<Uuid>,
+        tag: &str,
+    ) -> OrderView {
         let order = CreateOrder {
             resource_tenant_id: u(RESOURCE),
             payer_tenant_id: PAYER,
@@ -201,7 +208,7 @@ impl World {
     }
 
     /// A submitted order: drafted by `author`, submitted by `submitter`; its id and version N.
-    async fn submitted(
+    pub(super) async fn submitted(
         &self,
         author: &Caller,
         submitter: &Caller,
@@ -220,7 +227,7 @@ impl World {
     }
 
     /// Release `order`'s overlap claims: every order of the fixture claims the same tuple.
-    async fn release(&self, order: Uuid) {
+    pub(super) async fn release(&self, order: Uuid) {
         self.f
             .t
             .env
@@ -233,7 +240,7 @@ impl World {
             .unwrap();
     }
 
-    async fn consent(&self, who: &Caller, order: Uuid) -> AcceptancePage {
+    pub(super) async fn consent(&self, who: &Caller, order: Uuid) -> AcceptancePage {
         self.reads
             .get_acceptance(who, order, &AcceptanceList::default())
             .await
@@ -241,7 +248,7 @@ impl World {
     }
 
     /// `[state, current_version, state_entered_at, versions]` of `order`: row 25 changes none.
-    async fn shape(&self, order: Uuid) -> Value {
+    pub(super) async fn shape(&self, order: Uuid) -> Value {
         self.f
             .t
             .json(&format!(
@@ -265,7 +272,7 @@ impl World {
         parse(&t)
     }
 
-    async fn rows(&self, order: Uuid) -> i64 {
+    pub(super) async fn rows(&self, order: Uuid) -> i64 {
         self.f
             .t
             .n(&format!(
@@ -283,7 +290,7 @@ fn parse(value: &Value) -> OffsetDateTime {
     .unwrap()
 }
 
-fn meta(text: &str, version: i64) -> CallMeta {
+pub(super) fn meta(text: &str, version: i64) -> CallMeta {
     CallMeta {
         expected_version: OrderVersion::try_from(version).unwrap(),
         idempotency_key: key(text),
@@ -292,7 +299,7 @@ fn meta(text: &str, version: i64) -> CallMeta {
     }
 }
 
-async fn record(
+pub(super) async fn record(
     svc: &AcceptanceService,
     who: &Caller,
     order: Uuid,
@@ -310,7 +317,7 @@ async fn record(
 }
 
 /// The refusal of an attempt, settled or not.
-fn refusal(answer: &Result<Settled, OrdersError>) -> Reason {
+pub(super) fn refusal(answer: &Result<Settled, OrdersError>) -> Reason {
     match answer {
         Ok(Settled {
             outcome: SettledOutcome::Refused(Some(reason)),

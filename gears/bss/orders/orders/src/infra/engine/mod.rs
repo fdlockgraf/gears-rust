@@ -2506,10 +2506,12 @@ async fn existing_body<'a>(
         (Trigger::AdministrativeEdit, Some(_)) => locked_line_ids(&locked, &facts).await?,
         _ => Vec::new(),
     };
-    // Row 25: whether the locked current version already has a consent, read under this lock
-    // (D-255), so of two independent recordings of one version only the first is admitted and
-    // the second is refused `acceptance-already-recorded`, never a key violation.
-    let acceptance_recorded = a.trigger == Trigger::RecordAcceptance
+    // Rows 25 and 11: whether the locked current version already has a consent, read under
+    // this lock. Row 25 (D-255): of two independent recordings of one version only the first is
+    // admitted and the second is refused `acceptance-already-recorded`, never a key violation.
+    // Row 11 (D-256): begin-fulfillment decides consent on the version it admits, so a consent
+    // recorded on a superseded version never satisfies it.
+    let acceptance_recorded = transition::reads_locked_acceptance(a.trigger)
         && locked_acceptance_recorded(&locked, &facts).await?;
     let registries = &inner.registries;
     let decision = transition::decide_with(
@@ -3208,7 +3210,7 @@ async fn locked_line_ids<'a>(
     }
 }
 
-/// Whether the locked current version has a consent row (row 25, D-255).
+/// Whether the locked current version has a consent row (rows 25 and 11, D-255, D-256).
 async fn locked_acceptance_recorded<'a>(
     locked: &LockedOrder<'a, DbTx<'a>>,
     facts: &AggregateFacts,

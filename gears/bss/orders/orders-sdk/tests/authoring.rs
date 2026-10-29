@@ -253,3 +253,35 @@ fn the_acceptance_body_carries_no_member() {
         );
     }
 }
+
+/// S4-10 (`models.json` `AuthorizationOutcome`, D-256): the begin-fulfillment payment outcome is
+/// exactly `{ "outcome": "authorized" | "pending" | "failed" }`. An unknown outcome, a missing
+/// one or any other member is refused at the wire, so it can never reach the tolerance decision.
+#[test]
+fn the_authorization_outcome_is_closed() {
+    use bss_orders_sdk::fulfillment::{Authorization, AuthorizationOutcome};
+    for (token, outcome) in [
+        ("authorized", Authorization::Authorized),
+        ("pending", Authorization::Pending),
+        ("failed", Authorization::Failed),
+    ] {
+        let wire = serde_json::json!({ "outcome": token });
+        let parsed: AuthorizationOutcome = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(parsed, AuthorizationOutcome { outcome });
+        assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
+    }
+    for refused in [
+        r#"{"outcome":"unknown"}"#,
+        r#"{"outcome":"declined"}"#,
+        r#"{"outcome":null}"#,
+        r#"{}"#,
+        r#"{"outcome":"failed","token":"tok_1"}"#,
+        "[]",
+        "null",
+    ] {
+        assert!(
+            serde_json::from_str::<AuthorizationOutcome>(refused).is_err(),
+            "{refused}"
+        );
+    }
+}
