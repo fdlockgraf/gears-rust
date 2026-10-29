@@ -9,8 +9,8 @@ use super::capture::{buyer, key, s};
 use super::engine::fixed;
 use super::submit::{
     Fixture, ORDER_RT, SELLER, WORKFLOW, acceptances, attempts, committed, draft_tagged,
-    high_water, lapse_leases, last_event, rebind, setup_with, submit, transition_instant,
-    two_line_fixture, versions,
+    high_water, lapse_leases, last_event, rebind, service_over, setup_with, submit, submit_with,
+    transition_instant, two_line_fixture, versions,
 };
 use super::*;
 use crate::authz::Caller;
@@ -25,6 +25,8 @@ use crate::infra::engine::documents::EventDetail;
 use crate::infra::engine::{EngineOutcome, OutcomeKind, Prepared, Registries, TransitionRequest};
 use crate::infra::events::payload::OrderApproved;
 use crate::infra::gate::tests::orchestrate::PAYER;
+use async_trait::async_trait;
+use authz_resolver_sdk::{AuthZResolverApi, EvaluationRequest, EvaluationResponse};
 use bss_orders_sdk::OrdersError;
 use bss_orders_sdk::amend::AmendOrder;
 use bss_orders_sdk::authoring::OrderView;
@@ -32,9 +34,14 @@ use bss_orders_sdk::catalog::{Reason, Trigger};
 use bss_orders_sdk::models::{CallMeta, OrderVersion};
 use bss_pricing_sdk::acceptance::CommercialReason;
 use serde_json::{Value, json};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::PlatformSecurityContext;
 
 /// The amendment service over the fixture's engine, gate, dates, authority and Pricing double.
 fn amend_service(f: &Fixture) -> AmendService {
@@ -968,5 +975,290 @@ async fn added_line_identity_survives_recovery() {
         ))
         .await,
         1
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Races between the read and the lock (D-253)
+
+/// A concurrent writer's work, run by a test hook.
+type Work = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// The fixture's rules PDP, running `work` once on the `nth` `amend` decision of the engine it
+/// is bound to. The service's committed read uses the fixture's own PDP, so the `nth = 2`
+/// decision (after the recovery probe's) is the engine's target authorization of the
+/// transition: a concurrent writer between the service's read and the engine's lock, as the
+/// engine tests' `side_effect` preparation is.
+struct RaceAt {
+    inner: Arc<dyn AuthZResolverApi>,
+    nth: usize,
+    seen: AtomicUsize,
+    fired: AtomicUsize,
+    work: Work,
+}
+#[async_trait]
+impl AuthZResolverApi for RaceAt {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        if request.action.name == "amend"
+            && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.nth
+        {
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            (self.work)().await;
+        }
+        self.inner.evaluate(ctx, request).await
+    }
+}
+
+/// The amendment service over an engine whose second `amend` decision runs `work` first.
+fn racing(f: &Fixture, work: Work) -> (AmendService, Arc<RaceAt>) {
+    let pdp = Arc::new(RaceAt {
+        inner: f.pdp(),
+        nth: 2,
+        seen: AtomicUsize::new(0),
+        fired: AtomicUsize::new(0),
+        work,
+    });
+    let api: Arc<dyn AuthZResolverApi> = pdp.clone();
+    let engine = f.t.engine(api);
+    (AmendService::new(Arc::new(service_over(f, engine))), pdp)
+}
+
+/// Owner SQL on the raw connection (triggers off, as [`force`] does), as racing work.
+fn sql_work(f: &Fixture, assignment: String, order: Uuid) -> Work {
+    let raw = f.t.env.pg.raw.clone();
+    Arc::new(move || {
+        let raw = raw.clone();
+        let sql = format!(
+            "ALTER TABLE bss_orders__order DISABLE TRIGGER USER; \
+             UPDATE bss_orders__order SET {assignment} WHERE order_id='{order}'; \
+             ALTER TABLE bss_orders__order ENABLE TRIGGER USER;"
+        );
+        Box::pin(async move {
+            raw.execute_unprepared(&sql).await.unwrap();
+        })
+    })
+}
+
+/// Holds the `nth` Pricing command (counted from now) on its worker thread until released, so
+/// the test can run a competing writer while that attempt is between reservation and commit.
+struct Hold {
+    reached: Arc<AtomicBool>,
+    go: Arc<AtomicBool>,
+}
+impl Hold {
+    fn on(f: &Fixture, nth: usize) -> Self {
+        let base = f.acceptance.calls();
+        let reached = Arc::new(AtomicBool::new(false));
+        let go = Arc::new(AtomicBool::new(false));
+        let (r, g) = (Arc::clone(&reached), Arc::clone(&go));
+        *f.acceptance.on_call.lock() = Some(Arc::new(move |n| {
+            if n != base + nth {
+                return;
+            }
+            r.store(true, Ordering::SeqCst);
+            // The worker hands its core off while it waits (multi-thread runtime only).
+            tokio::task::block_in_place(|| {
+                let start = Instant::now();
+                while !g.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }));
+        Self { reached, go }
+    }
+    async fn reached(&self) {
+        let start = Instant::now();
+        while !self.reached.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the held command was never reached"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    fn release(&self) {
+        self.go.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The race fix (D-253): an order read `on_hold` and resumed (row 22, same version) before the
+/// engine locks it is decided from the locked state. The engine finds the amendment admissible
+/// at N; the refusal-only preparation does not admit it, so the service runs once more from the
+/// recovery probe and the amendment commits M, never an abort.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn on_hold_resumed_between_read_and_lock_is_decided_from_the_locked_state() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let (v, n) = submitted(&f, 1, "am-hold").await;
+    let order = v.order.order_id;
+    force(&f, order, "state = 'on_hold', pre_hold_state = 'submitted'").await;
+    let resume = sql_work(
+        &f,
+        "state = 'submitted', pre_hold_state = NULL".to_owned(),
+        order,
+    );
+    let (svc, race) = racing(&f, resume);
+    let outbox = f.t.outbox().await;
+    let settled = amend_as(
+        &svc,
+        &buyer(),
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-hold-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(race.fired.load(Ordering::SeqCst), 1, "the resume raced");
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let m = settled.response.body()["version"].as_i64().unwrap();
+    let row = order_row(&f, order).await;
+    assert_eq!(row["state"], json!("submitted"));
+    assert_eq!(row["current_version"], json!(m));
+    assert_eq!(row["amendment_count"], json!(1));
+    assert_eq!(f.t.outbox().await, outbox + 1, "exactly one OrderAmended");
+    assert_eq!(last_event(&f).await["supersedesVersion"], json!(n));
+    // An order still on hold at the lock is the settled state refusal, with no external call.
+    force(&f, order, "state = 'on_hold', pre_hold_state = 'submitted'").await;
+    let calls = external_calls(&f);
+    let settled = amend(
+        &f,
+        order,
+        m,
+        change_quantity(v.lines[0].line_id, "3"),
+        "am-hold-2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::NotAdmissible)),
+        "{settled:?}"
+    );
+    assert_eq!(
+        settled.response.body()["context"]["data"]["state"],
+        json!("on_hold")
+    );
+    assert_eq!(external_calls(&f), calls);
+}
+
+/// The consent path that exists (Task 6, S4-08a: a self-service submit records the customer's
+/// consent on the version it commits) raced by an amendment naming that version, both ways:
+/// (a) the amendment arrives while the consented submit is in its Pricing phase (the order is
+/// still a draft at the lock): the settled `not-admissible`, and the submit's consent names its
+/// version; (b) the amendment reads the draft, then the consented submit commits N before the
+/// amendment's lock: the amendment is decided from the locked state (D-253 race fix) and
+/// commits M, N's consent stays N's and M has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn amendment_races_consent() {
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    // (a) The amendment during the submit's Pricing command.
+    let v = draft_tagged(&f, 1, "am-cons-a").await;
+    let order = v.order.order_id;
+    let n = high_water(&f, order).await + 1;
+    let hold = Hold::on(&f, 1);
+    let submitter = Arc::new(rebind(&f));
+    let submitting = {
+        let (svc, v) = (Arc::clone(&submitter), v.clone());
+        tokio::spawn(async move { submit_with(&svc, &buyer(), &v, "am-cons-a-submit").await })
+    };
+    hold.reached().await;
+    let refused = amend(
+        &f,
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-cons-a-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.outcome,
+        SettledOutcome::Refused(Some(Reason::NotAdmissible)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.response.body()["context"]["data"]["state"],
+        json!("draft")
+    );
+    hold.release();
+    let submitted = submitting.await.unwrap().unwrap();
+    assert_eq!(
+        submitted.outcome,
+        SettledOutcome::Committed,
+        "{submitted:?}"
+    );
+    let consent = acceptances(&f, order).await;
+    assert_eq!(consent.as_array().unwrap().len(), 1, "{consent}");
+    assert_eq!(consent[0]["version"], json!(n));
+    assert_eq!(order_row(&f, order).await["current_version"], json!(n));
+    *f.acceptance.on_call.lock() = None;
+
+    // (b) The consented submit commits N between the amendment's read and its lock.
+    // Leg (a)'s order leaves flight first: its claim would block this order's one tuple.
+    f.t.env
+        .pg
+        .sql(&format!(
+            "UPDATE bss_orders__inflight_overlap_claim SET released_at = now() \
+             WHERE order_id='{order}' AND released_at IS NULL"
+        ))
+        .await
+        .unwrap();
+    let v = draft_tagged(&f, 1, "am-cons-b").await;
+    let order = v.order.order_id;
+    let n = high_water(&f, order).await + 1;
+    let committed_n = Arc::new(AtomicBool::new(false));
+    let work: Work = {
+        let (svc, v, done) = (Arc::clone(&submitter), v.clone(), Arc::clone(&committed_n));
+        Arc::new(move || {
+            let (svc, v, done) = (Arc::clone(&svc), v.clone(), Arc::clone(&done));
+            Box::pin(async move {
+                let settled = submit_with(&svc, &buyer(), &v, "am-cons-b-submit")
+                    .await
+                    .unwrap();
+                done.store(
+                    settled.outcome == SettledOutcome::Committed,
+                    Ordering::SeqCst,
+                );
+            })
+        })
+    };
+    let (svc, race) = racing(&f, work);
+    let outbox = f.t.outbox().await;
+    let settled = amend_as(
+        &svc,
+        &buyer(),
+        order,
+        n,
+        change_quantity(v.lines[0].line_id, "2"),
+        "am-cons-b-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(race.fired.load(Ordering::SeqCst), 1);
+    assert!(committed_n.load(Ordering::SeqCst), "the submit committed N");
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let m = settled.response.body()["version"].as_i64().unwrap();
+    assert!(m > n);
+    let consent = acceptances(&f, order).await;
+    assert_eq!(consent.as_array().unwrap().len(), 1, "{consent}");
+    assert_eq!(consent[0]["version"], json!(n), "N's consent stays N's");
+    assert_eq!(
+        f.t.json(&format!(
+            "SELECT jsonb_build_array(supersedes_version, reason) AS j \
+             FROM bss_orders__order_version WHERE order_id='{order}' AND version={m}"
+        ))
+        .await,
+        json!([n, "amendment"])
+    );
+    assert_eq!(
+        f.t.outbox().await,
+        outbox + 2,
+        "OrderSubmitted, OrderAmended"
     );
 }

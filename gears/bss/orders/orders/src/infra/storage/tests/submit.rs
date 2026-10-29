@@ -279,10 +279,11 @@ pub(super) struct Scripted {
     pub(super) refuse: Mutex<BTreeMap<Uuid, CommercialReason>>,
     pub(super) lose_replies: AtomicUsize,
     lapsed: AtomicBool,
-    on_call: Mutex<Option<OnCall>>,
+    /// Run on every call with the running call count, outside every lock of the double.
+    pub(super) on_call: Mutex<Option<OnCall>>,
 }
 /// A hook run with the call number on every scripted acceptance call.
-type OnCall = Box<dyn Fn(usize) + Send + Sync>;
+pub(super) type OnCall = Arc<dyn Fn(usize) + Send + Sync>;
 impl Scripted {
     fn new(bindings: Arc<FixedBindings>) -> Arc<Self> {
         Arc::new(Self {
@@ -315,7 +316,8 @@ impl SellabilityV1 for Scripted {
             calls.push((meta.idempotency_key.clone(), query.line_id));
             calls.len()
         };
-        if let Some(hook) = self.on_call.lock().as_ref() {
+        let hook = self.on_call.lock().clone();
+        if let Some(hook) = hook {
             hook(n);
         }
         if let Some(reason) = self.refuse.lock().get(&query.line_id) {
@@ -390,7 +392,7 @@ pub(super) async fn setup_with(stubs: StubFixture, per_minute: u32, bound: bool)
     setup_with_bindings(stubs, per_minute, bound, None).await
 }
 
-async fn setup_with_bindings(
+pub(super) async fn setup_with_bindings(
     stubs: StubFixture,
     per_minute: u32,
     bound: bool,
@@ -444,6 +446,13 @@ async fn setup_with_bindings(
     }
 }
 
+impl Fixture {
+    /// The fixture's rules PDP (buyer grants), for a test that wraps it.
+    pub(super) fn pdp(&self) -> Arc<dyn AuthZResolverApi> {
+        self.pdp.clone()
+    }
+}
+
 /// The same service with the scripted double bound (a later process after a crash).
 pub(super) fn rebind(f: &Fixture) -> SubmitService {
     let port: Arc<dyn SellabilityV1> = f.acceptance.clone();
@@ -467,7 +476,7 @@ pub(super) fn rebind(f: &Fixture) -> SubmitService {
 }
 
 /// The same service over `engine` (a fault-injecting one), with the scripted double bound.
-fn service_over(f: &Fixture, engine: Engine) -> SubmitService {
+pub(super) fn service_over(f: &Fixture, engine: Engine) -> SubmitService {
     let port: Arc<dyn SellabilityV1> = f.acceptance.clone();
     SubmitService::new(
         Arc::new(ArcSwapOption::from(Some(Arc::new(engine)))),
@@ -489,9 +498,9 @@ fn service_over(f: &Fixture, engine: Engine) -> SubmitService {
 }
 
 /// Fails the commit at one named persistence boundary (`FaultPoint`), every time it is reached.
-struct FailAt {
-    point: FaultPoint,
-    hits: AtomicUsize,
+pub(super) struct FailAt {
+    pub(super) point: FaultPoint,
+    pub(super) hits: AtomicUsize,
 }
 #[async_trait]
 impl FaultHook for FailAt {
@@ -596,7 +605,12 @@ pub(super) fn line() -> AddLine {
 pub(super) async fn draft_tagged(f: &Fixture, lines: usize, tag: &str) -> OrderView {
     draft_tagged_items(f, lines, tag, false).await
 }
-async fn draft_tagged_items(f: &Fixture, lines: usize, tag: &str, multikey: bool) -> OrderView {
+pub(super) async fn draft_tagged_items(
+    f: &Fixture,
+    lines: usize,
+    tag: &str,
+    multikey: bool,
+) -> OrderView {
     draft_on(f, lines, tag, multikey, None).await
 }
 /// [`draft_tagged_items`] on `contract`.
@@ -654,7 +668,7 @@ fn meta(text: &str) -> CallMeta {
     }
 }
 
-async fn submit_with(
+pub(super) async fn submit_with(
     svc: &SubmitService,
     caller: &Caller,
     v: &OrderView,
@@ -1425,7 +1439,7 @@ async fn revoked_authority_before_the_commit_records_the_denial_and_commits_noth
     let v = draft(&f, 1).await;
     let order = v.order.order_id;
     let pdp = Arc::clone(&f.pdp);
-    *f.acceptance.on_call.lock() = Some(Box::new(move |_| pdp.revoke()));
+    *f.acceptance.on_call.lock() = Some(Arc::new(move |_| pdp.revoke()));
     let answer = submit(&f, &buyer(), &v, "m26-revoked").await.unwrap_err();
     // The buyer still reads the order, so the denial names the operation, not the order.
     assert!(
@@ -2453,7 +2467,7 @@ async fn explicit_components_and_non_recurring_tcv_carriers_commit_on_postgres()
     }
 }
 
-fn multikey_fixture() -> StubFixture {
+pub(super) fn multikey_fixture() -> StubFixture {
     let mut fixture = fixture();
     let mut classification = fixture
         .item_classifications

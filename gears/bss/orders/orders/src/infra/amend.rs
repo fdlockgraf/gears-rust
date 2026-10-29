@@ -16,7 +16,11 @@
 //!    than `submitted`, `pending_approval` or `approved`, or a current version other than N
 //!    makes no external call: the engine settles the precedence refusal (`not-admissible`,
 //!    `precondition-failed`) through the refusal preparation, every guard presented passing only
-//!    to satisfy the binding contract;
+//!    to satisfy the binding contract. The engine decides from the locked state: when a
+//!    concurrent writer made the amendment admissible at N between the read and the lock (a
+//!    resume of an order on hold, a submit committing N), the engine reaches the guards, which
+//!    the refusal preparation never admits; the service then runs once more from step 2 and the
+//!    amendment proceeds (D-253);
 //! 4. the merge of the delta onto N ([`merge_with`]; added lines get fresh time-ordered ids,
 //!    handed out in ascending order so a recovery reproduces them from the frozen requests) and
 //!    the request facts of the seven versioning guards ([`AmendmentFacts`], Capture's one field
@@ -36,6 +40,7 @@
 //!    lines; when N is no longer current the commit names no content and the engine refuses by
 //!    precedence, burning the candidate (stale work is never rebased).
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bss_orders_sdk::OrdersError;
 use bss_orders_sdk::amend::AmendOrder;
@@ -114,20 +119,37 @@ impl AmendService {
         meta: &CallMeta,
         cancel: &CancellationToken,
     ) -> Result<Settled, OrdersError> {
-        Box::pin(self.amend_boxed(caller, order_id, request, meta, cancel)).await
+        // One pass, and a second one only when the first found the order amendable under the
+        // engine's lock although its read did not (module doc, step 3); a second race answers
+        // what the engine answered. Each pass is boxed so callers hold a small future.
+        if let Some(settled) =
+            Box::pin(self.pass(caller, order_id, &request, meta, cancel, true)).await?
+        {
+            return Ok(settled);
+        }
+        tracing::debug!(
+            target: "orders.amend",
+            order_id = %order_id,
+            "bss-orders: the order became amendable between the read and the lock; deciding again"
+        );
+        Box::pin(self.pass(caller, order_id, &request, meta, cancel, false))
+            .await?
+            .ok_or(OrdersError::Unavailable)
     }
 
-    /// [`Self::amend`]'s body, boxed once so callers hold a small future.
-    async fn amend_boxed(
+    /// Steps 1–7 (module doc) once. `None` only when `retry` is set and the engine reached the
+    /// guards of a refusal-only preparation, i.e. the locked order was amendable at N.
+    async fn pass(
         &self,
         caller: &Caller,
         order_id: Uuid,
-        request: AmendOrder,
+        request: &AmendOrder,
         meta: &CallMeta,
         cancel: &CancellationToken,
-    ) -> Result<Settled, OrdersError> {
+        retry: bool,
+    ) -> Result<Option<Settled>, OrdersError> {
         let engine = self.submit.engine()?;
-        let delta = AmendmentDelta::from_request(&request);
+        let delta = AmendmentDelta::from_request(request);
         let base_version = i32::from(meta.expected_version);
         // 1. The request, from the call alone.
         let transition = TransitionRequest {
@@ -136,7 +158,7 @@ impl AmendService {
             operation: OPERATION,
             expected_version: meta.expected_version,
             expected_draft_revision: None,
-            document: fingerprint_document(&request)?,
+            document: fingerprint_document(request)?,
             // Only the payer may move on an amendment; a named resource or seller is the
             // `tenant-axis-immutable` guard's, never a proposal.
             proposed: delta.header.payer_tenant_id.map(|payer| ArrangementDelta {
@@ -153,7 +175,7 @@ impl AmendService {
             .recover_commercial_attempt(caller, &transition)
             .await?
         {
-            Recovery::Replay(outcome) => return Ok(Settled::from_outcome(*outcome)),
+            Recovery::Replay(outcome) => return Ok(Some(Settled::from_outcome(*outcome))),
             Recovery::Existing(existing) => {
                 let (execution, frozen) = *existing;
                 return self
@@ -167,7 +189,8 @@ impl AmendService {
                         frozen,
                         cancel,
                     )
-                    .await;
+                    .await
+                    .map(Some);
             }
             Recovery::Miss => {}
         }
@@ -178,14 +201,21 @@ impl AmendService {
             .await?
             .filter(|s| s.version.version == base_version && amendable(s.state))
         else {
+            // The engine decides from the locked state; reaching any guard means the locked
+            // order is amendable at N, which this preparation never admits (module doc, step 3).
+            let reached = Arc::new(AtomicBool::new(false));
             let preparation = RefusalPreparation::proposed(
                 RefusalGate::NotRun,
                 RefusalSubject::Unread {
                     row: AMEND_ROW,
-                    passing: passing(&engine),
+                    passing: passing(&engine, &reached),
                 },
             );
-            return refuse(caller, &engine, transition, &preparation).await;
+            let refused = refuse(caller, &engine, transition, &preparation).await;
+            if retry && refused.is_err() && reached.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            return refused.map(Some);
         };
         // 4. The merge, the request facts and the local guards before any external call.
         let CommittedSnapshot {
@@ -220,7 +250,9 @@ impl AmendService {
         };
         if local.is_some() {
             let preparation = RefusalPreparation::proposed(RefusalGate::Precluded, subject);
-            return refuse(caller, &engine, transition, &preparation).await;
+            return refuse(caller, &engine, transition, &preparation)
+                .await
+                .map(Some);
         }
         // 5. The shared assessment over every proposed line.
         let lines = proposal.version.as_draft_lines();
@@ -239,7 +271,9 @@ impl AmendService {
         let assessed = self.submit.assess(caller, &assessing, meta, cancel).await?;
         if let Some(gate) = assessed.refusal(&assessing)? {
             let preparation = RefusalPreparation::proposed(gate, subject);
-            return refuse(caller, &engine, transition, &preparation).await;
+            return refuse(caller, &engine, transition, &preparation)
+                .await
+                .map(Some);
         }
         // 6. The D-188 attempt: reserve M, then phases B and C.
         let reserved = Box::pin(self.submit.reserve(
@@ -256,10 +290,12 @@ impl AmendService {
         ))
         .await?;
         let (execution, frozen) = match reserved {
-            PreparedExecution::Settled(outcome) => return Ok(Settled::from_outcome(*outcome)),
+            PreparedExecution::Settled(outcome) => {
+                return Ok(Some(Settled::from_outcome(*outcome)));
+            }
             PreparedExecution::Execution(execution) => *execution,
         };
-        let reason = request.reason;
+        let reason = request.reason.clone();
         self.submit
             .continue_with(
                 caller,
@@ -278,6 +314,7 @@ impl AmendService {
                 },
             )
             .await
+            .map(Some)
     }
 
     /// Step 7 (module doc): phases B and C of a recovered attempt over the same delta re-merged
@@ -409,15 +446,20 @@ enum Allocation {
 }
 
 /// Every guard of rows 18–20 bound passing: the binding contract of a refusal the engine settles
-/// by precedence before any guard (module doc, step 3).
-fn passing(engine: &Engine) -> GuardBindings {
+/// by precedence before any guard (module doc, step 3). Each records in `reached` that the engine
+/// evaluated it, i.e. found the locked order amendable at N.
+fn passing(engine: &Engine, reached: &Arc<AtomicBool>) -> GuardBindings {
     engine
         .registries()
         .guards
         .row_guards(RowId::of(AMEND_ROW))
         .iter()
         .fold(GuardBindings::new(), |bindings, guard| {
-            bindings.bind(guard.name, |_: &GuardSubject<'_>| GuardVerdict::Pass)
+            let reached = Arc::clone(reached);
+            bindings.bind(guard.name, move |_: &GuardSubject<'_>| {
+                reached.store(true, Ordering::SeqCst);
+                GuardVerdict::Pass
+            })
         })
 }
 
