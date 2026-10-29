@@ -489,7 +489,15 @@ fn history_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_orders.list_versions")
         .summary("List the order's committed versions")
         .description(
-            "One authorized keyset page of the committed version history in version order, read              from the stored version rows (never a chain walk or event replay): version, reason              (create, submit, amendment), actor, actor tenant, engine timestamp,              amendment_reason and supersedes_version. Reserved or burned candidate numbers are              gaps, never placeholder items. current_version and current_acceptance (absent: no              consent recorded) come from the same snapshot; the ETag is the current version.              Authorization is decided on the current order first: a reader without access gets              404 ORDER_NOT_FOUND, exactly as for a missing order. History permission is order              read; it does not grant audit-trail access.",
+            "One authorized keyset page of the committed version history in version order, read \
+            from the stored version rows (never a chain walk or event replay): version, reason \
+            (create, submit, amendment), actor, actor tenant, engine timestamp, \
+            amendment_reason and supersedes_version. Reserved or burned candidate numbers are \
+            gaps, never placeholder items. current_version and current_acceptance (absent: no \
+            consent recorded) come from the same snapshot; the ETag is the current version. \
+            Authorization is decided on the current order first: a reader without access gets \
+            404 ORDER_NOT_FOUND, exactly as for a missing order. History permission is order \
+            read; it does not grant audit-trail access.",
         )
         .tag(TAG)
         .authenticated()
@@ -508,7 +516,13 @@ fn history_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_orders.get_version")
         .summary("Read one committed version")
         .description(
-            "The exact committed version composed at that version from its stored rows: its              lines with the complete immutable commercial evidence and its persisted producer              totals (version 1, the empty draft, has neither). 404 VERSION_NOT_FOUND for an              authorized order that never committed the version, a reserved or burned candidate              included; 404 ORDER_NOT_FOUND for a missing or hidden order. A version that is not              a positive integer is 400 REQUEST_INVALID. No ETag: the version read is not              necessarily the current one. The administrative projection is not delivered.",
+            "The exact committed version composed at that version from its stored rows: its \
+            lines with the complete immutable commercial evidence and its persisted producer \
+            totals (version 1, the empty draft, has neither). 404 VERSION_NOT_FOUND for an \
+            authorized order that never committed the version, a reserved or burned candidate \
+            included; 404 ORDER_NOT_FOUND for a missing or hidden order. A version that is not \
+            a positive integer is 400 REQUEST_INVALID. No ETag: the version read is not \
+            necessarily the current one. The administrative projection is not delivered.",
         )
         .tag(TAG)
         .authenticated()
@@ -529,7 +543,11 @@ fn history_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_orders.get_acceptance")
         .summary("Read the order's consent")
         .description(
-            "The current version, its recorded consent (absent: none recorded) and one keyset              page of the prior versions' consent records in version order: accepted_version,              accepted_at, recorded_by, recording_path and requirement_source. Consent is per              version: an amended version starts without one. Internal recovery evidence is              never returned. The ETag is the current version.",
+            "The current version, its recorded consent (absent: none recorded) and one keyset \
+            page of the prior versions' consent records in version order: accepted_version, \
+            accepted_at, recorded_by, recording_path and requirement_source. Consent is per \
+            version: an amended version starts without one. Internal recovery evidence is \
+            never returned. The ETag is the current version.",
         )
         .tag(TAG)
         .authenticated()

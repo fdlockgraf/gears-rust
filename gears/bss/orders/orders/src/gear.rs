@@ -687,8 +687,8 @@ impl RestApiCapability for BssOrdersGear {
         // Only delivered, authorized handlers are mounted (the S2-12 census,
         // `crate::api::rest::DELIVERED_OPERATIONS`): the S2-09 draft authoring routes, bound to
         // the gateway caller zone and the edge limiter, the early S6-01/S6-04 read routes and
-        // the S4-06 history read routes (D-254). They answer unavailable until `serve` binds the engine and the read parts (no
-        // write or read before readiness).
+        // the S4-06 history read routes (D-254). They answer unavailable until `serve` binds the
+        // engine and the read parts (no write or read before readiness).
         // A gear whose init failed publishes no route, as it publishes no SDK client.
         let (Some(capture), Some(reads), Some(limiter)) = (
             self.capture.load_full(),

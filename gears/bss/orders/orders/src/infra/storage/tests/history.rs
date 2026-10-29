@@ -45,14 +45,16 @@ fn rule(id: &str, subject: u128, property: &str, value: Uuid) -> Value {
 }
 
 /// `order × read` only: history needs no audit permission.
-fn reads(f: &Fixture) -> ReadService {
-    let policy = json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s4-06",
+fn history_policy() -> Value {
+    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s4-06",
     "rules": [
         rule("buyer", BUYER.0, "resource_tenant_id", u(RESOURCE)),
         rule("seller", SELLER_READER.0, "seller_tenant_id", u(SELLER)),
         rule("payer", PAYER_READER.0, "payer_tenant_id", PAYER),
-    ]});
-    f.t.reads_with(RulesProvider::from_policy(policy))
+    ]})
+}
+fn reads(f: &Fixture) -> ReadService {
+    f.t.reads_with(RulesProvider::from_policy(history_policy()))
 }
 
 fn caller(who: (u128, u128)) -> Caller {
@@ -363,7 +365,11 @@ async fn sparse_1_4_7(f: &Fixture, tag: &str) -> Uuid {
 async fn burned_candidate_is_version_not_found() {
     let f = setup_with(two_line_fixture(), 10, true).await;
     let order = sparse_1_4_7(&f, "h-burn").await;
-    let reads = reads(&f);
+    let signals = Arc::new(super::reads::RecordingSignals::default());
+    let reads = f.t.reads_with_signals(
+        RulesProvider::from_policy(history_policy()),
+        Arc::clone(&signals) as Arc<dyn crate::infra::read::ReadSignals>,
+    );
     for number in [2, 3, 5, 6, 8, 2_147_483_647] {
         let error = reads
             .get_version(&buyer(), order, v(number))
@@ -376,6 +382,15 @@ async fn burned_candidate_is_version_not_found() {
             .unwrap_err();
         assert_eq!(refusal(&hidden), Reason::OrderNotFound, "{number}");
     }
+    // Every authorized `version-not-found` is counted as a refusal (D-254 item 4).
+    let counted = signals.refusals();
+    assert_eq!(
+        counted
+            .iter()
+            .filter(|(r, _)| *r == Reason::VersionNotFound)
+            .count(),
+        6
+    );
     for number in [1, 4, 7] {
         let read = reads.get_version(&buyer(), order, v(number)).await.unwrap();
         assert_eq!(i64::from(read.version), number);

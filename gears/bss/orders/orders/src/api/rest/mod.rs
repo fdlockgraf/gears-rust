@@ -1,7 +1,8 @@
 //! The REST boundary adapter: shared header/caller parsing and the delivered route groups.
 //! S2-09 mounts the five draft authoring routes, the early S6-01/S6-04 package the three draft
-//! read routes, S4-06 the three history read routes (D-254); S2-12 owns the pre-engine throttling ([`throttle`]) and the route census
-//! ([`DELIVERED_OPERATIONS`], [`validate_delivered`]). The REST error gear ([`error`]) and the
+//! read routes, S4-06 the three history read routes (D-254); S2-12 owns the pre-engine
+//! throttling ([`throttle`]) and the route census ([`DELIVERED_OPERATIONS`],
+//! [`validate_delivered`]). The REST error gear ([`error`]) and the
 //! generated wire bindings of the SDK catalog ([`wire`]) own every HTTP fact (D-219). The S3-11
 //! Preview route ([`gate`]) is mounted only in the development build (M2-1) and is not part of
 //! the census.

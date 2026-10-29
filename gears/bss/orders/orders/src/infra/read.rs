@@ -767,6 +767,7 @@ impl ReadService {
         let Some(stored) = snapshot.version.as_ref() else {
             self.served_point(&parts, caller, GET_VERSION_OPERATION, &snapshot.row)
                 .await?;
+            self.signals.refused(Reason::VersionNotFound, None);
             return Err(OrdersError::Refused(Reason::VersionNotFound));
         };
         let view = compose_version(&snapshot, stored)?;
