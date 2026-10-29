@@ -5,7 +5,9 @@
 //! [`validate_delivered`]). The REST error gear ([`error`]) and the
 //! generated wire bindings of the SDK catalog ([`wire`]) own every HTTP fact (D-219). The S3-11
 //! Preview route ([`gate`]) is mounted only in the development build (M2-1) and is not part of
-//! the census.
+//! the census; so are the submit, amendment ([`amend`]) and record-acceptance ([`acceptance`],
+//! D-255) routes.
+pub mod acceptance;
 pub mod amend;
 pub mod capture;
 pub mod dto;

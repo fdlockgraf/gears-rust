@@ -13,6 +13,7 @@
 // D-184: the crate-local clippy.toml disallows `AccessScope::allow_all`.
 #![deny(clippy::disallowed_methods)]
 
+pub mod acceptance;
 pub mod amend;
 pub mod api;
 pub mod authoring;

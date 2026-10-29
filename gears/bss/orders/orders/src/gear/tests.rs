@@ -508,6 +508,24 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
         crate::api::rest::problem(amended.unwrap_err()).status,
         Some(503)
     );
+    // Nor a record-acceptance service (S4-08b, D-255): not delivered (503).
+    let recorded = client
+        .record_acceptance(
+            &caller,
+            Uuid::from_u128(3),
+            bss_orders_sdk::acceptance::Acceptance,
+            CallMeta {
+                expected_version: OrderVersion::try_from(2)?,
+                idempotency_key: IdempotencyKey::try_from("key-accept".to_owned())?,
+                correlation_id: None,
+                delegation_proof_ref: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        crate::api::rest::problem(recorded.unwrap_err()).status,
+        Some(503)
+    );
     // S2-09 mounts exactly the five delivered authoring operations, the early-S6 package the
     // three draft read operations and S4-06 the three history reads (D-254); nothing else.
     let openapi = toolkit::api::OpenApiRegistryImpl::new();
@@ -545,6 +563,10 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
     assert!(
         document["paths"]["/bss-orders/v1/orders/{orderId}/amendments"].is_null(),
         "the amendment route is absent without the development delivery"
+    );
+    assert!(
+        document["paths"]["/bss-orders/v1/orders/{orderId}/acceptance"]["post"].is_null(),
+        "the record-acceptance route is absent without the development delivery"
     );
     assert_delivered_census(&router, &openapi, &document, &operations, &caller).await?;
     // Before `serve` binds the engine the routes answer unavailable: no write before readiness.
@@ -1505,6 +1527,109 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             "{headers:?} {body}"
         );
     }
+    // S4-08b (D-255): the record-acceptance route is mounted under the same development
+    // delivery beside the delivered GET on the same path, outside the census.
+    let accept_route = crate::api::rest::wire::route("record_acceptance").unwrap();
+    assert_eq!(
+        accept_route.path,
+        "/bss-orders/v1/orders/{orderId}/acceptance"
+    );
+    let accept_doc = &document["paths"][accept_route.path]["post"];
+    assert_eq!(
+        accept_doc["operationId"],
+        json!("bss_orders.record_acceptance")
+    );
+    assert_eq!(accept_doc["requestBody"]["required"], json!(true));
+    assert!(
+        document["paths"][accept_route.path]["get"].is_object(),
+        "the delivered read keeps its GET"
+    );
+    let params: Vec<_> = accept_doc["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    for name in [
+        "orderid",
+        "if-match",
+        "idempotency-key",
+        "x-delegation-proof-ref",
+    ] {
+        assert!(params.contains(&name.to_owned()), "{name} in {params:?}");
+    }
+    for status in ["200", "400", "412", "428", "429", "503"] {
+        assert!(accept_doc["responses"][status].is_object(), "{status}");
+    }
+    assert!(!crate::api::rest::DELIVERED_OPERATIONS.contains(&"record_acceptance"));
+    let accept_path = accept_route
+        .path
+        .replace("{orderId}", &Uuid::from_u128(3).to_string());
+    let accept = |headers: &[(&str, &str)], body: &'static str| {
+        let mut request =
+            axum::http::Request::post(&accept_path).header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(axum::body::Body::from(body)).unwrap();
+        tower::ServiceExt::oneshot(
+            router.clone().layer(axum::Extension(caller.clone())),
+            request,
+        )
+    };
+    for (headers, body, error) in [
+        // No If-Match: 428 before the key, the body and the service.
+        (
+            &[key][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // An unparseable If-Match is the same 428.
+        (
+            &[("if-match", "2"), key][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // If-Match without an Idempotency-Key: the key is enforced before the service.
+        (
+            &[if_match][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A caller-supplied timestamp is an unknown key, refused at the boundary.
+        (
+            &[if_match, key][..],
+            r#"{"accepted_at":"2020-01-01T00:00:00Z"}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // So is any other member, and a body that is not an object.
+        (
+            &[if_match, key][..],
+            r#"{"x":1}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        (
+            &[if_match, key][..],
+            "[]",
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A well-formed request reaches the service: unavailable before `serve`.
+        (
+            &[if_match, key][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+    ] {
+        let response = accept(headers, body).await?;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            answered(status, &bytes),
+            expect(error),
+            "{headers:?} {body}"
+        );
+    }
+
     // The local client decides the same well-formedness before any authority or store work,
     // and a well-formed request reaches the same service.
     let client = hub.get::<dyn OrdersV1>()?;
@@ -1537,6 +1662,18 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             Uuid::from_u128(3),
             serde_json::from_str(amend_valid)?,
             call("k-local-2")?,
+        )
+        .await;
+    assert!(
+        matches!(local, Err(bss_orders_sdk::OrdersError::Unavailable)),
+        "{local:?}"
+    );
+    let local = client
+        .record_acceptance(
+            &caller,
+            Uuid::from_u128(3),
+            bss_orders_sdk::acceptance::Acceptance,
+            call("k-local-3")?,
         )
         .await;
     assert!(

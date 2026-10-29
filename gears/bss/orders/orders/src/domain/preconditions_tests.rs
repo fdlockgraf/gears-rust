@@ -100,3 +100,107 @@ fn source_tokens_are_the_acceptance_check_vocabulary() {
     }
     assert_eq!(SELF_SERVICE, "self_service");
 }
+
+// ---- S4-08b: the recording-party bar (05 §3.2 steps 1-2, *Record Acceptance* step 4) ----
+
+/// A role version appended by `actor` from `tenant`.
+fn role(actor: &str, tenant: Uuid) -> RoleActor {
+    RoleActor {
+        actor: actor.to_owned(),
+        actor_tenant_id: tenant,
+    }
+}
+
+/// Every role taken by someone other than the caller, on the resource tenant.
+fn others(resource: Uuid) -> RoleVersions {
+    RoleVersions {
+        creator: role("creator", resource),
+        submitter: role("submitter", resource),
+        amender: Some(role("amender", resource)),
+    }
+}
+
+/// The full truth table: creator, submitter and amender, each with the caller's identity or
+/// another one, on both sales paths, appended from the resource tenant or another tenant. The
+/// caller is barred exactly when that role's identity matches AND (the order is partner-placed
+/// OR that role's actor tenant differs from the resource tenant).
+#[test]
+fn the_recording_party_bar_truth_table() {
+    let (resource, partner) = (tenant(10), tenant(11));
+    let caller = "caller";
+    for which in ["creator", "submitter", "amender"] {
+        for same_identity in [true, false] {
+            for path in [SalesPath::SelfService, SalesPath::PartnerPlaced] {
+                for actor_tenant in [resource, partner] {
+                    let mut roles = others(resource);
+                    let taken = role(if same_identity { caller } else { "someone" }, actor_tenant);
+                    match which {
+                        "creator" => roles.creator = taken,
+                        "submitter" => roles.submitter = taken,
+                        _ => roles.amender = Some(taken),
+                    }
+                    let expected = same_identity
+                        && (path == SalesPath::PartnerPlaced || actor_tenant != resource);
+                    assert_eq!(
+                        recording_party_barred(caller, path, resource, &roles),
+                        expected,
+                        "{which} same={same_identity} {path:?} tenant={actor_tenant}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The bar is per role: a resource-tenant creator of a self-service order is not barred because
+/// a delegate of another tenant submitted it; the delegate is.
+#[test]
+fn a_resource_tenant_creator_is_not_barred_by_a_delegated_submit() {
+    let (resource, partner) = (tenant(10), tenant(11));
+    let roles = RoleVersions {
+        creator: role("customer", resource),
+        submitter: role("delegate", partner),
+        amender: None,
+    };
+    assert!(!recording_party_barred(
+        "customer",
+        SalesPath::SelfService,
+        resource,
+        &roles
+    ));
+    assert!(recording_party_barred(
+        "delegate",
+        SalesPath::SelfService,
+        resource,
+        &roles
+    ));
+    // On a partner-placed order every role actor is barred, even one on the resource tenant.
+    assert!(recording_party_barred(
+        "customer",
+        SalesPath::PartnerPlaced,
+        resource,
+        &roles
+    ));
+    // Nobody who took no role is barred, on either path.
+    for path in [SalesPath::SelfService, SalesPath::PartnerPlaced] {
+        assert!(!recording_party_barred("bystander", path, resource, &roles));
+    }
+}
+
+/// Only the current version's amendment counts: an order without one is decided on the creator
+/// and the submitter alone.
+#[test]
+fn without_an_amendment_only_creator_and_submitter_count() {
+    let resource = tenant(10);
+    let roles = RoleVersions {
+        creator: role("a", resource),
+        submitter: role("b", resource),
+        amender: None,
+    };
+    assert!(!recording_party_barred(
+        "c",
+        SalesPath::PartnerPlaced,
+        resource,
+        &roles
+    ));
+}

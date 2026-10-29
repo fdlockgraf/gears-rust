@@ -231,3 +231,25 @@ fn amend_request_round_trips_and_rejects_unknown_keys() {
     unknown_op["lines"][2]["op"] = serde_json::json!("replace");
     assert!(serde_json::from_value::<AmendOrder>(unknown_op).is_err());
 }
+
+/// S4-08b (`models.json` `Acceptance`, D-255): the record-acceptance body has no member. The
+/// instant and the recording actor are server facts, so a caller-supplied timestamp or actor is
+/// an unknown member the wire refuses.
+#[test]
+fn the_acceptance_body_carries_no_member() {
+    use bss_orders_sdk::acceptance::Acceptance;
+    let body: Acceptance = serde_json::from_str("{}").unwrap();
+    assert_eq!(serde_json::to_value(body).unwrap(), serde_json::json!({}));
+    for refused in [
+        r#"{"accepted_at":"2026-10-29T10:00:00Z"}"#,
+        r#"{"recorded_by":"00000000-0000-0000-0000-000000000066"}"#,
+        r#"{"accepted_version":2}"#,
+        "[]",
+        "null",
+    ] {
+        assert!(
+            serde_json::from_str::<Acceptance>(refused).is_err(),
+            "{refused}"
+        );
+    }
+}

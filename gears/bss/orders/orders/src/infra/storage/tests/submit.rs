@@ -3077,7 +3077,7 @@ async fn sdk_preview_and_submit_refuse_a_credential_bearing_proof_before_the_pdp
 // ---- S4-08a: automatic consent on a self-service submit (D-146, D-251) ----
 
 /// The fixture with the referenced contract's `acceptance_required` stated as `required`.
-fn contract_fixture(required: Option<bool>) -> StubFixture {
+pub(super) fn contract_fixture(required: Option<bool>) -> StubFixture {
     let mut stubs = fixture();
     stubs
         .contracts
@@ -3129,7 +3129,7 @@ pub(super) async fn transition_instant(f: &Fixture, order: Uuid, version: i64) -
 }
 
 /// Store an `acceptance_required` election (the policy channel's write, as the admin).
-async fn elect(f: &Fixture, seller: Option<Uuid>, elected: bool) {
+pub(super) async fn elect(f: &Fixture, seller: Option<Uuid>, elected: bool) {
     let (scope, scope_id) = match seller {
         Some(id) => ("seller", format!("'{id}'")),
         None => ("platform", "NULL".to_owned()),

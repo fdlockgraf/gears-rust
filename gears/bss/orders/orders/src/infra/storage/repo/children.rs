@@ -209,6 +209,21 @@ pub async fn acceptance_for_order(
         .all(runner)
         .await
 }
+/// The consent of exactly the committed `version`, if one is recorded (D-255).
+pub async fn acceptance(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Option<entity::acceptance::Model>, ScopeError> {
+    entity::acceptance::Entity::find_by_id((id, version))
+        .inner_join(order::Entity)
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .one(runner)
+        .await
+}
 pub async fn approval_reflection_for_order(
     runner: &impl DBRunner,
     scope: &AccessScope,

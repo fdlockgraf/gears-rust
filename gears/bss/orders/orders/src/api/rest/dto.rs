@@ -397,6 +397,17 @@ pub struct OrdersAmendOrder {
     pub lines: Vec<OrdersAmendLine>,
 }
 
+/// Record-acceptance body (S4-08b, `models.json` `Acceptance`): an empty object. The instant
+/// and the recording actor are server facts; the route decodes the body with the SDK's strict
+/// `Acceptance`, so this type only documents the schema.
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "the OpenAPI schema of an empty JSON object; a unit struct documents `null`"
+)]
+pub struct OrdersAcceptance {}
+
 /// Optional line `DELETE` body.
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]

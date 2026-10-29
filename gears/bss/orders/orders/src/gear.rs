@@ -102,6 +102,9 @@ pub struct BssOrdersGear {
     /// The amendment service (S4-03/S4-04), under the same development-delivery condition; the
     /// REST route and the local SDK delegate to it, `None` in every other build.
     amend: ArcSwapOption<crate::infra::amend::AmendService>,
+    /// The record-acceptance service (S4-08b, D-255), under the same development-delivery
+    /// condition; the REST route and the local SDK delegate to it, `None` in every other build.
+    acceptance: ArcSwapOption<crate::infra::acceptance::AcceptanceService>,
 }
 
 /// Submit's development acceptance double (M2-6): with the `gate-dev-stubs` feature and the stubs
@@ -132,6 +135,33 @@ fn dev_acceptance(
     _hub: Arc<toolkit::ClientHub>,
 ) -> Option<Arc<dyn bss_pricing_sdk::acceptance::SellabilityV1>> {
     None
+}
+
+/// The services that ride the submit service's development delivery (D-231): the amendment
+/// service runs the submit pipeline (S4-03/S4-04), and recording consent after submit (S4-08b,
+/// D-255) reads its requirement through the gate's contract port (the development stub here,
+/// fail-closed otherwise) and the policy elections. Both `None` without the submit service.
+fn dev_writes(
+    submit: Option<&Arc<crate::infra::gate::submit::SubmitService>>,
+    engine: &Arc<ArcSwapOption<crate::infra::engine::Engine>>,
+    gate: &crate::infra::gate::GatePorts,
+    db: &toolkit_db::Db,
+) -> (
+    Option<Arc<crate::infra::amend::AmendService>>,
+    Option<Arc<crate::infra::acceptance::AcceptanceService>>,
+) {
+    let Some(submit) = submit else {
+        return (None, None);
+    };
+    let amend = Arc::new(crate::infra::amend::AmendService::new(Arc::clone(submit)));
+    let acceptance = Arc::new(crate::infra::acceptance::AcceptanceService::new(
+        Arc::clone(engine),
+        crate::infra::acceptance::RequirementResolver::new(
+            Arc::clone(&gate.contracts),
+            Some(db.clone()),
+        ),
+    ));
+    (Some(amend), Some(acceptance))
 }
 
 /// M2-1: the gate's development delivery switch. Both the `gate-dev-stubs` feature and
@@ -168,6 +198,7 @@ impl Default for BssOrdersGear {
             preview: ArcSwapOption::from(None),
             submit: ArcSwapOption::from(None),
             amend: ArcSwapOption::from(None),
+            acceptance: ArcSwapOption::from(None),
         }
     }
 }
@@ -620,11 +651,7 @@ impl Gear for BssOrdersGear {
                 ))
             })
             .transpose()?;
-        // S4-03/S4-04 (D-231): the amendment service runs the submit pipeline, so it rides the
-        // submit service's development delivery.
-        let amend = submit
-            .as_ref()
-            .map(|submit| Arc::new(crate::infra::amend::AmendService::new(Arc::clone(submit))));
+        let (amend, acceptance) = dev_writes(submit.as_ref(), &self.engine, &gate, &runtime.db);
         let throttle = runtime._config.throttle_settings()?;
         // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows and
         // policy elections (S4-07, D-250) with the deployment, and startup refuses a missing or
@@ -657,7 +684,8 @@ impl Gear for BssOrdersGear {
                 )
                 .with_preview(preview.clone())
                 .with_submit(submit.clone())
-                .with_amend(amend.clone()),
+                .with_amend(amend.clone())
+                .with_acceptance(acceptance.clone()),
             ));
         self.limiter
             .store(Some(crate::infra::throttle::PerOrderLimiter::new(throttle)));
@@ -666,6 +694,7 @@ impl Gear for BssOrdersGear {
         self.preview.store(preview);
         self.submit.store(submit);
         self.amend.store(amend);
+        self.acceptance.store(acceptance);
         self.capture.store(Some(capture));
         self.reads.store(Some(reads));
         self.runtime.store(Some(runtime));
@@ -718,7 +747,15 @@ impl RestApiCapability for BssOrdersGear {
             ));
             if let Some(amend) = self.amend.load_full() {
                 router = router.merge(crate::api::rest::amend::amend_router(
-                    amend, limiter, openapi,
+                    amend,
+                    Arc::clone(&limiter),
+                    openapi,
+                ));
+            }
+            // S4-08b (D-255): POST beside the delivered GET on the same path.
+            if let Some(acceptance) = self.acceptance.load_full() {
+                router = router.merge(crate::api::rest::acceptance::acceptance_router(
+                    acceptance, limiter, openapi,
                 ));
             }
         }

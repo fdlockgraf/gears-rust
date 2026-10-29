@@ -266,6 +266,8 @@ mod roles;
 mod workers;
 
 #[cfg(feature = "gate-dev-stubs")]
+mod acceptance;
+#[cfg(feature = "gate-dev-stubs")]
 mod administrative;
 #[cfg(feature = "gate-dev-stubs")]
 mod amend;

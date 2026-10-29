@@ -148,6 +148,23 @@ pub struct PreparationView {
     pub draft_lines: Vec<draft_content::Model>,
     /// A recovered D-188/D-198 execution's frozen inputs, loaded before any fresh assessment.
     pub frozen: Option<Frozen>,
+    /// The attempt's trusted actor, as the audit, version and consent rows record it.
+    pub actor: AuditActor,
+    /// Record-acceptance only (row 25, D-255): the stored facts the recording-party bar reads.
+    pub recording: Option<RecordingFacts>,
+}
+
+/// The stored facts of the recording-party bar (05 §3.2 step 1, D-255), read in the engine's
+/// authorized snapshot under the authorized scope: the immutable sales path and every committed
+/// version row (each names its appending actor and reason). Committed version rows are never
+/// changed, and the engine checks under the lock that the expected version is still current
+/// before any guard, so a bar decided from them equals one decided under the lock (D-252 item 3).
+#[derive(Debug, Clone)]
+pub struct RecordingFacts {
+    /// `orders_order.sales_path`, fixed at create (D-106, D-140).
+    pub sales_path: SalesPath,
+    /// Every committed version row, ascending by version.
+    pub versions: Vec<order_version::Model>,
 }
 
 /// Slice input resolution failure that is not an unresolvable guard input.
@@ -490,6 +507,8 @@ impl Engine {
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
             frozen: None,
+            actor,
+            recording: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
         let create = Arc::new(CreateAttempt {
@@ -640,7 +659,7 @@ impl Engine {
         };
         let disclosure = self.disclosure(caller, request.trigger).await?;
         let view = match self
-            .snapshot(&target, AbortContext::of(&request), frozen)
+            .snapshot(&target, AbortContext::of(&request), frozen, actor)
             .await?
         {
             Ok(view) => view,
@@ -761,6 +780,8 @@ impl Engine {
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
             frozen: None,
+            actor,
+            recording: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
         let attempt = Arc::new(Attempt {
@@ -1353,6 +1374,7 @@ impl Engine {
         target: &TargetAuthorization,
         context: AbortContext,
         frozen: Option<Frozen>,
+        actor: AuditActor,
     ) -> Result<Result<PreparationView, Reason>, EngineError> {
         let trigger = context.trigger;
         let target = target.clone();
@@ -1393,11 +1415,23 @@ impl Engine {
                     } else {
                         Vec::new()
                     };
+                    let recording = if trigger == Trigger::RecordAcceptance {
+                        Some(RecordingFacts {
+                            sales_path: SalesPath::from_token(&row.sales_path)
+                                .ok_or(Abort::Integration("stored sales path"))?,
+                            versions: children::versions(tx, target.access_scope(), row.order_id)
+                                .await?,
+                        })
+                    } else {
+                        None
+                    };
                     Ok::<_, Abort>(Ok(PreparationView {
                         facts: aggregate_facts(&row)?,
                         prepared_draft_revision: draft.then_some(row.draft_revision),
                         draft_lines,
                         frozen,
+                        actor,
+                        recording,
                     }))
                 })
             })
@@ -2472,6 +2506,11 @@ async fn existing_body<'a>(
         (Trigger::AdministrativeEdit, Some(_)) => locked_line_ids(&locked, &facts).await?,
         _ => Vec::new(),
     };
+    // Row 25: whether the locked current version already has a consent, read under this lock
+    // (D-255), so of two independent recordings of one version only the first is admitted and
+    // the second is refused `acceptance-already-recorded`, never a key violation.
+    let acceptance_recorded = a.trigger == Trigger::RecordAcceptance
+        && locked_acceptance_recorded(&locked, &facts).await?;
     let registries = &inner.registries;
     let decision = transition::decide_with(
         &registries.table,
@@ -2485,6 +2524,7 @@ async fn existing_body<'a>(
         t,
         &administrative,
         &admin_lines,
+        acceptance_recorded,
     )?;
     let execution_id = owned.record().execution_id;
     let settle = Settle {
@@ -3166,6 +3206,20 @@ async fn locked_line_ids<'a>(
     } else {
         children::committed_line_ids(locked.transaction(), &scope, id, facts.current_version).await
     }
+}
+
+/// Whether the locked current version has a consent row (row 25, D-255).
+async fn locked_acceptance_recorded<'a>(
+    locked: &LockedOrder<'a, DbTx<'a>>,
+    facts: &AggregateFacts,
+) -> Result<bool, ScopeError> {
+    let id = locked.row().order_id;
+    let scope = toolkit_security::AccessScope::for_resources(vec![id]);
+    Ok(
+        children::acceptance(locked.transaction(), &scope, id, facts.current_version)
+            .await?
+            .is_some(),
+    )
 }
 
 /// Row 3's named changes reconciled with the administrative values stored at this locked read.

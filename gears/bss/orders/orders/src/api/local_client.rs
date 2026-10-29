@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use super::rest::error::RefusalEnvelope;
 use crate::authz::Caller;
+use crate::infra::acceptance::AcceptanceService;
 use crate::infra::amend::AmendService;
 use crate::infra::capture::{CaptureService, Settled, SettledOutcome, WriteMeta};
 use crate::infra::diagnostics::serde_category;
@@ -41,6 +42,8 @@ pub struct LocalOrdersClient {
     submit: Option<Arc<SubmitService>>,
     /// The amendment service (S4-03), present only in the same development delivery.
     amend: Option<Arc<AmendService>>,
+    /// The record-acceptance service (S4-08b), present only in the same development delivery.
+    acceptance: Option<Arc<AcceptanceService>>,
 }
 impl LocalOrdersClient {
     /// A client over the shared capture and read services; Preview and submit undelivered.
@@ -52,6 +55,7 @@ impl LocalOrdersClient {
             preview: None,
             submit: None,
             amend: None,
+            acceptance: None,
         }
     }
 
@@ -76,6 +80,14 @@ impl LocalOrdersClient {
     #[must_use]
     pub fn with_amend(mut self, amend: Option<Arc<AmendService>>) -> Self {
         self.amend = amend;
+        self
+    }
+
+    /// Deliver record-acceptance through `acceptance` (the gear passes `Some` only in the
+    /// development delivery, D-231, D-255).
+    #[must_use]
+    pub fn with_acceptance(mut self, acceptance: Option<Arc<AcceptanceService>>) -> Self {
+        self.acceptance = acceptance;
         self
     }
 }
@@ -323,6 +335,27 @@ impl OrdersV1 for LocalOrdersClient {
         sdk_result(
             service
                 .amend(&caller, order_id, request, &meta, &CancellationToken::new())
+                .await?,
+        )
+    }
+    async fn record_acceptance(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::acceptance::Acceptance,
+        meta: CallMeta,
+    ) -> Result<TransitionResult, OrdersError> {
+        // Production: recording consent after submit is Stage 4 (S4-08b), development-delivered
+        // like amendment (D-231, D-255).
+        let Some(service) = &self.acceptance else {
+            return Err(not_delivered("record_acceptance (S4-08b)").into());
+        };
+        // D-202 before any PDP or store work, as on the REST header path. The body has no
+        // member, so it has nothing further to check.
+        let caller = Caller::from_meta(ctx, meta.delegation_proof_ref.as_ref())?;
+        sdk_result(
+            service
+                .record(&caller, order_id, request, &meta, &CancellationToken::new())
                 .await?,
         )
     }

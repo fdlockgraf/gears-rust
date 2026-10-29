@@ -105,6 +105,7 @@ fn guards_refuse_in_contract_order() {
             OffsetDateTime::from_unix_timestamp(1_790_000_100).unwrap(),
             administrative,
             lines,
+            false,
         )
         .unwrap();
         match d {

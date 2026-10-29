@@ -1,22 +1,6 @@
 // Internal capability and scoped adapters are consumed by the engine, draft service, reads and
 // workers (S2-04/09/11, S6-01). Business operations remain unavailable until they are delivered.
-/// The one consent-requirement resolver (S4-08).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only submit's `requirement_for` has a caller until record-acceptance (S4-12) \
-                  and begin-fulfillment (S4-13) use the live read and `tolerate_failure`"
-    )
-)]
-#[cfg_attr(
-    test,
-    allow(
-        dead_code,
-        reason = "the unit tests reach only part of the resolver, so whether the lint fires \
-                  differs per test target; `expect` cannot be verified there"
-    )
-)]
+/// The one consent-requirement resolver (S4-08) and the record-acceptance service (S4-08b).
 pub mod acceptance;
 /// Amendment service (S4-03 stub; S4-04 delivers it).
 pub mod amend;

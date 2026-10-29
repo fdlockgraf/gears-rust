@@ -1,9 +1,11 @@
-//! Acceptance preconditions (05 §4.1–4.2; S4-08; D-146, D-251): who consents automatically on a
-//! submit, whether consent is required and the source a recorded consent carries.
+//! Acceptance preconditions (05 §4.1–4.2; S4-08; D-146, D-251, D-255): who consents automatically
+//! on a submit, whether consent is required, the source a recorded consent carries and who is
+//! barred from recording the customer's consent after submit.
 //!
 //! Pure rules over already-resolved facts. The caller supplies the live contract's
 //! `acceptance_required` and the seller and platform elections as read (`None` = no row); a read
 //! that failed never reaches these rules (it answers `unavailable`, never a default).
+use bss_orders_sdk::authoring::SalesPath;
 use serde::{Deserialize, Serialize};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -98,6 +100,57 @@ pub fn recorded_source(requirement: Requirement) -> RequirementSource {
         Requirement::Required(source) => source,
         Requirement::NotRequired => RequirementSource::Volunteered,
     }
+}
+
+/// Who appended one stored role version (`orders_order_version.actor`, `actor_tenant_id`).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleActor {
+    /// The appending actor's reference (D-103: the lowercase hyphenated subject UUID).
+    pub actor: String,
+    /// The appending actor's trusted subject tenant.
+    pub actor_tenant_id: Uuid,
+}
+
+/// The role versions the recording-party bar reads (05 §3.2 step 1): the creator (version 1,
+/// reason `create`), the actual submit version and, when the current version was appended by an
+/// amendment, its amender.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleVersions {
+    /// Version 1's appender.
+    pub creator: RoleActor,
+    /// The submit version's appender.
+    pub submitter: RoleActor,
+    /// The current version's appender when its reason is `amendment`; `None` otherwise.
+    pub amender: Option<RoleActor>,
+}
+
+/// The recording-party bar (05 §3.2 step 2, *Record Acceptance* step 4; D-130, D-146): `caller`
+/// (the trusted actor's reference) is barred when, for any one role version, it is that version's
+/// actor **and** either the order is `partner_placed` or that version's actor tenant is not the
+/// resource tenant. Each role is decided on its own, so a resource-tenant creator is not barred
+/// because a delegate submitted; `self_service` alone never admits a role actor of another
+/// tenant.
+#[must_use]
+pub fn recording_party_barred(
+    caller: &str,
+    sales_path: SalesPath,
+    resource_tenant_id: Uuid,
+    roles: &RoleVersions,
+) -> bool {
+    [
+        Some(&roles.creator),
+        Some(&roles.submitter),
+        roles.amender.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|role| {
+        role.actor == caller
+            && (sales_path == SalesPath::PartnerPlaced
+                || role.actor_tenant_id != resource_tenant_id)
+    })
 }
 
 /// Tolerating a failed authorization (S4-10, its first caller): seller election, then

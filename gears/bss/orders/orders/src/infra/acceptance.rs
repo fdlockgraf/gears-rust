@@ -1,22 +1,47 @@
 //! The consent requirement, resolved once (S4-08, D-251): submit, recording an acceptance and
-//! begin-fulfillment all ask this resolver, so the precedence cannot drift between them.
+//! begin-fulfillment all ask this resolver, so the precedence cannot drift between them. The
+//! record-acceptance service ([`AcceptanceService`], S4-08b, D-255) lives here too.
 //!
 //! Requirement: the contract the order references, then the seller's `acceptance_required`
 //! election, then the platform's, then unset = required. Tolerance of a failed authorization
 //! (S4-10): the seller's election, then the platform's, then unset = false. An election is read
 //! only when the earlier term is silent. A missing or failed read is `Unavailable`, never a
 //! default.
+use crate::authz::Caller;
+use crate::domain::contributions::AggregateContribution;
 use crate::domain::gate::answers::ContractQuery;
 use crate::domain::gate::ports::PortAnswer;
-use crate::domain::preconditions::{Requirement, acceptance_requirement, tolerate_failure};
-use crate::infra::engine::PrepareError;
+use crate::domain::guards::InputPort;
+use crate::domain::preconditions::{
+    Requirement, RequirementSource, RoleActor, RoleVersions, acceptance_requirement,
+    recorded_source, recording_party_barred, tolerate_failure,
+};
+use crate::domain::state_table::StateTable;
+use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, InputState, Inputs};
+use crate::infra::capture::{Settled, fingerprint_document};
+use crate::infra::engine::documents::EventEnqueue;
+use crate::infra::engine::{
+    ChildDocuments, DocumentWriter, Engine, EventSpec, Preparation, PreparationView, PrepareError,
+    Prepared, TransitionRequest,
+};
+use crate::infra::events::EventEnqueueError;
+use crate::infra::events::payload::OrderAcceptanceRecorded;
 use crate::infra::gate::budget::RunBudget;
 use crate::infra::gate::ports::ContractReads;
 use crate::infra::gate::unavailable::ContractsUnavailable;
 use crate::infra::policy::{self, Election, PolicyScope};
+use crate::infra::storage::entity::{acceptance, order_version};
+use arc_swap::ArcSwapOption;
+use async_trait::async_trait;
+use bss_orders_sdk::OrdersError;
+use bss_orders_sdk::acceptance::Acceptance;
+use bss_orders_sdk::authoring::SalesPath;
+use bss_orders_sdk::catalog::{Reason, Trigger};
+use bss_orders_sdk::models::CallMeta;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use toolkit_db::Db;
+use toolkit_db::secure::ScopeError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -170,6 +195,269 @@ impl RequirementResolver {
             );
             PrepareError::Unavailable
         })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recording the customer's consent after submit (S4-08b; 05 *Record Acceptance*; D-255)
+
+/// The public catalog operation a recording fingerprints under.
+const OPERATION: &str = "record_acceptance";
+/// Row 25's guards, in registration order.
+const NOT_RECORDED: &str = "preconditions.acceptance-not-recorded";
+const RECORDING_PARTY: &str = "preconditions.recording-party";
+
+/// The record-acceptance service: the one service REST and the local SDK share.
+///
+/// [`Self::record`] builds the row-25 [`TransitionRequest`] from the call alone (operation
+/// `record_acceptance`, the caller's `If-Match` as the expected version, the empty body as the
+/// fingerprint document) and hands the engine a [`RecordPreparation`]. The engine authorizes
+/// `acceptance × record` on the target (resource-tenant membership is the PDP's), replays a
+/// settled key, takes the authorized snapshot with the
+/// [`RecordingFacts`](crate::infra::engine::RecordingFacts) and the trusted actor, then decides
+/// state, version and the two guards under the aggregate lock.
+pub struct AcceptanceService {
+    engine: Arc<ArcSwapOption<Engine>>,
+    resolver: RequirementResolver,
+}
+
+impl AcceptanceService {
+    /// A service over the engine slot and the consent-requirement resolver (the gate's
+    /// contract port for the live contract read, the policy store for the elections).
+    #[must_use]
+    pub fn new(engine: Arc<ArcSwapOption<Engine>>, resolver: RequirementResolver) -> Self {
+        Self { engine, resolver }
+    }
+
+    /// Record the caller's consent to the committed version `meta.expected_version` of
+    /// `order_id`. The boundary has already refused a body with any member and a missing
+    /// `If-Match`.
+    ///
+    /// # Errors
+    /// The engine's unsettled refusals (denial, `precondition-failed` race evidence,
+    /// `idempotency-mismatch`, `still-processing`); `Unavailable` when the engine is not bound;
+    /// `Integration` for a broken contract. A business refusal is settled and returned as `Ok`.
+    pub async fn record(
+        &self,
+        caller: &Caller,
+        order_id: Uuid,
+        request: Acceptance,
+        meta: &CallMeta,
+        cancel: &CancellationToken,
+    ) -> Result<Settled, OrdersError> {
+        let engine = self.engine.load_full().ok_or(OrdersError::Unavailable)?;
+        let transition = TransitionRequest {
+            order_id,
+            trigger: Trigger::RecordAcceptance,
+            operation: OPERATION,
+            expected_version: meta.expected_version,
+            expected_draft_revision: None,
+            document: fingerprint_document(&request)?,
+            proposed: None,
+            caller_reason: None,
+            idempotency_key: meta.idempotency_key.clone(),
+            correlation_id: meta.correlation_id,
+            execution: None,
+        };
+        let preparation = RecordPreparation {
+            resolver: &self.resolver,
+            table: &engine.registries().table,
+            ctx: caller.ctx(),
+            expected_version: i32::from(meta.expected_version),
+            cancel,
+        };
+        let outcome = engine.transition(caller, transition, &preparation).await?;
+        Ok(Settled::from_outcome(outcome))
+    }
+}
+
+/// Row 25's preparation (05 *Record Acceptance* steps 2-6, D-255), from the engine's authorized
+/// snapshot:
+///
+/// 1. the role versions of the expected version ([`role_versions`]): version 1 (`create`), the
+///    actual submit version and, when the expected version was appended by an amendment, that
+///    version. When the snapshot cannot be admitted (a state outside row 25, a current version
+///    other than the expected one, or a role version it does not hold) the engine refuses by
+///    precedence before any guard (`not-admissible`, `precondition-failed`); nothing external is
+///    read, and should the guards be reached after all (a version committed between the snapshot
+///    and the lock) the input is unresolvable, so the attempt refuses
+///    `acceptance-requirement-unevaluable` and never records on unread facts;
+/// 2. the recording-party bar over the trusted actor's reference
+///    ([`AuditActor::reference`](crate::domain::audit::AuditActor::reference), the spelling of
+///    `order_version.actor`) and the stored sales path. A barred caller records
+///    nothing, so its requirement is not read: the bar is decided from stored facts and is never
+///    masked by an outage (D-113; the guard registry declares the input on this guard for that
+///    order);
+/// 3. otherwise the live requirement ([`RequirementResolver::requirement`], the live contract
+///    for a contract-bound order, then the elections); unavailable is the unresolvable input
+///    `acceptance-requirement-unevaluable` (503), never a default. Not required records
+///    `volunteered`;
+/// 4. the guards: already-recorded over the engine's locked read, then the bar; the documents
+///    (one consent row at the locked current version, the engine's transition time, the trusted
+///    actor, the stored sales path and the source) and exactly one `OrderAcceptanceRecorded`.
+///    The row is state-only: no version, no state change.
+struct RecordPreparation<'a> {
+    resolver: &'a RequirementResolver,
+    table: &'a StateTable,
+    ctx: &'a SecurityContext,
+    expected_version: i32,
+    cancel: &'a CancellationToken,
+}
+
+/// The role versions of `expected` among `versions` (05 §3.2 step 1); `None` when version 1,
+/// the submit version or the expected version itself is not among them.
+fn role_versions(versions: &[order_version::Model], expected: i32) -> Option<RoleVersions> {
+    let actor = |row: &order_version::Model| RoleActor {
+        actor: row.actor.clone(),
+        actor_tenant_id: row.actor_tenant_id,
+    };
+    let creator = versions
+        .iter()
+        .find(|v| v.version == 1 && v.reason == Trigger::Create.token())?;
+    let submitter = versions
+        .iter()
+        .find(|v| v.reason == Trigger::Submit.token())?;
+    let current = versions.iter().find(|v| v.version == expected)?;
+    Some(RoleVersions {
+        creator: actor(creator),
+        submitter: actor(submitter),
+        amender: (current.reason == Trigger::Amendment.token()).then(|| actor(current)),
+    })
+}
+
+#[async_trait]
+impl Preparation for RecordPreparation<'_> {
+    async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
+        let recording = view.recording.as_ref().ok_or(PrepareError::Integration)?;
+        let facts = &view.facts;
+        let mut prepared = Prepared::new(AggregateContribution::None);
+        let roles = role_versions(&recording.versions, self.expected_version);
+        let admissible = facts.current_version == self.expected_version
+            && self
+                .table
+                .lookup(facts.state, Trigger::RecordAcceptance)
+                .is_some();
+        let caller = view.actor.reference();
+        let barred = roles.as_ref().is_some_and(|roles| {
+            recording_party_barred(
+                &caller,
+                recording.sales_path,
+                facts.resource_tenant_id,
+                roles,
+            )
+        });
+        prepared.guards = GuardBindings::new()
+            .bind(NOT_RECORDED, |subject: &GuardSubject<'_>| {
+                if subject.acceptance_recorded {
+                    GuardVerdict::Fail(Reason::AcceptanceAlreadyRecorded)
+                } else {
+                    GuardVerdict::Pass
+                }
+            })
+            .bind(RECORDING_PARTY, move |_: &GuardSubject<'_>| {
+                if barred {
+                    GuardVerdict::Fail(Reason::AcceptanceRecordingPartyBarred)
+                } else {
+                    GuardVerdict::Pass
+                }
+            });
+        // 1. Not admissible from this snapshot: the engine refuses by precedence.
+        if roles.is_none() || !admissible {
+            prepared.inputs = Inputs::new().with(
+                InputPort::AcceptanceRequirement,
+                InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
+            );
+            return Ok(prepared);
+        }
+        // 2. A barred caller: decided from stored facts, nothing is recorded or read.
+        if barred {
+            prepared.inputs =
+                Inputs::new().with(InputPort::AcceptanceRequirement, InputState::Resolved);
+            return Ok(prepared);
+        }
+        // 3. The live requirement.
+        let subject = RequirementSubject {
+            contract_id: facts.contract_id,
+            payer_tenant_id: facts.payer_tenant_id,
+            seller_tenant_id: facts.seller_tenant_id,
+        };
+        let requirement = match self
+            .resolver
+            .requirement(self.ctx, &subject, None, &RunBudget::new(), self.cancel)
+            .await
+        {
+            Ok(requirement) => requirement,
+            Err(PrepareError::Unavailable) => {
+                prepared.inputs = Inputs::new().with(
+                    InputPort::AcceptanceRequirement,
+                    InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
+                );
+                return Ok(prepared);
+            }
+            Err(PrepareError::Integration) => return Err(PrepareError::Integration),
+        };
+        let source = recorded_source(requirement);
+        // 4. The consent row and its one event.
+        prepared.inputs =
+            Inputs::new().with(InputPort::AcceptanceRequirement, InputState::Resolved);
+        prepared.documents = Some(Arc::new(ConsentDocument {
+            recorded_by: caller.clone(),
+            recording_path: recording.sales_path,
+            source,
+        }));
+        prepared.event = Some(Arc::new(AcceptanceRecordedEvent {
+            recording_actor: caller,
+            source,
+        }));
+        Ok(prepared)
+    }
+}
+
+/// The one consent row, at the locked current version and the engine's transition time.
+struct ConsentDocument {
+    recorded_by: String,
+    recording_path: SalesPath,
+    source: RequirementSource,
+}
+
+#[async_trait]
+impl DocumentWriter for ConsentDocument {
+    async fn write(&self, documents: &ChildDocuments<'_, '_>) -> Result<(), ScopeError> {
+        let (accepted_version, _) = documents.locked_version_and_generation();
+        documents
+            .insert_acceptance(acceptance::Model {
+                order_id: documents.order_id(),
+                accepted_version,
+                accepted_at: documents.transition_time(),
+                recorded_by: self.recorded_by.clone(),
+                recording_path: self.recording_path.token().to_owned(),
+                requirement_source: self.source.token().to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+/// Row 25's `OrderAcceptanceRecorded`: the version and instant from the summary the engine hands
+/// the enqueue, so they equal the stored row.
+struct AcceptanceRecordedEvent {
+    recording_actor: String,
+    source: RequirementSource,
+}
+
+#[async_trait]
+impl EventSpec for AcceptanceRecordedEvent {
+    fn kind(&self) -> bss_orders_sdk::catalog::EventKind {
+        bss_orders_sdk::catalog::EventKind::OrderAcceptanceRecorded
+    }
+    async fn enqueue(&self, enqueue: EventEnqueue<'_, '_>) -> Result<(), EventEnqueueError> {
+        let detail = OrderAcceptanceRecorded {
+            accepted_version: enqueue.order_version(),
+            accepted_at: enqueue.occurred_at(),
+            recording_actor: self.recording_actor.clone(),
+            requirement_source: self.source,
+        };
+        enqueue.enqueue(detail).await
     }
 }
 

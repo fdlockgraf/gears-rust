@@ -100,6 +100,18 @@ Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_RE
 
 **Success**: Both initial partner-path and renewed post-amendment acceptance can be recorded by an eligible customer. **Errors**: Missing permissions, barred recording actor, stale version (`precondition-failed`, 412, D-212), existing current-version record or unavailable policy input never manufacture acceptance.
 
+**Implementation note (S4-08b, D-255).** Delivered in the development delivery only (D-231):
+`AcceptanceService` (`infra/acceptance.rs`) behind `POST /orders/{orderId}/acceptance` and
+`OrdersV1::record_acceptance`; steps 1 to 5 are implemented, step 6 is S4-06's read (D-254). The
+body is exactly `{}`, so a caller-supplied instant or actor is a boundary `request-invalid`. The
+recording-party bar reads the stored role versions and sales path from the engine's authorized
+snapshot and compares the engine's trusted actor reference per role (§3.2); the live requirement
+comes from the one resolver (D-251), unavailable answering `acceptance-requirement-unevaluable`.
+Whether the current version already has a consent is read under the aggregate lock, so of two
+independent recordings only one commits. One transaction writes the consent row at the engine's
+transition time, the audit entry, the settlement and one `OrderAcceptanceRecorded`; no state or
+version changes. Production delivery remains open.
+
 ### 2.3 Attempt fulfillment with a payment outcome
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-flow-preconditions-begin`

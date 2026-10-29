@@ -553,6 +553,7 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         t(),
         &change,
         &[],
+        false,
     )
     .unwrap_err();
     assert_eq!(err, DecisionError::Administrative);
@@ -569,6 +570,7 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         t(),
         &[],
         &[uuid::Uuid::from_u128(77)],
+        false,
     )
     .unwrap_err();
     assert_eq!(err, DecisionError::Administrative);
@@ -594,6 +596,7 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         t(),
         &change,
         &[],
+        false,
     )
     .unwrap();
     assert!(matches!(d, Decision::Admitted(_)));
@@ -644,5 +647,67 @@ fn stale_authorization_refusal_follows_the_version_precedence() {
             stale_refusal(None, 2, trigger),
             Reason::AuthorizationContextChanged
         );
+    }
+}
+
+/// S4-08b (D-255): whether the locked current version already has a consent is read under the
+/// aggregate lock and reaches row 25's guards only; on any other row it is a contract violation.
+#[test]
+fn the_locked_acceptance_fact_reaches_only_the_record_acceptance_row() {
+    let (table, registry) = env();
+    let facts = facts(S::Submitted);
+    let err = decide_with(
+        &table,
+        &registry,
+        Trigger::Hold,
+        &facts,
+        facts.current_version,
+        DraftRevisions::NotApplicable,
+        &bindings(&registry, 21, &[]),
+        &resolved(&registry, 21),
+        t(),
+        &[],
+        &[],
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(err, DecisionError::LockedAcceptance);
+    for recorded in [false, true] {
+        let b = bindings(&registry, 25, &[]).bind(
+            "preconditions.acceptance-not-recorded",
+            |s: &GuardSubject<'_>| {
+                if s.acceptance_recorded {
+                    GuardVerdict::Fail(Reason::AcceptanceAlreadyRecorded)
+                } else {
+                    GuardVerdict::Pass
+                }
+            },
+        );
+        let d = decide_with(
+            &table,
+            &registry,
+            Trigger::RecordAcceptance,
+            &facts,
+            facts.current_version,
+            DraftRevisions::NotApplicable,
+            &b,
+            &resolved(&registry, 25),
+            t(),
+            &[],
+            &[],
+            recorded,
+        )
+        .unwrap();
+        if recorded {
+            assert!(matches!(
+                d,
+                Decision::Guard {
+                    reason: Reason::AcceptanceAlreadyRecorded,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(d, Decision::Admitted(_)), "{d:?}");
+        }
     }
 }

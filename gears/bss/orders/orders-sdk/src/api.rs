@@ -3,6 +3,7 @@
 //! point.
 use crate::{
     OrdersError,
+    acceptance::Acceptance,
     amend::AmendOrder,
     authoring::{AddLine, CreateMeta, CreateOrder, HeaderPatch, LinePatch, OrderView},
     models::OrderVersion,
@@ -198,6 +199,23 @@ pub trait OrdersV1: Send + Sync {
         ctx: &SecurityContext,
         order_id: Uuid,
         request: AmendOrder,
+        meta: CallMeta,
+    ) -> Result<TransitionResult, OrdersError>;
+
+    /// Record the customer's consent to the committed version named by `meta.expected_version`
+    /// (`If-Match`) after submit (S4-08b). The instant and the recording actor are the engine's;
+    /// nothing in `request` is assent. A stale version is the audited `precondition-failed`.
+    ///
+    /// # Errors
+    /// `expected-version-required` or `request-invalid` for a malformed request, an Orders
+    /// refusal (`acceptance-already-recorded`, `acceptance-recording-party-barred`,
+    /// `acceptance-requirement-unevaluable`, the shared authorization and version refusals), or
+    /// an infrastructure/unavailable failure.
+    async fn record_acceptance(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: Acceptance,
         meta: CallMeta,
     ) -> Result<TransitionResult, OrdersError>;
 
