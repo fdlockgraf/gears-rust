@@ -83,6 +83,30 @@ pub use documents::{
 };
 pub use errors::{Abort, EngineError, FaultPoint};
 
+/// The decision an attempt's result reports (D-257 item 1), or `None` when it is not one.
+fn decided(result: &Result<EngineOutcome, EngineError>) -> Option<Decided> {
+    match result {
+        Ok(EngineOutcome {
+            kind: OutcomeKind::Committed { .. },
+            ..
+        }) => Some(Decided::Committed),
+        Ok(EngineOutcome {
+            kind: OutcomeKind::Refused { reason, .. },
+            ..
+        })
+        | Err(EngineError::Refused(reason)) => (!matches!(
+            reason,
+            Reason::IdempotencyMismatch | Reason::StillProcessing
+        ))
+        .then_some(Decided::Refused(*reason)),
+        Ok(EngineOutcome {
+            kind: OutcomeKind::Replayed { .. },
+            ..
+        })
+        | Err(_) => None,
+    }
+}
+
 /// Transaction attempts for transient contention (deadlock/serialization) before giving up.
 const TX_ATTEMPTS: u32 = 3;
 const SERVICE_SUBJECT: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
@@ -638,28 +662,16 @@ impl Engine {
     }
 
     /// Report a decided attempt (S4-12, D-257): a commit or a business refusal, settled or not.
-    /// A replay, an outage or an integration failure is not a decision and reports nothing.
+    /// A replay, an outage, an integration failure and an idempotency answer (mismatch or still
+    /// processing) are not decisions and report nothing.
     fn observe(
         &self,
         trigger: Trigger,
         result: &Result<EngineOutcome, EngineError>,
         observed: &Observed,
     ) {
-        let decision = match result {
-            Ok(EngineOutcome {
-                kind: OutcomeKind::Committed { .. },
-                ..
-            }) => Decided::Committed,
-            Ok(EngineOutcome {
-                kind: OutcomeKind::Refused { reason, .. },
-                ..
-            })
-            | Err(EngineError::Refused(reason)) => Decided::Refused(*reason),
-            Ok(EngineOutcome {
-                kind: OutcomeKind::Replayed { .. },
-                ..
-            })
-            | Err(_) => return,
+        let Some(decision) = decided(result) else {
+            return;
         };
         let mut observation = TransitionObservation::new(trigger, decision);
         observation.authorization = observed.authorization;

@@ -179,6 +179,14 @@ async fn alert_s4_s5_party_bar_and_requirement_outage_are_observed() {
         .unwrap();
     assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
     let (due, margin) = due_and_margin(&w.f.t, order).await;
+    // A same-key replay goes through `Engine::transition`'s `Replayed` branch and is not a
+    // decision: the observation count does not change.
+    let before = of(&w.f.t, Trigger::RecordAcceptance).len();
+    let replay = record(&w.recorder(), &customer(), order, n, "sig-rec-3")
+        .await
+        .unwrap();
+    assert_eq!(replay.outcome, SettledOutcome::Committed, "{replay:?}");
+    assert_eq!(of(&w.f.t, Trigger::RecordAcceptance).len(), before);
 
     assert_eq!(
         of(&w.f.t, Trigger::RecordAcceptance),

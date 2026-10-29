@@ -234,3 +234,17 @@ fn the_authorization_tokens_are_the_wire_values() {
         ["authorized", "pending", "failed"]
     );
 }
+
+/// An idempotency answer (mismatch, still processing) is not a decision; a business refusal is.
+#[test]
+fn idempotency_answers_are_not_decisions() {
+    use super::{EngineError, decided};
+    for reason in [Reason::IdempotencyMismatch, Reason::StillProcessing] {
+        assert_eq!(decided(&Err(EngineError::Refused(reason))), None);
+    }
+    assert_eq!(
+        decided(&Err(EngineError::Refused(Reason::VersionConflict))),
+        Some(Decision::Refused(Reason::VersionConflict))
+    );
+    assert_eq!(decided(&Err(EngineError::Integration)), None);
+}

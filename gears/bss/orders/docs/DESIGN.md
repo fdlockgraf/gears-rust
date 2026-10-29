@@ -12001,7 +12001,7 @@ Pending evidence for the configured production scopes:
 
 #### Stage 4 readiness register (S4-12, D-257)
 
-One row per Stage 4 operation, at branch head `bss/orders-stage4`. "Missing" means no provider
+One row per Stage 4 operation, at commit `44aa09ef3` (2026-10-29). "Missing" means no provider
 SDK or runtime exists in this repository; a double named here is a test or development double
 and is **never** evidence. Every gate stays unchecked: no row is passed because its double works.
 Scope: *production* (mounted in every build), *development* (`gate-dev-stubs` feature **and**
