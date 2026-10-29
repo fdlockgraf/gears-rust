@@ -117,6 +117,19 @@ DESIGN owns schemas and architectural rationale; this feature owns the complete 
 7. [ ] Let the engine validate the final date basis and expected version, replace claims and append the version atomically. On a partial claim collision, release only the exact fresh claim IDs returned by this attempt, retain pre-existing claims and commercial content, then commit the released reservation history with the refusal audit and settlement. A cleanup-count mismatch or persistence failure instead rolls back the transaction under Foundation’s contract.
 8. [ ] Persist the explanation as `amendment_reason` on the version and `caller_reason` on audit; machine reason remains `amendment`. Only the engine assigns `supersedes_version` and moves the current pointer.
 
+**Implementation note (S4-03/S4-04, D-252, D-253).** Delivered in the development delivery only
+(D-231): `AmendService` (`infra/amend.rs`) behind `POST /orders/{orderId}/amendments` and
+`OrdersV1::amend`. It runs submit's assessment, reservation and phases B and C over the proposed
+version (steps 2 and 5 to 8), merging the delta onto the committed version named by `If-Match`
+(steps 3 and 4). Step 5's preclusion covers the seven versioning guards, the structural guards
+and authored-selection capacity: they are decided before any date, gate, authority or Pricing
+call. The engine rechecks state and expected version under the reservation lock (E1), and a
+concurrent writer that makes the order amendable between the read and the lock is decided from
+the locked state (D-253 item 10). Step 7's partial-collision cleanup and its rollback on failure
+are covered by the PostgreSQL tests named in D-253. `OrderAmended { supersedesVersion }` is
+emitted on rows 18–20. Production delivery, the maintenance recovery body (D-232) and a
+per-caller amendment limiter remain open.
+
 ### 3.2 Apply an administrative edit
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-algo-versioning-admin-edit`
