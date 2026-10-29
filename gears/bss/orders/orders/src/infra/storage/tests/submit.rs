@@ -188,6 +188,13 @@ pub(super) struct FixedBindings {
     sku_name: Option<String>,
 }
 impl FixedBindings {
+    /// Bindings answering a second item on every line (two overlap scopes).
+    pub(super) fn multikey() -> Arc<Self> {
+        Arc::new(Self {
+            multikey: true,
+            ..Default::default()
+        })
+    }
     fn answer(&self, line: Uuid) -> crate::domain::gate::pricing_map::CatalogAnswer {
         let mut answer = Catalog::answer();
         if self.multikey {
