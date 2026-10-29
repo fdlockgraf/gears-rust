@@ -111,6 +111,16 @@ fn undecided(_: &GuardSubject<'_>) -> GuardVerdict {
 #[async_trait]
 impl Preparation for BeginFulfillmentPreparation<'_> {
     async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
+        let mut prepared = self.decide(view).await?;
+        // The presented outcome is reported with the decision, whatever it is (D-257).
+        prepared.authorization = Some(self.outcome);
+        Ok(prepared)
+    }
+}
+
+impl BeginFulfillmentPreparation<'_> {
+    /// Steps 0-4 (type doc).
+    async fn decide(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
         let facts = &view.facts;
         // 0. Not admissible from this snapshot (row 11 starts only at `approved`): the engine
         //    refuses by precedence before any guard, so nothing external is read. Should the

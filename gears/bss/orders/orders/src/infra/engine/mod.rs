@@ -71,6 +71,12 @@ use crate::infra::storage::scoped::{self, AuthorizedLock, AuthorizedRead, Privat
 
 pub mod documents;
 pub mod errors;
+/// The engine's decision signals (S4-12, D-257).
+pub mod signals;
+use signals::{Decision as Decided, TransitionObservation, TransitionSignals};
+#[cfg(test)]
+#[path = "signals_tests.rs"]
+mod signals_tests;
 
 pub use documents::{
     ChildDocuments, DiagnosticsContribution, DiagnosticsSettled, DocumentWriter, EventSpec,
@@ -115,6 +121,14 @@ pub struct Prepared {
     pub line_id: Option<Uuid>,
     /// Frozen commercial assessment identity returned on successful submit.
     pub assessment_id: Option<Uuid>,
+    /// Begin-fulfillment only: the authorization outcome Workflow presented, reported with the
+    /// decision whatever it is (S4-12, D-257). Observability only; the engine decides nothing
+    /// from it.
+    pub authorization: Option<bss_orders_sdk::fulfillment::Authorization>,
+    /// The consent the child documents record when the transition commits (submit's
+    /// self-service consent, D-251; record-acceptance, D-255), reported on commit (D-257).
+    /// Observability only; the documents write the row.
+    pub consent: Option<signals::ConsentObservation>,
 }
 impl Prepared {
     /// A contribution with no inputs, guards, documents or event.
@@ -133,6 +147,8 @@ impl Prepared {
             diagnostics: None,
             line_id: None,
             assessment_id: None,
+            authorization: None,
+            consent: None,
         }
     }
 }
@@ -165,6 +181,9 @@ pub struct RecordingFacts {
     pub sales_path: SalesPath,
     /// Every committed version row, ascending by version.
     pub versions: Vec<order_version::Model>,
+    /// The current version's earliest line acceptance due date, reported with a recorded
+    /// consent (D-257; observability only, never a guard input).
+    pub acceptance_due: Option<time::Date>,
 }
 
 /// Slice input resolution failure that is not an unresolvable guard input.
@@ -288,6 +307,8 @@ pub struct EngineParts {
     pub admin_key: Arc<AdminTextKey>,
     /// The idempotency execution lease.
     pub lease: LeaseDuration,
+    /// Where decided attempts are reported (S4-12, D-257).
+    pub signals: Arc<dyn TransitionSignals>,
 }
 
 /// The compiled declarations the engine runs (startup-validated, Foundation §3.4 step 1).
@@ -336,6 +357,7 @@ struct Inner {
     identities: ActorIdentities,
     admin_key: Arc<AdminTextKey>,
     lease: LeaseDuration,
+    signals: Arc<dyn TransitionSignals>,
     registries: Registries,
     #[cfg(test)]
     fault: Option<Arc<dyn FaultHook>>,
@@ -392,6 +414,43 @@ struct Attempt {
     correlation_id: Option<Uuid>,
     prepared: Prepared,
     completed: AtomicBool,
+    /// Set by the admitting body, read only for a committed outcome (D-257).
+    committed: parking_lot::Mutex<Option<CommitNote>>,
+}
+
+/// What an admitted body knew that the decision signal reports (D-257).
+#[derive(Debug, Clone, Copy)]
+struct CommitNote {
+    /// The order's amendment count after the transition.
+    amendment_count: i32,
+    /// Administrative audit entries appended (one per changed field).
+    admin_audits: usize,
+    /// The transition time.
+    at: OffsetDateTime,
+}
+
+/// What [`Engine::transition`] learnt about its attempt for the decision signal (D-257).
+#[derive(Default)]
+struct Observed {
+    authorization: Option<bss_orders_sdk::fulfillment::Authorization>,
+    consent: Option<signals::ConsentObservation>,
+    tolerated: bool,
+    note: Option<CommitNote>,
+}
+
+impl Observed {
+    /// The preparation's facts and, once the body ran, its commit note.
+    fn of(attempt: &Attempt) -> Self {
+        Self {
+            authorization: attempt.prepared.authorization,
+            consent: attempt.prepared.consent,
+            tolerated: matches!(
+                attempt.prepared.aggregate,
+                AggregateContribution::BeginFulfillment { tolerated: true }
+            ),
+            note: *attempt.committed.lock(),
+        }
+    }
 }
 
 /// What a committed transaction produced.
@@ -416,6 +475,7 @@ impl Engine {
                 identities: parts.identities,
                 admin_key: parts.admin_key,
                 lease: parts.lease,
+                signals: parts.signals,
                 registries,
                 #[cfg(test)]
                 fault: None,
@@ -435,6 +495,7 @@ impl Engine {
                 identities: inner.identities.clone(),
                 admin_key: Arc::clone(&inner.admin_key),
                 lease: inner.lease,
+                signals: Arc::clone(&inner.signals),
                 registries: inner.registries.clone(),
                 fault: Some(hook),
             }),
@@ -567,6 +628,68 @@ impl Engine {
         request: TransitionRequest,
         preparation: &dyn Preparation,
     ) -> Result<EngineOutcome, EngineError> {
+        let trigger = request.trigger;
+        let observed = parking_lot::Mutex::new(Observed::default());
+        let result = self
+            .decide_transition(caller, request, preparation, &observed)
+            .await;
+        self.observe(trigger, &result, &observed.into_inner());
+        result
+    }
+
+    /// Report a decided attempt (S4-12, D-257): a commit or a business refusal, settled or not.
+    /// A replay, an outage or an integration failure is not a decision and reports nothing.
+    fn observe(
+        &self,
+        trigger: Trigger,
+        result: &Result<EngineOutcome, EngineError>,
+        observed: &Observed,
+    ) {
+        let decision = match result {
+            Ok(EngineOutcome {
+                kind: OutcomeKind::Committed { .. },
+                ..
+            }) => Decided::Committed,
+            Ok(EngineOutcome {
+                kind: OutcomeKind::Refused { reason, .. },
+                ..
+            })
+            | Err(EngineError::Refused(reason)) => Decided::Refused(*reason),
+            Ok(EngineOutcome {
+                kind: OutcomeKind::Replayed { .. },
+                ..
+            })
+            | Err(_) => return,
+        };
+        let mut observation = TransitionObservation::new(trigger, decision);
+        observation.authorization = observed.authorization;
+        if decision == Decided::Committed {
+            if let Some(note) = observed.note {
+                observation.amendment_count =
+                    (trigger == Trigger::Amendment).then_some(note.amendment_count);
+                observation.admin_audits = note.admin_audits;
+            }
+            observation.tolerated = observed.tolerated;
+            observation.consent = observed.consent;
+            observation.consent_margin_days = observed
+                .consent
+                .and_then(|c| c.due)
+                .zip(observed.note)
+                .map(|(due, note)| {
+                    (due - note.at.to_offset(time::UtcOffset::UTC).date()).whole_days()
+                });
+        }
+        self.inner.signals.settled(&observation);
+    }
+
+    /// [`Self::transition`]'s body; `observed` collects the decision signal's facts.
+    async fn decide_transition(
+        &self,
+        caller: &Caller,
+        request: TransitionRequest,
+        preparation: &dyn Preparation,
+        observed: &parking_lot::Mutex<Observed>,
+    ) -> Result<EngineOutcome, EngineError> {
         let inner = &self.inner;
         // D-105: create runs its dedicated branch and never this existing-order algorithm.
         if request.trigger == Trigger::Create {
@@ -689,6 +812,7 @@ impl Engine {
             correlation_id: request.correlation_id,
             prepared,
             completed: AtomicBool::new(false),
+            committed: parking_lot::Mutex::new(None),
         });
         let result = self.run(&attempt).await;
         let target = ReplayTarget::Order {
@@ -696,8 +820,11 @@ impl Engine {
             prefetch: &prefetch,
         };
         let context = AbortContext::of(&*attempt);
-        self.finish(caller, target, result, &attempt.completed, context)
-            .await
+        let finished = self
+            .finish(caller, target, result, &attempt.completed, context)
+            .await;
+        *observed.lock() = Observed::of(&attempt);
+        finished
     }
 
     /// Internal worker entry (Foundation *Internal worker entry*; 08 §3.5): only the allowlisted
@@ -803,6 +930,7 @@ impl Engine {
             correlation_id: request.correlation_id,
             prepared,
             completed: AtomicBool::new(false),
+            committed: parking_lot::Mutex::new(None),
         });
         let result = self.run(&attempt).await;
         match result {
@@ -1421,6 +1549,13 @@ impl Engine {
                                 .ok_or(Abort::Integration("stored sales path"))?,
                             versions: children::versions(tx, target.access_scope(), row.order_id)
                                 .await?,
+                            acceptance_due: children::earliest_acceptance_due(
+                                tx,
+                                target.access_scope(),
+                                row.order_id,
+                                row.current_version,
+                            )
+                            .await?,
                         })
                     } else {
                         None
@@ -2825,6 +2960,11 @@ async fn admit<'a>(
     fault(inner, FaultPoint::Audit, tx).await?;
     step_event(a, locked, row, &after, t, events).await?;
     fault(inner, FaultPoint::Enqueue, tx).await?;
+    *a.committed.lock() = Some(CommitNote {
+        amendment_count: after.amendment_count,
+        admin_audits: administrative.len(),
+        at: t,
+    });
     let response = success_response(
         row.trigger,
         &after,

@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// global between another's install and sink build would record into the wrong exporter.
 /// Async tests take it with `.lock().await`, sync tests with `.blocking_lock()`, and hold the
 /// guard for their whole run.
-pub(super) fn meter_lock() -> &'static tokio::sync::Mutex<()> {
+pub fn meter_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -33,7 +33,7 @@ pub(super) fn meter_lock() -> &'static tokio::sync::Mutex<()> {
 /// [`OtelGateSignals::new`] builds on `global::meter("bss-orders")` record into it (the
 /// api-gateway `http_metrics_tests` precedent). Call it before building the sink, while
 /// holding the [`meter_lock`] guard, which is taken as proof the global is the caller's.
-pub(super) fn install_meter(
+pub fn install_meter(
     _guard: &tokio::sync::MutexGuard<'_, ()>,
 ) -> (SdkMeterProvider, InMemoryMetricExporter) {
     let exporter = InMemoryMetricExporter::default();
@@ -46,14 +46,11 @@ pub(super) fn install_meter(
 
 /// One exported `u64` data point: `(instrument, sorted attributes, value)`, the value being a
 /// counter's sum, a gauge's last value or a histogram's count.
-pub(super) type Point = (String, Vec<(String, String)>, u64);
+pub type Point = (String, Vec<(String, String)>, u64);
 
 /// Every `u64` data point of a fresh flush. The exporter keeps each flush's batch, so it is
 /// cleared first: with the default cumulative temporality the new batch holds every point.
-pub(super) fn exported(
-    provider: &SdkMeterProvider,
-    exporter: &InMemoryMetricExporter,
-) -> BTreeSet<Point> {
+pub fn exported(provider: &SdkMeterProvider, exporter: &InMemoryMetricExporter) -> BTreeSet<Point> {
     exporter.reset();
     provider.force_flush().unwrap();
     let mut points = BTreeSet::new();
@@ -126,7 +123,7 @@ fn gate_points(points: BTreeSet<Point>) -> BTreeSet<Point> {
 }
 
 /// An expected [`Point`].
-pub(super) fn point(name: &str, attrs: &[(&str, &str)], value: u64) -> Point {
+pub fn point(name: &str, attrs: &[(&str, &str)], value: u64) -> Point {
     let mut attrs: Vec<(String, String)> = attrs
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -203,12 +200,15 @@ fn the_recording_sink_records_each_call_in_order() {
 fn the_flow_ceilings_are_the_run_level_budgets() {
     assert_eq!(Flow::Preview.ceiling(), Duration::from_millis(2500));
     assert_eq!(Flow::Submit.ceiling(), Duration::from_millis(2250));
+    // An amendment runs the submit pipeline under submit's ceiling (D-257).
+    assert_eq!(Flow::Amend.ceiling(), Duration::from_millis(2250));
 }
 
 #[test]
 fn the_flow_tokens_are_the_label_values() {
     assert_eq!(Flow::Preview.token(), "preview");
     assert_eq!(Flow::Submit.token(), "submit");
+    assert_eq!(Flow::Amend.token(), "amend");
 }
 
 /// Every D-237 instrument the calls below touch is exported under its name with exactly its

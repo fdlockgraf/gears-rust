@@ -20,6 +20,7 @@ use crate::domain::state_table::StateTable;
 use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, InputState, Inputs};
 use crate::infra::capture::{Settled, fingerprint_document};
 use crate::infra::engine::documents::EventEnqueue;
+use crate::infra::engine::signals::ConsentObservation;
 use crate::infra::engine::{
     ChildDocuments, DocumentWriter, Engine, EventSpec, Preparation, PreparationView, PrepareError,
     Prepared, TransitionRequest,
@@ -400,6 +401,12 @@ impl Preparation for RecordPreparation<'_> {
         // 4. The consent row and its one event.
         prepared.inputs =
             Inputs::new().with(InputPort::AcceptanceRequirement, InputState::Resolved);
+        // Reported with the commit's decision signal (D-257).
+        prepared.consent = Some(ConsentObservation {
+            source,
+            path: recording.sales_path,
+            due: recording.acceptance_due,
+        });
         prepared.documents = Some(Arc::new(ConsentDocument {
             recorded_by: caller.clone(),
             recording_path: recording.sales_path,

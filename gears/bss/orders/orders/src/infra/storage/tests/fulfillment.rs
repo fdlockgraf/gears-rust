@@ -141,7 +141,7 @@ async fn approve(w: &World, order: Uuid) {
 }
 
 /// Set the `tolerate_authorization_failure` election of `seller` (`None` = platform).
-async fn tolerate(w: &World, seller: Option<Uuid>, elected: bool) {
+pub(super) async fn tolerate(w: &World, seller: Option<Uuid>, elected: bool) {
     upsert(w, "tolerate_authorization_failure", seller, elected).await;
 }
 
@@ -211,7 +211,7 @@ async fn committed_at(w: &World, order: Uuid, trigger: &str) -> Value {
 /// A partner-placed, contract-bound `approved` order at version N, with the customer's consent
 /// on N when `consent` (the world's contract requires it, source `contract`). Its overlap claim
 /// is released so the next order of the world can submit.
-async fn approved(w: &World, tag: &str, consent: bool) -> (Uuid, i64) {
+pub(super) async fn approved(w: &World, tag: &str, consent: bool) -> (Uuid, i64) {
     let (order, n) = approved_holding(w, tag, consent).await;
     w.release(order).await;
     (order, n)

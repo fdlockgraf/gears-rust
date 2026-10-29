@@ -124,6 +124,8 @@ pub(super) struct T {
     pub(super) env: Env,
     _bound: BoundProducer,
     pub(super) sink: crate::infra::events::EventSink,
+    /// Every engine this harness builds reports its decided attempts here (D-257).
+    pub(super) transitions: Arc<crate::infra::engine::signals::RecordingTransitionSignals>,
 }
 impl T {
     pub(super) async fn new() -> Self {
@@ -134,6 +136,7 @@ impl T {
             env,
             _bound: bound,
             sink,
+            transitions: Arc::default(),
         }
     }
     pub(super) fn engine(&self, api: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> Engine {
@@ -145,6 +148,7 @@ impl T {
                 identities: identities(),
                 admin_key: Arc::new(AdminTextKey::new("k1", &[7u8; 32]).unwrap()),
                 lease: LeaseDuration::from_seconds(30).unwrap(),
+                signals: Arc::clone(&self.transitions) as Arc<_>,
             },
             Registries::compile().unwrap(),
         )

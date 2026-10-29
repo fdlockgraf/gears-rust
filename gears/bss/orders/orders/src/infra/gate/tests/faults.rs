@@ -741,3 +741,58 @@ async fn alert_8_backpressure_is_not_a_breaker_failure() {
         Some(BreakerState::Closed)
     );
 }
+
+/// Row 9 (alert: amendment assessment failure, D-257). Pricing hangs while an amendment is
+/// assessed: the run is reported under `flow="amend"`, blocked with unevaluable entries, so the
+/// amendment's failure rate is told apart from submit's; the exported run and unevaluable
+/// counters carry the `amend` flow.
+#[tokio::test(start_paused = true)]
+async fn alert_9_amendment_assessment_failure_is_its_own_flow() {
+    let guard = meter_lock().lock().await;
+    let (provider, exporter) = install_meter(&guard);
+    let (budget, sink) = budget_over(
+        &GateConfig::default(),
+        Sink {
+            otel: Some(OtelGateSignals::new()),
+            ..Sink::default()
+        },
+    );
+    let pricing = pricing(Vec::new());
+    pricing.fail_with(Some(Fault::Hang));
+    let h = harness(fixture(), &budget, Some(&pricing));
+
+    run(&h, &basket(Operation::Amendment, 1)).await;
+    let runs = run_signals(&sink.observations());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let (flow, signals) = &runs[0];
+    assert_eq!(*flow, Flow::Amend);
+    assert!(signals.blocked, "{signals:?}");
+    assert!(
+        unevaluable(
+            signals,
+            PredicateId::CatalogRevisionCurrent,
+            Reason::PricingRevisionUnavailable
+        ),
+        "{signals:?}"
+    );
+    let points = exported(&provider, &exporter);
+    for expected in [
+        point(
+            "orders_gate_runs_total",
+            &[("flow", "amend"), ("outcome", "blocked")],
+            1,
+        ),
+        point(
+            "orders_gate_runs_unevaluable_total",
+            &[("flow", "amend")],
+            1,
+        ),
+    ] {
+        assert!(points.contains(&expected), "{expected:?} in {points:?}");
+    }
+
+    // A submit run over the same fault stays `submit`.
+    run(&h, &basket(Operation::Submit, 1)).await;
+    let runs = run_signals(&sink.observations());
+    assert_eq!(runs[1].0, Flow::Submit);
+}

@@ -149,7 +149,7 @@ pub(super) async fn live_claims(f: &Fixture, order: Uuid) -> Value {
 }
 
 /// Set an aggregate column directly (a state the fixture cannot reach through delivered paths).
-async fn force(f: &Fixture, order: Uuid, assignment: &str) {
+pub(super) async fn force(f: &Fixture, order: Uuid, assignment: &str) {
     f.t.env
         .pg
         .sql(&format!(

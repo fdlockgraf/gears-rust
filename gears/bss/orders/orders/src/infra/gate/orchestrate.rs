@@ -42,9 +42,9 @@ use crate::domain::gate::answers::{
 use crate::domain::gate::assess::{Assessment, assess};
 use crate::domain::gate::commercial::CommercialError;
 use crate::domain::gate::orchestrate::{
-    Answers, Basket, IdentityGate, OccupancyAnswer, assemble, assessment_query, evaluation_request,
-    gate_after_identity, line_bindings, occupancy_queries, overlap_key_lines, payer_market, plan,
-    tax_query,
+    Answers, Basket, GateTarget, IdentityGate, OccupancyAnswer, assemble, assessment_query,
+    evaluation_request, gate_after_identity, line_bindings, occupancy_queries, overlap_key_lines,
+    payer_market, plan, tax_query,
 };
 use crate::domain::gate::ports::{GatePort, PortAnswer, Unavailable};
 use crate::domain::gate::pricing_map::{CatalogAnswer, ReadFailure};
@@ -414,10 +414,12 @@ impl Orchestrator {
         let ports = &self.ports;
         let axes = basket.axes;
         let signals = self.budget.signals().as_ref();
-        let flow = if plan.tax {
-            Flow::Preview
-        } else {
-            Flow::Submit
+        // An amendment runs the submit pipeline but reports as its own flow (D-257), so its
+        // assessment failures are told apart from submit's.
+        let flow = match basket.target {
+            _ if plan.tax => Flow::Preview,
+            GateTarget::Amendment { .. } => Flow::Amend,
+            GateTarget::Preview | GateTarget::Submit { .. } => Flow::Submit,
         };
         let mut down = Unanswered::new(signals, axes.seller);
         checkpoint(cancel)?;

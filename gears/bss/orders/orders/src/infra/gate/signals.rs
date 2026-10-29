@@ -26,6 +26,8 @@ pub enum Flow {
     Preview,
     /// `SubmitService`: phase A of a submit.
     Submit,
+    /// `AmendService`: the assessment of an amendment's proposed version (S4-12, D-257).
+    Amend,
 }
 
 impl Flow {
@@ -35,15 +37,17 @@ impl Flow {
         match self {
             Self::Preview => "preview",
             Self::Submit => "submit",
+            Self::Amend => "amend",
         }
     }
 
-    /// The run-level resolution ceiling (03 §3.8): 2500 ms for a Preview, 2250 ms for a submit.
+    /// The run-level resolution ceiling (03 §3.8): 2500 ms for a Preview, 2250 ms for a submit
+    /// and for an amendment (which runs the submit pipeline, D-253).
     #[must_use]
     pub const fn ceiling(self) -> Duration {
         match self {
             Self::Preview => Duration::from_millis(2500),
-            Self::Submit => Duration::from_millis(2250),
+            Self::Submit | Self::Amend => Duration::from_millis(2250),
         }
     }
 }

@@ -230,6 +230,9 @@ impl BssOrdersGear {
                         identities: runtime.identities.clone(),
                         admin_key: Arc::clone(&runtime.admin_text_key),
                         lease: runtime.lease,
+                        signals: Arc::new(
+                            crate::infra::engine::signals::OtelTransitionSignals::new(),
+                        ),
                     },
                     runtime.registries.clone(),
                 ))));

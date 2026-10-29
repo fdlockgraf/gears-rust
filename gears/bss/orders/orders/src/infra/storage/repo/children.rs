@@ -528,6 +528,26 @@ pub async fn committed_line_ids(
         .map(|line| line.line_id)
         .collect())
 }
+/// The earliest line acceptance due date of committed `version` (D-257 consent signal).
+pub async fn earliest_acceptance_due(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Option<time::Date>, ScopeError> {
+    Ok(entity::order_line::Entity::find()
+        .inner_join(order::Entity)
+        .filter(entity::order_line::Column::OrderId.eq(id))
+        .filter(entity::order_line::Column::Version.eq(version))
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await?
+        .into_iter()
+        .filter_map(|line| line.acceptance_due_date)
+        .min())
+}
 /// Totals of exactly the snapshot's current commercial version.
 pub async fn committed_totals(
     runner: &impl DBRunner,

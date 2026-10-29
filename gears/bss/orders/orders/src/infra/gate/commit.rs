@@ -64,6 +64,7 @@ use crate::domain::transition::{GuardBindings, GuardSubject, GuardVerdict, Input
 use crate::infra::acceptance::RequirementResolver;
 use crate::infra::dates::admitted_line;
 use crate::infra::engine::documents::{EventEnqueue, EventSpec};
+use crate::infra::engine::signals::ConsentObservation;
 use crate::infra::engine::{
     ChildDocuments, DocumentWriter, Preparation, PreparationView, PrepareError, Prepared,
 };
@@ -695,8 +696,15 @@ impl Preparation for SubmitPreparation {
             Some(_) => None,
         };
         if evidence.blocked.is_none() {
+            // Reported with the commit's decision signal (D-257).
+            let lines = evidence.line_rows();
+            prepared.consent = consent.as_ref().map(|c| ConsentObservation {
+                source: c.source,
+                path: bss_orders_sdk::authoring::SalesPath::SelfService,
+                due: lines.iter().filter_map(|l| l.acceptance_due_date).min(),
+            });
             prepared.documents = Some(Arc::new(SubmitDocuments {
-                lines: evidence.line_rows(),
+                lines,
                 totals: reserved.total_models(facts.order_id, &evidence),
                 version: reserved.candidate_version,
                 consent: consent.clone(),

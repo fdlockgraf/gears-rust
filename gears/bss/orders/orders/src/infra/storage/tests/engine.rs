@@ -147,6 +147,7 @@ impl T {
                 identities: identities(),
                 admin_key: Arc::new(AdminTextKey::new("k1", &[7u8; 32]).unwrap()),
                 lease: LeaseDuration::from_seconds(30).unwrap(),
+                signals: Arc::new(crate::infra::engine::signals::OtelTransitionSignals::new()),
             },
             Registries::compile().unwrap(),
         )
