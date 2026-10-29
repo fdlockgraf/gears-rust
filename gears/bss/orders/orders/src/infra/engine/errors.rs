@@ -90,6 +90,11 @@ pub enum Abort {
     /// nothing is logged as an abort.
     #[error("durable preparation withdrawn")]
     UnreservedRefusal(Reason),
+    /// A preparation that read nothing ([`super::Prepared::unread`]) met a locked order that
+    /// is admissible: the read-to-lock race (D-253 item 10). Nothing is written; the caller
+    /// runs once more from a fresh snapshot, and the outcome is `unavailable` otherwise.
+    #[error("the order became admissible between the snapshot and the lock")]
+    Raced,
     /// A D-188 recovery that found no execution to resume (E2). It leaves nothing behind, its
     /// fresh registry claim included, and the caller answers "nothing to resume" without
     /// logging an abort.
@@ -141,6 +146,7 @@ pub fn terminate(abort: &Abort, body_completed: bool) -> EngineError {
         Abort::NotDelivered(capability) => EngineError::NotDelivered(capability),
         Abort::UnreservedRefusal(reason) => EngineError::Refused(*reason),
         Abort::NothingToResume => EngineError::Integration,
+        Abort::Raced => EngineError::Unavailable,
         Abort::Registry(RegistryError::CandidateExhausted) => {
             EngineError::VersionAllocationExhausted
         }

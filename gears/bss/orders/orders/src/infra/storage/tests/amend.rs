@@ -984,7 +984,7 @@ async fn added_line_identity_survives_recovery() {
 // Races, stress and the remaining preclusion proofs (Task 9b)
 
 /// A concurrent writer's work, run by a test hook.
-type Work = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub(super) type Work = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The fixture's rules PDP, running `work` once on the `nth` `amend` decision of the engine it
 /// is bound to. The service's committed read uses the fixture's own PDP, so the `nth = 2`
@@ -1030,7 +1030,7 @@ fn racing(f: &Fixture, work: Work) -> (AmendService, Arc<RaceAt>) {
 }
 
 /// Owner SQL on the raw connection (triggers off, as [`force`] does), as racing work.
-fn sql_work(f: &Fixture, assignment: String, order: Uuid) -> Work {
+pub(super) fn sql_work(f: &Fixture, assignment: String, order: Uuid) -> Work {
     let raw = f.t.env.pg.raw.clone();
     Arc::new(move || {
         let raw = raw.clone();

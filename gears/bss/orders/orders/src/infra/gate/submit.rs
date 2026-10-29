@@ -1146,11 +1146,13 @@ pub enum RefusalSubject {
     },
     /// No proposal was read (an amendment of a draft, of an order outside rows 18–20, or naming
     /// a version that is no longer current): every guard of `row` passing only to satisfy the
-    /// binding contract; the engine's precedence refusal settles before any guard.
+    /// binding contract; the engine's precedence refusal settles before any guard, and a
+    /// decision past precedence aborts unsettled ([`Prepared::unread`], D-253 item 10).
     Unread {
         /// The transition-table row.
         row: u8,
-        /// Every guard of the row, bound passing.
+        /// Every guard of the row, bound passing through a [`Reached`](crate::infra::engine::Reached)
+        /// witness.
         passing: GuardBindings,
     },
 }
@@ -1210,7 +1212,11 @@ impl Preparation for RefusalPreparation {
                 structural,
                 capacity,
             } => (structural.row, structural.bind(own.clone()), *capacity),
-            RefusalSubject::Unread { row, passing } => (*row, passing.clone(), GuardVerdict::Pass),
+            RefusalSubject::Unread { row, passing } => {
+                // Nothing was read: past precedence the engine aborts unsettled (D-253 item 10).
+                prepared.unread = true;
+                (*row, passing.clone(), GuardVerdict::Pass)
+            }
         };
         // The accepted-binding deadline and byte capacity remain the commit's.
         let mut guards = guards.bind(BINDING_ADMISSION, move |_: &GuardSubject<'_>| capacity);

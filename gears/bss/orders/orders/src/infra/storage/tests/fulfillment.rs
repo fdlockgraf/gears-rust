@@ -1,15 +1,18 @@
 //! The begin-fulfillment consent and payment guard on real PostgreSQL (S4-10; 05 §3.3; Stage 4
 //! DESIGN §6; D-256). The public operation is an undelivered Workflow seam (Stage 5), so row 11
-//! is driven through `Engine::transition` with [`BeginFulfillmentPreparation`] by the configured
-//! Workflow service, over the S4-08b world (`acceptance.rs`): partner-placed orders, consent
+//! is driven through its Stage 5 seam driver [`begin_fulfillment`] by the configured Workflow
+//! service, over the S4-08b world (`acceptance.rs`): partner-placed orders, consent
 //! recorded by the customer through the real record-acceptance service, the live contract read
 //! through the development contract stub and the tolerance elections from the policy store.
 //! Compiled only with `gate-dev-stubs`.
 //!
 //! Two doubles, each labelled where it is used: S5-04's `gate.binding-deadline` is bound to pass
-//! ([`DeadlineDouble`]), and Workflow's approval reflection (row 8, S5-03) is owner SQL
+//! ([`deadline_double`]), and Workflow's approval reflection (row 8, S5-03) is owner SQL
 //! ([`approve`]), as `engine.rs` `seed` does.
-use super::acceptance::{Before, Hooked, World, customer, meta, partner, policy, record, world};
+use super::acceptance::{
+    Before, BeforeLock, Hooked, World, customer, meta, partner, policy, record, world,
+};
+use super::amend::{force, sql_work};
 use super::capture::key;
 use super::submit::{ORDER_RT, RESOURCE, SELLER, WORKFLOW, contract_fixture, elect, submit_with};
 use super::*;
@@ -21,16 +24,14 @@ use crate::infra::acceptance::{RequirementResolver, RequirementSubject};
 use crate::infra::amend::AmendService;
 use crate::infra::capture::SettledOutcome;
 use crate::infra::engine::{
-    Engine, EngineError, EngineOutcome, OutcomeKind, Preparation, PreparationView, PrepareError,
-    Prepared, TransitionRequest,
+    Engine, EngineError, EngineOutcome, OutcomeKind, PrepareError, TransitionRequest,
 };
-use crate::infra::fulfillment::BeginFulfillmentPreparation;
+use crate::infra::fulfillment::{Deadline, begin_fulfillment};
 use crate::infra::gate::budget::RunBudget;
 use crate::infra::gate::ports::ContractReads;
 use crate::infra::gate::stubs::ContractsStub;
 use crate::infra::gate::tests::orchestrate::CONTRACT;
 use crate::infra::gate::unavailable::ContractsUnavailable;
-use async_trait::async_trait;
 use bss_orders_sdk::amend::AmendOrder;
 use bss_orders_sdk::catalog::{OrderState as S, Reason, Trigger};
 use bss_orders_sdk::fulfillment::{Authorization, AuthorizationOutcome};
@@ -45,19 +46,11 @@ fn workflow() -> Caller {
     service(WORKFLOW.0, WORKFLOW.1)
 }
 
-/// TEST DOUBLE for S5-04's `gate.binding-deadline`, row 11's third guard: bound to pass so these
-/// tests observe only the two S4-10 guards. The binding deadline is S5-04's to implement.
-struct DeadlineDouble<'a>(BeginFulfillmentPreparation<'a>);
-#[async_trait]
-impl Preparation for DeadlineDouble<'_> {
-    async fn prepare(&self, view: &PreparationView) -> Result<Prepared, PrepareError> {
-        let mut prepared = self.0.prepare(view).await?;
-        prepared.guards = std::mem::take(&mut prepared.guards)
-            .bind("gate.binding-deadline", |_: &GuardSubject<'_>| {
-                GuardVerdict::Pass
-            });
-        Ok(prepared)
-    }
+/// TEST DOUBLE for S5-04's `gate.binding-deadline`, row 11's third guard: a predicate that
+/// passes, so these tests observe only the two S4-10 guards. The binding deadline is S5-04's to
+/// implement; its owner hands the predicate to the driver.
+fn deadline_double() -> Deadline {
+    Arc::new(|_: &GuardSubject<'_>| GuardVerdict::Pass)
 }
 
 /// A resolver reading the contract's `acceptance_required` as `stated` (the development contract
@@ -99,6 +92,19 @@ pub(super) async fn begin(
     outcome: Authorization,
     text: &str,
 ) -> Result<EngineOutcome, EngineError> {
+    let engine = workflow_engine(w, order);
+    begin_on(&engine, resolver, order, version, outcome, text).await
+}
+
+/// As [`begin`], on `engine` (the world's Workflow engine, possibly with a test hook).
+async fn begin_on(
+    engine: &Engine,
+    resolver: &RequirementResolver,
+    order: Uuid,
+    version: i64,
+    outcome: Authorization,
+    text: &str,
+) -> Result<EngineOutcome, EngineError> {
     let caller = workflow();
     let cancel = CancellationToken::new();
     let body = AuthorizationOutcome { outcome };
@@ -115,15 +121,16 @@ pub(super) async fn begin(
         correlation_id: None,
         execution: None,
     };
-    let preparation = DeadlineDouble(BeginFulfillmentPreparation::new(
+    begin_fulfillment(
+        engine,
+        &caller,
+        &request,
         resolver,
-        caller.ctx(),
         body,
+        &deadline_double(),
         &cancel,
-    ));
-    workflow_engine(w, order)
-        .transition(&caller, request, &preparation)
-        .await
+    )
+    .await
 }
 
 /// TEST DOUBLE for Workflow's approval reflection (row 8, S5-03): owner SQL moves a submitted
@@ -960,4 +967,42 @@ async fn a_snapshot_outside_approved_reads_nothing() {
     );
     assert_eq!(counting.calls.load(Ordering::SeqCst), 0, "no external call");
     assert_eq!(footprint(&w, order).await, before);
+}
+
+/// The read-to-lock race (D-256 item 9, D-253 item 10): the snapshot is `pending_approval`, so
+/// the preparation reads nothing, and Workflow's approval reflection (row 9, owner SQL as the
+/// labelled double) commits `approved` at the same version before the lock. The engine reaches
+/// the guards of a preparation that read nothing and aborts unsettled; the driver runs once
+/// more from a fresh snapshot, which reads the requirement and admits on the recorded consent.
+/// Never a settled `acceptance-requirement-unevaluable`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn approval_reflected_between_snapshot_and_lock_begins_after_one_more_pass() {
+    let w = world(contract_fixture(Some(true))).await;
+    let (order, n) = approved(&w, "bf-lock", true).await;
+    force(&w.f, order, "state = 'pending_approval'").await;
+    let hook = BeforeLock::new(sql_work(&w.f, "state = 'approved'".to_owned(), order));
+    let engine = workflow_engine(&w, order).with_fault(hook.clone());
+    let r = resolver(&w, Some(true), true);
+    let out = begin_on(
+        &engine,
+        &r,
+        order,
+        n,
+        Authorization::Authorized,
+        "bf-lock-1",
+    )
+    .await;
+    assert_eq!(hook.passes(), 2, "one more pass after the race: {out:?}");
+    let out = out.unwrap();
+    assert!(matches!(out.kind, OutcomeKind::Committed { .. }), "{out:?}");
+    assert_eq!(flag(&w, order).await, json!(["in_fulfillment", null]));
+    let refused =
+        w.f.t
+            .n(&format!(
+                "SELECT count(*) AS n FROM bss_orders__transition_audit WHERE order_id='{order}' \
+             AND trigger='begin-fulfillment' AND outcome <> 'committed'"
+            ))
+            .await;
+    assert_eq!(refused, 0, "no refusal was settled or audited");
 }

@@ -153,6 +153,13 @@ pub struct Prepared {
     /// self-service consent, D-251; record-acceptance, D-255), reported on commit (D-257).
     /// Observability only; the documents write the row.
     pub consent: Option<signals::ConsentObservation>,
+    /// The preparation read nothing because its snapshot could not be admitted (a state outside
+    /// the row, another current version): the engine is expected to refuse by precedence. Should
+    /// the locked decision get past precedence (the order became admissible between the snapshot
+    /// and the lock), the attempt aborts unsettled and writes nothing ([`Abort::Raced`]); the
+    /// caller, holding the [`Reached`] witness of its passing guards, runs once more from a
+    /// fresh snapshot (D-253 item 10, D-255 item 9, D-256 item 9).
+    pub unread: bool,
 }
 impl Prepared {
     /// A contribution with no inputs, guards, documents or event.
@@ -173,7 +180,43 @@ impl Prepared {
             assessment_id: None,
             authorization: None,
             consent: None,
+            unread: false,
         }
+    }
+}
+
+/// The witness of a read-to-lock race (D-253 item 10, D-255 item 9, D-256 item 9). A
+/// preparation whose snapshot cannot be admitted reads nothing, sets [`Prepared::unread`] and
+/// binds its guards through [`Self::passing`]. The engine evaluates guards only when the locked
+/// order is admissible, so a reached witness with an error proves the race: the attempt aborted
+/// unsettled ([`Abort::Raced`]), wrote nothing, and the caller runs once more from a fresh
+/// snapshot, once. A race on that second pass answers what the engine answered (`unavailable`).
+#[derive(Debug, Clone, Default)]
+pub struct Reached(Arc<AtomicBool>);
+impl Reached {
+    /// A witness nothing has reached yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// The guards `names` bound passing, each recording that the engine evaluated it. They
+    /// never admit: the engine aborts an unread preparation that gets past precedence.
+    #[must_use]
+    pub fn passing(&self, names: impl IntoIterator<Item = &'static str>) -> GuardBindings {
+        names
+            .into_iter()
+            .fold(GuardBindings::new(), |bindings, name| {
+                let reached = Arc::clone(&self.0);
+                bindings.bind(name, move |_: &transition::GuardSubject<'_>| {
+                    reached.store(true, Ordering::SeqCst);
+                    transition::GuardVerdict::Pass
+                })
+            })
+    }
+    /// Whether the engine evaluated a guard of the unread preparation.
+    #[must_use]
+    pub fn reached(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -372,6 +415,10 @@ impl Registries {
 #[async_trait]
 pub trait FaultHook: Send + Sync {
     async fn at(&self, point: FaultPoint, tx: &DbTx<'_>) -> Result<(), Abort>;
+    /// Runs after a caller transition's preparation and before its transaction takes the
+    /// aggregate lock: a concurrent writer between the snapshot and the lock (the read-to-lock
+    /// race, D-253 item 10, D-255, D-256).
+    async fn prepared(&self) {}
 }
 
 struct Inner {
@@ -805,6 +852,10 @@ impl Engine {
             }
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
+        #[cfg(test)]
+        if let Some(hook) = &inner.fault {
+            hook.prepared().await;
+        }
         let attempt = Arc::new(Attempt {
             caller: caller.clone(),
             actor,
@@ -1961,6 +2012,17 @@ impl AbortContext {
 /// the `error` field and a fixed message.
 fn log_abort(abort: &Abort, body_completed: bool, context: AbortContext) -> EngineError {
     let error = errors::terminate(abort, body_completed);
+    if matches!(abort, Abort::Raced) {
+        tracing::debug!(
+            target: "orders.engine",
+            trigger = context.trigger.token(),
+            order_id = context.order_id.map(tracing::field::display),
+            correlation_id = context.correlation_id.map(tracing::field::display),
+            "bss-orders: the order became admissible between the snapshot and the lock; \
+             nothing written"
+        );
+        return error;
+    }
     if let EngineError::NotDelivered(capability) = error {
         errors::log_not_delivered(capability);
         return error;
@@ -2675,6 +2737,11 @@ async fn existing_body<'a>(
         &admin_lines,
         acceptance_recorded,
     )?;
+    // A preparation that read nothing never settles past precedence: the order became
+    // admissible between its snapshot and this lock (D-253 item 10). Abort unsettled.
+    if a.prepared.unread && !precedence(&decision) {
+        return Err(Abort::Raced);
+    }
     let execution_id = owned.record().execution_id;
     let settle = Settle {
         owned,
@@ -2745,6 +2812,15 @@ async fn existing_body<'a>(
         &administrative,
     ))
     .await
+}
+
+/// Whether `decision` is the state table's precedence refusal, decided before any guard.
+fn precedence(decision: &Decision<'_>) -> bool {
+    matches!(
+        decision,
+        Decision::Engine(refusal)
+            if !matches!(refusal, transition::EngineRefusal::ResumeTargetMissing)
+    )
 }
 
 /// Registry ownership and, for D-188/D-198, the recovered durable execution.

@@ -23,7 +23,7 @@ use crate::infra::engine::documents::EventEnqueue;
 use crate::infra::engine::signals::ConsentObservation;
 use crate::infra::engine::{
     ChildDocuments, DocumentWriter, Engine, EventSpec, Preparation, PreparationView, PrepareError,
-    Prepared, TransitionRequest,
+    Prepared, Reached, TransitionRequest,
 };
 use crate::infra::events::EventEnqueueError;
 use crate::infra::events::payload::OrderAcceptanceRecorded;
@@ -216,7 +216,9 @@ const RECORDING_PARTY: &str = "preconditions.recording-party";
 /// `acceptance × record` on the target (resource-tenant membership is the PDP's), replays a
 /// settled key, takes the authorized snapshot with the
 /// [`RecordingFacts`](crate::infra::engine::RecordingFacts) and the trusted actor, then decides
-/// state, version and the two guards under the aggregate lock.
+/// state, version and the two guards under the aggregate lock. When the snapshot could not be
+/// admitted but the locked order is (the read-to-lock race), the engine aborts unsettled and the
+/// service runs once more from a fresh snapshot, once (D-253 item 10, D-255 item 9).
 pub struct AcceptanceService {
     engine: Arc<ArcSwapOption<Engine>>,
     resolver: RequirementResolver,
@@ -247,13 +249,58 @@ impl AcceptanceService {
         cancel: &CancellationToken,
     ) -> Result<Settled, OrdersError> {
         let engine = self.engine.load_full().ok_or(OrdersError::Unavailable)?;
+        // One pass, and a second one only when the engine reached the guards of a preparation
+        // whose snapshot it could not admit; a second race answers what the engine answered.
+        let reached = Reached::new();
+        match self
+            .pass(&engine, caller, order_id, &request, meta, cancel, &reached)
+            .await
+        {
+            Err(_) if reached.reached() => {
+                tracing::debug!(
+                    target: "orders.acceptance",
+                    order_id = %order_id,
+                    "bss-orders: the order became admissible between the snapshot and the lock; \
+                     deciding again"
+                );
+                self.pass(
+                    &engine,
+                    caller,
+                    order_id,
+                    &request,
+                    meta,
+                    cancel,
+                    &Reached::new(),
+                )
+                .await
+            }
+            answer => answer,
+        }
+    }
+
+    /// One engine attempt of row 25.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attempt reads the engine, the caller, the target, the body, the call \
+                  metadata, the cancellation and the race witness"
+    )]
+    async fn pass(
+        &self,
+        engine: &Engine,
+        caller: &Caller,
+        order_id: Uuid,
+        request: &Acceptance,
+        meta: &CallMeta,
+        cancel: &CancellationToken,
+        reached: &Reached,
+    ) -> Result<Settled, OrdersError> {
         let transition = TransitionRequest {
             order_id,
             trigger: Trigger::RecordAcceptance,
             operation: OPERATION,
             expected_version: meta.expected_version,
             expected_draft_revision: None,
-            document: fingerprint_document(&request)?,
+            document: fingerprint_document(request)?,
             proposed: None,
             caller_reason: None,
             idempotency_key: meta.idempotency_key.clone(),
@@ -266,6 +313,7 @@ impl AcceptanceService {
             ctx: caller.ctx(),
             expected_version: i32::from(meta.expected_version),
             cancel,
+            reached,
         };
         let outcome = engine.transition(caller, transition, &preparation).await?;
         Ok(Settled::from_outcome(outcome))
@@ -275,14 +323,16 @@ impl AcceptanceService {
 /// Row 25's preparation (05 *Record Acceptance* steps 2-6, D-255), from the engine's authorized
 /// snapshot:
 ///
-/// 1. the role versions of the expected version ([`role_versions`]): version 1 (`create`), the
-///    actual submit version and, when the expected version was appended by an amendment, that
-///    version. When the snapshot cannot be admitted (a state outside row 25, a current version
-///    other than the expected one, or a role version it does not hold) the engine refuses by
-///    precedence before any guard (`not-admissible`, `precondition-failed`); nothing external is
-///    read, and should the guards be reached after all (a version committed between the snapshot
-///    and the lock) the input is unresolvable, so the attempt refuses
-///    `acceptance-requirement-unevaluable` and never records on unread facts;
+/// 1. admissibility of the snapshot: a state outside row 25 or a current version other than the
+///    expected one reads nothing external, and the engine refuses by precedence before any guard
+///    (`not-admissible`, `precondition-failed`). Should the guards be reached after all (the
+///    order became admissible between the snapshot and the lock), they are the [`Reached`]
+///    witness's and the preparation is [`Prepared::unread`]: the engine aborts unsettled, never
+///    records on unread facts, and the service runs once more (D-253 item 10, D-255 item 9).
+///    Then the role versions of the expected version ([`role_versions`]): version 1 (`create`),
+///    the actual submit version and, when the expected version was appended by an amendment,
+///    that version. An admissible snapshot without them is a broken store contract
+///    (integration), never a settled refusal;
 /// 2. the recording-party bar over the trusted actor's reference
 ///    ([`AuditActor::reference`](crate::domain::audit::AuditActor::reference), the spelling of
 ///    `order_version.actor`) and the stored sales path. A barred caller records
@@ -303,6 +353,7 @@ struct RecordPreparation<'a> {
     ctx: &'a SecurityContext,
     expected_version: i32,
     cancel: &'a CancellationToken,
+    reached: &'a Reached,
 }
 
 /// The role versions of `expected` among `versions` (05 §3.2 step 1); `None` when version 1,
@@ -332,21 +383,35 @@ impl Preparation for RecordPreparation<'_> {
         let recording = view.recording.as_ref().ok_or(PrepareError::Integration)?;
         let facts = &view.facts;
         let mut prepared = Prepared::new(AggregateContribution::None);
-        let roles = role_versions(&recording.versions, self.expected_version);
         let admissible = facts.current_version == self.expected_version
             && self
                 .table
                 .lookup(facts.state, Trigger::RecordAcceptance)
                 .is_some();
+        // 1. Not admissible from this snapshot: the engine refuses by precedence.
+        if !admissible {
+            prepared.unread = true;
+            prepared.inputs =
+                Inputs::new().with(InputPort::AcceptanceRequirement, InputState::Resolved);
+            prepared.guards = self.reached.passing([NOT_RECORDED, RECORDING_PARTY]);
+            return Ok(prepared);
+        }
+        let Some(roles) = role_versions(&recording.versions, self.expected_version) else {
+            tracing::error!(
+                target: "orders.acceptance",
+                order_id = %facts.order_id,
+                version = self.expected_version,
+                "bss-orders: an admissible order lacks its create or submit version row"
+            );
+            return Err(PrepareError::Integration);
+        };
         let caller = view.actor.reference();
-        let barred = roles.as_ref().is_some_and(|roles| {
-            recording_party_barred(
-                &caller,
-                recording.sales_path,
-                facts.resource_tenant_id,
-                roles,
-            )
-        });
+        let barred = recording_party_barred(
+            &caller,
+            recording.sales_path,
+            facts.resource_tenant_id,
+            &roles,
+        );
         prepared.guards = GuardBindings::new()
             .bind(NOT_RECORDED, |subject: &GuardSubject<'_>| {
                 if subject.acceptance_recorded {
@@ -362,14 +427,6 @@ impl Preparation for RecordPreparation<'_> {
                     GuardVerdict::Pass
                 }
             });
-        // 1. Not admissible from this snapshot: the engine refuses by precedence.
-        if roles.is_none() || !admissible {
-            prepared.inputs = Inputs::new().with(
-                InputPort::AcceptanceRequirement,
-                InputState::Unresolvable(Reason::AcceptanceRequirementUnevaluable),
-            );
-            return Ok(prepared);
-        }
         // 2. A barred caller: decided from stored facts, nothing is recorded or read.
         if barred {
             prepared.inputs =

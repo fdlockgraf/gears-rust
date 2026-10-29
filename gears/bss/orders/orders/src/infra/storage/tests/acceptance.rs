@@ -4,7 +4,7 @@
 //! buyer, a customer, a partner, a plain member and a seller operator. Every recorded consent is
 //! read back through `ReadService::get_acceptance` (S4-06), never by SQL. Compiled only with
 //! `gate-dev-stubs`.
-use super::amend::change_quantity;
+use super::amend::{Work, change_quantity};
 use super::capture::{BUYER, create_meta, key, s, view, write};
 use super::submit::{
     FailAt, Fixture, ORDER_RT, RESOURCE, SELLER, contract_fixture, elect, last_event, line,
@@ -19,7 +19,7 @@ use crate::domain::gate::ports::PortAnswer;
 use crate::infra::acceptance::{AcceptanceService, RequirementResolver};
 use crate::infra::amend::AmendService;
 use crate::infra::capture::{CaptureService, CaptureSettings, Settled, SettledOutcome};
-use crate::infra::engine::{Engine, FaultPoint};
+use crate::infra::engine::{Abort, Engine, FaultHook, FaultPoint};
 use crate::infra::gate::budget::RunBudget;
 use crate::infra::gate::ports::ContractReads;
 use crate::infra::gate::stubs::{ContractsStub, StubFixture};
@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
+use toolkit_db::DbTx;
 use toolkit_security::SecurityContext;
 
 const ACCEPTANCE_RT: &str = "gts.cf.bss.orders.acceptance.v1~";
@@ -364,6 +365,36 @@ impl ContractReads for Hooked {
         self.calls.fetch_add(1, Ordering::SeqCst);
         (self.before)().await;
         self.inner.resolve(ctx, queries, run, cancel).await
+    }
+}
+
+/// Runs `work` once, when the first attempt of the engine it is bound to is between its
+/// preparation and the aggregate lock (`FaultHook::prepared`): a concurrent writer in the
+/// read-to-lock window. `passes` counts the attempts that reached that point.
+pub(super) struct BeforeLock {
+    work: Work,
+    passes: AtomicUsize,
+}
+impl BeforeLock {
+    pub(super) fn new(work: Work) -> Arc<Self> {
+        Arc::new(Self {
+            work,
+            passes: AtomicUsize::new(0),
+        })
+    }
+    pub(super) fn passes(&self) -> usize {
+        self.passes.load(Ordering::SeqCst)
+    }
+}
+#[async_trait]
+impl FaultHook for BeforeLock {
+    async fn at(&self, _: FaultPoint, _: &DbTx<'_>) -> Result<(), Abort> {
+        Ok(())
+    }
+    async fn prepared(&self) {
+        if self.passes.fetch_add(1, Ordering::SeqCst) == 0 {
+            (self.work)().await;
+        }
     }
 }
 
@@ -906,4 +937,101 @@ async fn the_live_contract_then_the_elections_decide_the_source() {
         assert_eq!(current.requirement_source, source, "{stated:?}");
         assert_eq!(last_event(&w.f).await["requirementSource"], json!(source));
     }
+}
+
+/// The read-to-lock race (D-255 item 9, D-253 item 10): the engine's snapshot cannot be admitted
+/// (its current version is not the expected N; owner SQL stands in for a version committed
+/// between the snapshot and the lock), so the preparation reads nothing, and the order is
+/// current at N under the lock. The engine reaches the guards of a preparation that read
+/// nothing, aborts unsettled, and the service runs once more from a fresh snapshot: the consent
+/// is recorded on N, never a settled `acceptance-requirement-unevaluable`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_version_current_only_at_the_lock_records_after_one_more_pass() {
+    let w = world(contract_fixture(Some(true))).await;
+    let (order, n) = w
+        .submitted(&partner(), &partner(), Some(CONTRACT), "rec-lock")
+        .await;
+    let raw = w.f.t.env.pg.raw.clone();
+    raw.execute_unprepared(&current_version_sql(order, 1))
+        .await
+        .unwrap();
+    let work: Work = Arc::new(move || {
+        let raw = raw.clone();
+        Box::pin(async move {
+            raw.execute_unprepared(&current_version_sql(order, n))
+                .await
+                .unwrap();
+        })
+    });
+    let hook = BeforeLock::new(work);
+    let svc = w.recorder_with(
+        Arc::new(w.engine.with_fault(hook.clone())),
+        Arc::new(ContractsStub::new(Arc::new(w.stubs.clone()))),
+    );
+    let settled = record(&svc, &customer(), order, n, "rec-lock-1").await;
+    assert_eq!(
+        hook.passes(),
+        2,
+        "one more pass after the race: {settled:?}"
+    );
+    let settled = settled.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let current = w
+        .consent(&customer(), order)
+        .await
+        .current_acceptance
+        .unwrap();
+    assert_eq!(current.accepted_version, OrderVersion::try_from(n).unwrap());
+    assert_eq!(w.rows(order).await, 1);
+    let refused =
+        w.f.t
+            .n(&format!(
+                "SELECT count(*) AS n FROM bss_orders__transition_audit WHERE order_id='{order}' \
+             AND trigger='record-acceptance' AND outcome <> 'committed'"
+            ))
+            .await;
+    assert_eq!(refused, 0, "no refusal was settled or audited");
+}
+
+/// Owner SQL setting `order`'s current version, its constraints checked at once: the deferrable
+/// version foreign key would otherwise leave a pending trigger event that blocks re-enabling
+/// the triggers.
+fn current_version_sql(order: Uuid, version: i64) -> String {
+    format!(
+        "SET CONSTRAINTS ALL IMMEDIATE; \
+         ALTER TABLE bss_orders__order DISABLE TRIGGER USER; \
+         UPDATE bss_orders__order SET current_version = {version} WHERE order_id='{order}'; \
+         ALTER TABLE bss_orders__order ENABLE TRIGGER USER;"
+    )
+}
+
+/// An admissible snapshot whose role versions are missing (a submitted order without its submit
+/// version row) is a broken store contract: an integration failure, never a settled 503.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_admissible_snapshot_without_role_versions_is_an_integration_failure() {
+    let w = world(contract_fixture(Some(true))).await;
+    let (order, n) = w
+        .submitted(&partner(), &partner(), Some(CONTRACT), "rec-roles")
+        .await;
+    w.f.t
+        .env
+        .pg
+        .sql(&format!(
+            "ALTER TABLE bss_orders__order_version DISABLE TRIGGER USER; \
+             UPDATE bss_orders__order_version SET reason='amendment', \
+             amendment_reason='stand-in' WHERE order_id='{order}' AND reason='submit'; \
+             ALTER TABLE bss_orders__order_version ENABLE TRIGGER USER;"
+        ))
+        .await
+        .unwrap();
+    let before = w.shape(order).await;
+    let answer = record(&w.recorder(), &customer(), order, n, "rec-roles-1").await;
+    assert!(
+        matches!(answer, Err(OrdersError::Integration)),
+        "{answer:?}"
+    );
+    assert_eq!(w.rows(order).await, 0);
+    assert_eq!(w.shape(order).await, before);
 }

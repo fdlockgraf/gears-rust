@@ -37,21 +37,22 @@ pub mod engine;
 pub mod error_mapping;
 pub mod events;
 pub mod execution;
-/// The begin-fulfillment consent and payment guard (S4-10, D-256): row 11's preparation. The
-/// operation is an undelivered Workflow seam until Stage 5, so only the engine tests drive it.
+/// The begin-fulfillment consent and payment guard (S4-10, D-256): row 11's preparation and the
+/// Stage 5 seam's driver. The operation is an undelivered Workflow seam until Stage 5, so only
+/// the engine tests call the driver.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
         reason = "begin_fulfillment is an undelivered Workflow seam (Stage 5); only the engine \
-                  tests drive the preparation until then (D-256)"
+                  tests call its driver until then (D-256)"
     )
 )]
 #[cfg_attr(
     all(test, not(feature = "gate-dev-stubs")),
     expect(
         dead_code,
-        reason = "the PostgreSQL tests that drive the preparation need `gate-dev-stubs`"
+        reason = "the PostgreSQL tests that call the driver need `gate-dev-stubs`"
     )
 )]
 pub mod fulfillment;
