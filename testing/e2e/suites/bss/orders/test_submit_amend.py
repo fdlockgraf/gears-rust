@@ -3,7 +3,7 @@ S4-03/S4-04).
 
 A buyer submits an order (version 2, ``test_submit.py``'s path) and amends it through
 ``POST /bss-orders/v1/orders/{orderId}/amendments`` (``api/rest/amend.rs``), mounted with the
-submit route (D-231). The amendment re-runs the gate over every proposed line, reserves the next
+submit route (D-235). The amendment re-runs the gate over every proposed line, reserves the next
 candidate M and commits it through the engine: ``order_version`` M supersedes N with reason
 ``amendment`` and the caller's explanation, and one ``OrderAmended`` is enqueued with the
 transition. The Orders producer's Event Broker grant is the family prefix in

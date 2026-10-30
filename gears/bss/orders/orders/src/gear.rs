@@ -137,7 +137,7 @@ fn dev_acceptance(
     None
 }
 
-/// The services that ride the submit service's development delivery (D-231): the amendment
+/// The services that ride the submit service's development delivery (D-235): the amendment
 /// service runs the submit pipeline (S4-03/S4-04), and recording consent after submit (S4-08b,
 /// D-255) reads its requirement through the gate's contract port (the development stub here,
 /// fail-closed otherwise) and the policy elections. Both `None` without the submit service.

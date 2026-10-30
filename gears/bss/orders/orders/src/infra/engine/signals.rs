@@ -1,4 +1,4 @@
-//! What the engine reports when an attempt is decided (S4-12, D-257; D-223 naming; the D-233
+//! What the engine reports when an attempt is decided (S4-12, D-257; D-223 naming; the D-237
 //! `GateSignals` and the read path's `ReadSignals` patterns). The engine is the decision point of
 //! every Stage 4 operation: amendment, administrative edit, consent recording, begin-fulfillment
 //! and the Workflow reflections all settle through [`Engine::transition`](super::Engine::transition),

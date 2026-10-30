@@ -3,7 +3,7 @@ S4-06 and S4-08b).
 
 The three history reads are production routes (``GET /orders/{id}/versions``,
 ``.../versions/{version}``, ``.../acceptance``, D-254); ``POST /orders/{id}/acceptance`` is the
-development delivery's (D-255, D-231). The file name sorts after ``test_submit.py`` and
+development delivery's (D-255, D-235). The file name sorts after ``test_submit.py`` and
 ``test_submit_amend.py``: both depend on the session's earlier throttle state of their buyers.
 
 Reason tokens and statuses come from ``orders-sdk/contracts/catalog.json`` through

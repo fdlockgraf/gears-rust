@@ -32,7 +32,7 @@
 //!    the version contribution names the reserved candidate, the claims are the frozen keys,
 //!    the event is `OrderSubmitted`; the settlement carries the frozen gate report and the
 //!    engine writes the frozen outcome vector as the run's diagnostics, whether this call
-//!    assessed or recovered the attempt (D-231);
+//!    assessed or recovered the attempt (D-235);
 //! 7. automatic consent (S4-08a, D-146, D-251), only when nothing refused: decided from the
 //!    frozen attempt (its original principal's tenant and proof reference) against the resource
 //!    tenant the engine locked, so a recovered attempt decides as the fresh one did. A
@@ -386,7 +386,7 @@ impl ReservedAttempt {
     /// Step 6's shared part over `evidence`: the row's resolved inputs (a recorded unevaluable
     /// refusal or unstorable totals as the input that settles it), the commercial guards after
     /// the row's own (`structural`, binding admission, date basis, composite gate), the claims
-    /// (the frozen keys of every line) and the frozen run (D-231). `own` are the row's request
+    /// (the frozen keys of every line) and the frozen run (D-235). `own` are the row's request
     /// guards; `version_row` the persisted bytes of the version row; `item_capacity` the
     /// authored-selection capacity verdict over the committed content.
     #[expect(

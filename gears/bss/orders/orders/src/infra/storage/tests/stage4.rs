@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 
-/// A payer the AM double knows but outside the resource relationship (D-215/D-228).
+/// A payer the AM double knows but outside the resource relationship (D-215/D-232).
 const UNRELATED_PAYER: u128 = 31;
 
 /// The S3 example fixture with the contract requiring consent, two lines admitted on its one

@@ -76,7 +76,7 @@ impl LocalOrdersClient {
     }
 
     /// Deliver amendment through `amend` (the gear passes `Some` only in the development
-    /// delivery, D-231).
+    /// delivery, D-235).
     #[must_use]
     pub fn with_amend(mut self, amend: Option<Arc<AmendService>>) -> Self {
         self.amend = amend;
@@ -84,7 +84,7 @@ impl LocalOrdersClient {
     }
 
     /// Deliver record-acceptance through `acceptance` (the gear passes `Some` only in the
-    /// development delivery, D-231, D-255).
+    /// development delivery, D-235, D-255).
     #[must_use]
     pub fn with_acceptance(mut self, acceptance: Option<Arc<AcceptanceService>>) -> Self {
         self.acceptance = acceptance;
@@ -321,7 +321,7 @@ impl OrdersV1 for LocalOrdersClient {
         meta: CallMeta,
     ) -> Result<TransitionResult, OrdersError> {
         // Production: amendment is Stage 4 (S4-04), undelivered; the development delivery runs
-        // the amendment service (D-231).
+        // the amendment service (D-235).
         let Some(service) = &self.amend else {
             return Err(not_delivered("amend (S4-04)").into());
         };
@@ -346,7 +346,7 @@ impl OrdersV1 for LocalOrdersClient {
         meta: CallMeta,
     ) -> Result<TransitionResult, OrdersError> {
         // Production: recording consent after submit is Stage 4 (S4-08b), development-delivered
-        // like amendment (D-231, D-255).
+        // like amendment (D-235, D-255).
         let Some(service) = &self.acceptance else {
             return Err(not_delivered("record_acceptance (S4-08b)").into());
         };

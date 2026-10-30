@@ -100,7 +100,7 @@ Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_RE
 
 **Success**: Both initial partner-path and renewed post-amendment acceptance can be recorded by an eligible customer. **Errors**: Missing permissions, barred recording actor, stale version (`precondition-failed`, 412, D-212), existing current-version record or unavailable policy input never manufacture acceptance.
 
-**Implementation note (S4-08b, D-255).** Delivered in the development delivery only (D-231):
+**Implementation note (S4-08b, D-255).** Delivered in the development delivery only (D-235):
 `AcceptanceService` (`infra/acceptance.rs`) behind `POST /orders/{orderId}/acceptance` and
 `OrdersV1::record_acceptance`; steps 1 to 5 are implemented, step 6 is S4-06's read (D-254). The
 body is exactly `{}`, so a caller-supplied instant or actor is a boundary `request-invalid`. The
@@ -228,7 +228,7 @@ election read answers `unavailable` and commits nothing. The row and the `OrderS
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-acceptance`
 
-> **Status (2026-10-29): locally complete; record-acceptance in the development delivery (D-231, D-255), consent on submit with submit, history reads in production (D-254); open pending real providers.** Unchecked on purpose. Open gates: the Contracts `acceptance_required` SDK (missing; development stub or fail-closed); Q-30 acceptance surface for partner-placed orders (a seller election helps only contract-silent or contract-less orders); production PDP policy restricting `acceptance × record` to resource-tenant members (D-255 item 10); submit's production delivery (D-251 item 9); consent p95 < 1 s unmeasured (S6-06). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
+> **Status (2026-10-29): locally complete; record-acceptance in the development delivery (D-235, D-255), consent on submit with submit, history reads in production (D-254); open pending real providers.** Unchecked on purpose. Open gates: the Contracts `acceptance_required` SDK (missing; development stub or fail-closed); Q-30 acceptance surface for partner-placed orders (a seller election helps only contract-silent or contract-less orders); production PDP policy restricting `acceptance × record` to resource-tenant members (D-255 item 10); submit's production delivery (D-251 item 9); consent p95 < 1 s unmeasured (S6-06). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-257).
 
 The system **MUST** implement both acceptance flows, current-version uniqueness, stored-actor checks and authorized history without inferred consent.
 

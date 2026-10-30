@@ -30,7 +30,7 @@
 //!    earlier guard under the lock and settles it;
 //! 5. the shared Stage 3 assessment over every proposed line ([`SubmitService::assess`],
 //!    [`GateTarget::Amendment`], the proposed payer on the axes): a blocking assessment refuses
-//!    through the engine without reserving (D-230's primary refusal);
+//!    through the engine without reserving (D-234's primary refusal);
 //! 6. the D-188 attempt: the inputs are frozen and the candidate M reserved under the engine's
 //!    E1 recheck (state and version under the reservation lock); phase B commands Pricing for
 //!    every line at M; phase C commits M through [`AmendPreparation`]. Nothing from N is evidence

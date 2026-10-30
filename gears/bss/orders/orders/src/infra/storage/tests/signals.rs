@@ -1,4 +1,4 @@
-//! The Stage 4 fault-injection matrix (S4-12, D-257 item 3; the D-233 item 6 pattern): one test
+//! The Stage 4 fault-injection matrix (S4-12, D-257 item 3; the D-237 item 6 pattern): one test
 //! per injected condition, each proving that the observation behind its alert is emitted by the
 //! engine at the decision point, on real PostgreSQL. Every engine the harness builds reports to
 //! the recording sink `T::transitions`. Row 1 (amendment assessment failure) is a gate row:

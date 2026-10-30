@@ -410,7 +410,7 @@ async fn new_version_has_no_consent() {
     assert_eq!(acceptances(&f, order).await, consent_n);
 }
 
-/// D-215/D-228: a payer change is assessed by gate predicate 1 like a submit; a payer outside
+/// D-215/D-232: a payer change is assessed by gate predicate 1 like a submit; a payer outside
 /// the resource relationship refuses `payer-relationship-unconfirmed`, audited and settled, and
 /// N stays current.
 #[tokio::test]

@@ -12005,7 +12005,7 @@ One row per Stage 4 operation, at commit `44aa09ef3` (2026-10-29). "Missing" mea
 SDK or runtime exists in this repository; a double named here is a test or development double
 and is **never** evidence. Every gate stays unchecked: no row is passed because its double works.
 Scope: *production* (mounted in every build), *development* (`gate-dev-stubs` feature **and**
-`gate.dev_stubs`, D-231), *engine-only* (no route; driven through the Stage 5 seam driver
+`gate.dev_stubs`, D-235), *engine-only* (no route; driven through the Stage 5 seam driver
 `infra::fulfillment::begin_fulfillment` in tests, D-256 item 9).
 
 | Operation | Providers: SDK revision or missing | Double used | Principal / grants | Evidence (identity, freshness) | Enabled scope | Gate |

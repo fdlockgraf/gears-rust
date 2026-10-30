@@ -1,6 +1,6 @@
 //! The amendment route (S4-03): `POST /bss-orders/v1/orders/{orderId}/amendments`.
 //!
-//! Development delivery only (D-231), exactly as [`super::gate::submit_router`]: the gear mounts
+//! Development delivery only (D-235), exactly as [`super::gate::submit_router`]: the gear mounts
 //! [`amend_router`] only with the `gate-dev-stubs` feature **and** `gate.dev_stubs = true`, outside
 //! [`super::DELIVERED_OPERATIONS`]. Boundary order is the existing-order writes' (D-142, D-149):
 //! the per-(caller, order) edge limiter, the required `If-Match` (428), `Idempotency-Key`,
