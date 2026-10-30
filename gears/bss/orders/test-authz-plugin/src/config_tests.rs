@@ -102,7 +102,7 @@ fn the_suite_config_block_parses_and_validates() {
     let buyers: Vec<&Rule> = cfg
         .rules
         .iter()
-        .filter(|r| r.id.starts_with("e2e-buyer-"))
+        .filter(|r| r.id.starts_with("e2e-buyer-") && !r.id.ends_with("-acceptance"))
         .collect();
     assert_eq!(
         buyers.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -121,7 +121,9 @@ fn the_suite_config_block_parses_and_validates() {
         assert_eq!(buyer.resource_type, "gts.cf.bss.orders.order.v1~");
         assert_eq!(
             buyer.actions,
-            ["create", "write", "edit", "read", "preview", "submit", "amend"],
+            [
+                "create", "write", "edit", "read", "preview", "submit", "amend"
+            ],
             "{}",
             buyer.id
         );
@@ -131,6 +133,35 @@ fn the_suite_config_block_parses_and_validates() {
         assert_eq!(predicate.values, ["a0000000-0000-4000-8000-00000000000a"]);
         assert_eq!(predicate.value, None);
         assert!(buyer.delegation.is_none());
+    }
+
+    // S4-08b: each buyer, as the customer, records consent on resource tenant A's orders, one
+    // `acceptance × record` rule per buyer and nothing else.
+    let consents: Vec<&Rule> = cfg
+        .rules
+        .iter()
+        .filter(|r| r.id.starts_with("e2e-buyer-") && r.id.ends_with("-acceptance"))
+        .collect();
+    assert_eq!(
+        consents.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        (1..=8)
+            .map(|i| format!("e2e-buyer-{i}-acceptance"))
+            .collect::<Vec<_>>()
+    );
+    for (buyer, consent) in buyers.iter().zip(&consents) {
+        assert_eq!(consent.subject.id, buyer.subject.id, "{}", consent.id);
+        assert_eq!(consent.subject.tenant_id, None);
+        assert_eq!(consent.resource_type, "gts.cf.bss.orders.acceptance.v1~");
+        assert_eq!(consent.actions, ["record"], "{}", consent.id);
+        let [path] = consent.paths.as_slice() else {
+            panic!("{}: exactly one path", consent.id)
+        };
+        let [predicate] = path.predicates.as_slice() else {
+            panic!("{}: exactly one predicate", consent.id)
+        };
+        assert_eq!(predicate.property, "resource_tenant_id");
+        assert_eq!(predicate.values, ["a0000000-0000-4000-8000-00000000000a"]);
+        assert!(consent.delegation.is_none());
     }
 
     // The delegated partner reads only with an accepted proof reference.
