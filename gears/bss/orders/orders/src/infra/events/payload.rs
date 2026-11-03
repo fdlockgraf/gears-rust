@@ -616,19 +616,8 @@ impl EventKind for OrderFulfillmentFailed {
     }
 }
 
-/// The acceptance requirement source (05 §4.2; `orders_acceptance.requirement_source`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequirementSource {
-    /// A contract requires acceptance.
-    Contract,
-    /// A seller-scope election requires acceptance.
-    Seller,
-    /// The platform-scope election, or its unset fallback, requires acceptance.
-    PlatformDefault,
-    /// Acceptance was recorded although none was required.
-    Volunteered,
-}
+/// The acceptance requirement source (05 §4.2), declared once with the acceptance rules.
+pub use crate::domain::preconditions::RequirementSource;
 
 /// Row 25.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

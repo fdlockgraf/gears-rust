@@ -273,63 +273,148 @@ gears:
       rules:
         # Each buyer authors on resource tenant A; one identical rule per buyer identity. The
         # policy names no payer: which payer an order names is a business rule (D-215). Preview
-        # and submit (M3b) are the PEP's `preview`/`submit` actions under the same constraint.
+        # and submit (M3b) and amendments (S4-03) are the PEP's `preview`/`submit`/`amend`
+        # actions under the same constraint.
         - id: "e2e-buyer-1"
           subject: { id: "11111111-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-2"
           subject: { id: "11111112-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-3"
           subject: { id: "11111113-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-4"
           subject: { id: "11111114-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-5"
           subject: { id: "11111115-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-6"
           subject: { id: "11111116-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-7"
           subject: { id: "11111117-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
         - id: "e2e-buyer-8"
           subject: { id: "11111118-6a88-4768-9dfc-6bcd5187d9ed" }
           resource_type: "gts.cf.bss.orders.order.v1~"
-          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          actions: ["create", "write", "edit", "read", "preview", "submit", "amend"]
           paths:
             - predicates:
                 - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        # S4-08b: every buyer, as the customer, records consent on its own tenant's orders.
+        - id: "e2e-buyer-1-acceptance"
+          subject: { id: "11111111-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-2-acceptance"
+          subject: { id: "11111112-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-3-acceptance"
+          subject: { id: "11111113-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-4-acceptance"
+          subject: { id: "11111114-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-5-acceptance"
+          subject: { id: "11111115-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-6-acceptance"
+          subject: { id: "11111116-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-7-acceptance"
+          subject: { id: "11111117-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-8-acceptance"
+          subject: { id: "11111118-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        # S4-08b: the partner places orders for resource tenant A (create/edit/submit under an
+        # accepted proof reference) and attempts to record consent on them; the recording-party
+        # bar, not the grant, refuses it.
+        - id: "e2e-partner-places"
+          subject: { id: "dddddddd-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+          delegation:
+            proof_property: "delegation_proof_ref"
+            accepted: ["e2e-proof-ok"]
+        # Intentionally over-broad: grants the partner (a role actor on the orders it places)
+        # `acceptance × record` so the e2e suite exercises the recording-party bar (D-256). The
+        # bar stops only role actors; production PDP policy must restrict `acceptance × record`
+        # to resource-tenant members (D-256 item 10, readiness register).
+        - id: "e2e-partner-acceptance"
+          subject: { id: "dddddddd-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.acceptance.v1~"
+          actions: ["record"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+          delegation:
+            proof_property: "delegation_proof_ref"
+            accepted: ["e2e-proof-ok"]
         # The seller operator reads, holds and resumes the seller's orders; never authors.
         - id: "e2e-seller-operator"
           subject: { id: "55555555-6a88-4768-9dfc-6bcd5187d9ed" }

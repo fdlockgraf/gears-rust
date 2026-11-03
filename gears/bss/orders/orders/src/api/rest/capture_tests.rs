@@ -258,6 +258,7 @@ fn openapi_mirrors_are_pinned_to_the_sdk_wire() {
             billing_cycle: line.billing_cycle,
         }],
         draft_revision: Some(DraftRevision::try_from(0).unwrap()),
+        admin: None,
     });
     // Every response body name is snake_case (D-206); `draftRevision` is gone.
     let body = serde_json::to_value(TransitionResult {

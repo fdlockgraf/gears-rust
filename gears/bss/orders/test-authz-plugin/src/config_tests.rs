@@ -99,12 +99,12 @@ fn the_suite_config_block_parses_and_validates() {
     assert_eq!(cfg.priority, 10);
     assert_eq!(cfg.policy_revision, "orders-e2e-s2-12");
 
-    // Eight buyers, one identical rule each, authoring (preview and submit included) on
+    // Eight buyers, one identical rule each, authoring (preview, submit and amend included) on
     // resource tenant A.
     let buyers: Vec<&Rule> = cfg
         .rules
         .iter()
-        .filter(|r| r.id.starts_with("e2e-buyer-"))
+        .filter(|r| r.id.starts_with("e2e-buyer-") && !r.id.ends_with("-acceptance"))
         .collect();
     assert_eq!(
         buyers.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -123,7 +123,9 @@ fn the_suite_config_block_parses_and_validates() {
         assert_eq!(buyer.resource_type, "gts.cf.bss.orders.order.v1~");
         assert_eq!(
             buyer.actions,
-            ["create", "write", "edit", "read", "preview", "submit"],
+            [
+                "create", "write", "edit", "read", "preview", "submit", "amend"
+            ],
             "{}",
             buyer.id
         );
@@ -133,6 +135,35 @@ fn the_suite_config_block_parses_and_validates() {
         assert_eq!(predicate.values, ["a0000000-0000-4000-8000-00000000000a"]);
         assert_eq!(predicate.value, None);
         assert!(buyer.delegation.is_none());
+    }
+
+    // S4-08b: each buyer, as the customer, records consent on resource tenant A's orders, one
+    // `acceptance × record` rule per buyer and nothing else.
+    let consents: Vec<&Rule> = cfg
+        .rules
+        .iter()
+        .filter(|r| r.id.starts_with("e2e-buyer-") && r.id.ends_with("-acceptance"))
+        .collect();
+    assert_eq!(
+        consents.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        (1..=8)
+            .map(|i| format!("e2e-buyer-{i}-acceptance"))
+            .collect::<Vec<_>>()
+    );
+    for (buyer, consent) in buyers.iter().zip(&consents) {
+        assert_eq!(consent.subject.id, buyer.subject.id, "{}", consent.id);
+        assert_eq!(consent.subject.tenant_id, None);
+        assert_eq!(consent.resource_type, "gts.cf.bss.orders.acceptance.v1~");
+        assert_eq!(consent.actions, ["record"], "{}", consent.id);
+        let [path] = consent.paths.as_slice() else {
+            panic!("{}: exactly one path", consent.id)
+        };
+        let [predicate] = path.predicates.as_slice() else {
+            panic!("{}: exactly one predicate", consent.id)
+        };
+        assert_eq!(predicate.property, "resource_tenant_id");
+        assert_eq!(predicate.values, ["a0000000-0000-4000-8000-00000000000a"]);
+        assert!(consent.delegation.is_none());
     }
 
     // The delegated partner reads only with an accepted proof reference.
@@ -170,13 +201,14 @@ fn the_fragment_block_parses_and_validates_alone_and_appended() {
     assert_eq!(predicate.property, "owner_tenant_id");
     assert_eq!(predicate.values, ["00000000-df51-5b42-9538-d2b56b7ee953"]);
 
-    // The grant names the concrete submitted event type: no wildcard, no allow-all.
+    // The grant names the Orders event family as a trailing-`*` prefix (`OrderSubmitted` and
+    // `OrderAmended`), no other gear's events and no allow-all.
     assert_eq!(fragment.unconditional_grants.len(), 1);
     let grant = &fragment.unconditional_grants[0];
-    assert_eq!(grant.id, "orders-producer-submitted-produce");
+    assert_eq!(grant.id, "orders-producer-event-type-produce");
     assert_eq!(
         grant.resource_type,
-        "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~"
+        "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.*"
     );
     assert_eq!(grant.action, "produce");
     assert_eq!(

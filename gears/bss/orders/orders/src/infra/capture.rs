@@ -5,9 +5,8 @@
 //! existing-order `draft-mutate` row with the registered capture guards and a child-document
 //! contribution. Nothing here reads order state before authorization, writes the aggregate, or
 //! calls a catalog, pricing or contract port (02 §3.4-3.5). An administrative-only `PATCH`
-//! selects `administrative-edit`, whose S4-05 implementation is not delivered: it is refused
-//! unavailable with no authorization, audit, write or idempotency activity, never written through
-//! draft mutation.
+//! selects `administrative-edit` (row 3, S4-05): last write wins per field, no version, no event,
+//! one audit entry per changed field; it is never written through draft mutation.
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -23,16 +22,17 @@ use toolkit_db::secure::ScopeError;
 use uuid::Uuid;
 
 use crate::authz::{Arrangement, ArrangementDelta, Caller};
+use crate::domain::administrative_edit::{AdminEdit, AdminGuardFacts};
+use crate::domain::audit::AdminAttribute;
 use crate::domain::capture::{self, DraftGuardFacts, WorkingMember};
 use crate::domain::contributions::{AggregateContribution, DraftHeaderEdit};
 use crate::domain::idempotency::StoredResponse;
 use crate::infra::diagnostics::serde_category;
-use crate::infra::engine::errors::not_delivered;
 use crate::infra::engine::{
     ChildDocuments, CreateRequest, DocumentWriter, Engine, EngineOutcome, OutcomeKind, Preparation,
     PreparationView, PrepareError, Prepared, TransitionRequest,
 };
-use crate::infra::storage::entity::draft_content;
+use crate::infra::storage::entity::{draft_content, order_admin, order_line_admin};
 use crate::infra::storage::repo::idempotency::ReplayOutcome;
 use crate::infra::storage::term::{self, StoredShapeError};
 
@@ -192,7 +192,7 @@ impl CaptureService {
     /// Edit the header. Fields alone select the trigger; no state is read to choose it.
     ///
     /// # Errors
-    /// `request-invalid` input, unavailable administrative edits, unsettled refusals and
+    /// `request-invalid` input, unsettled refusals (an administrative edit's included) and
     /// sanitized infrastructure outcomes.
     pub async fn patch_order(
         &self,
@@ -208,7 +208,18 @@ impl CaptureService {
         let selection =
             capture::select_header(&engine.registries().fields, &patch).ok_or_else(invalid)?;
         if !capture::is_draft_mutation(selection) {
-            return Err(administrative_unavailable());
+            let document = fingerprint_document(&document_of([("fields", authored(&patch)?)]))?;
+            return self
+                .administrative(
+                    &engine,
+                    caller,
+                    order_id,
+                    "patch_order",
+                    AdminEdit::from_header(&patch),
+                    document,
+                    meta,
+                )
+                .await;
         }
         let proposed = (patch.resource_tenant_id.is_some() || patch.payer_tenant_id.is_some())
             .then_some(ArrangementDelta {
@@ -273,7 +284,7 @@ impl CaptureService {
     }
 
     /// Edit a line: commercial fields select `draft-mutate`; administrative-only fields select
-    /// the undelivered `administrative-edit` path.
+    /// the `administrative-edit` path (row 3, S4-05).
     ///
     /// # Errors
     /// As [`Self::patch_order`].
@@ -291,13 +302,23 @@ impl CaptureService {
         let engine = self.engine()?;
         let selection =
             capture::select_line(&engine.registries().fields, &patch).ok_or_else(invalid)?;
-        if !capture::is_draft_mutation(selection) {
-            return Err(administrative_unavailable());
-        }
         let document = fingerprint_document(&document_of([
             ("line_id", Value::String(line_id.to_string())),
             ("fields", authored(&patch)?),
         ]))?;
+        if !capture::is_draft_mutation(selection) {
+            return self
+                .administrative(
+                    &engine,
+                    caller,
+                    order_id,
+                    "patch_line",
+                    AdminEdit::from_line(line_id, &patch),
+                    document,
+                    meta,
+                )
+                .await;
+        }
         let preparation = DraftPreparation {
             settings: self.settings,
             operation: DraftOperation::EditLine {
@@ -347,6 +368,47 @@ impl CaptureService {
             &preparation,
         )
         .await
+    }
+
+    /// Row 3, `administrative-edit` (04 §3.2 steps 2-3, S4-05): last write wins per field, no
+    /// version and no event. The engine re-reads the stored values under the aggregate lock, so
+    /// every named value is passed and the unchanged ones are dropped there.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the one administrative-edit entry both PATCH operations share: each argument \
+                  is a distinct input of the transition request"
+    )]
+    async fn administrative(
+        &self,
+        engine: &Engine,
+        caller: &Caller,
+        order_id: Uuid,
+        operation: &'static str,
+        edit: AdminEdit,
+        document: Value,
+        meta: &WriteMeta,
+    ) -> Result<Settled, OrdersError> {
+        let request = TransitionRequest {
+            order_id,
+            trigger: Trigger::AdministrativeEdit,
+            operation,
+            expected_version: meta.call.expected_version,
+            expected_draft_revision: None,
+            document,
+            proposed: None,
+            caller_reason: None,
+            idempotency_key: meta.call.idempotency_key.clone(),
+            correlation_id: meta.call.correlation_id,
+            execution: None,
+        };
+        let outcome = engine
+            .transition(
+                caller,
+                request,
+                &AdminPreparation::new(edit, caller.ctx().subject_id().to_string()),
+            )
+            .await?;
+        Ok(Settled::from_outcome(outcome))
     }
 
     #[expect(
@@ -429,9 +491,118 @@ pub fn fingerprint_document(value: &impl serde::Serialize) -> Result<Value, Orde
     authored(value).map(exact)
 }
 
-/// The undelivered S4-05 administrative edit: explicitly unavailable, never a draft mutation.
-fn administrative_unavailable() -> OrdersError {
-    not_delivered("administrative-edit (S4-05)").into()
+/// Row 3's preparation: the named values as changes (the engine reconciles them with the stored
+/// values under the lock), the target line whose membership the engine checks at the same locked
+/// read, and the writer.
+pub struct AdminPreparation {
+    edit: AdminEdit,
+    updated_by: String,
+}
+impl AdminPreparation {
+    /// Row 3's preparation for `edit`, written as `updated_by`.
+    #[must_use]
+    pub fn new(edit: AdminEdit, updated_by: String) -> Self {
+        Self { edit, updated_by }
+    }
+}
+#[async_trait]
+impl Preparation for AdminPreparation {
+    async fn prepare(&self, _: &PreparationView) -> Result<Prepared, PrepareError> {
+        let mut prepared = Prepared::new(AggregateContribution::None);
+        prepared.guards = AdminGuardFacts {
+            line: self.edit.line_id,
+            all_administrative: true,
+        }
+        .bindings();
+        prepared.admin_changes = self.edit.named_changes();
+        prepared.admin_line = self.edit.line_id;
+        prepared.documents = Some(Arc::new(AdminWriter {
+            edit: self.edit.clone(),
+            updated_by: self.updated_by.clone(),
+        }) as Arc<dyn DocumentWriter>);
+        Ok(prepared)
+    }
+}
+
+/// The administrative values written from the engine's locked read: only the named attributes
+/// change (last write wins), a missing row is inserted, `updated_by`/`updated_at` follow the
+/// transition (04 §4.6).
+struct AdminWriter {
+    edit: AdminEdit,
+    updated_by: String,
+}
+impl AdminWriter {
+    /// The named values applied to the three stored attributes; the rest keep their value.
+    fn apply(
+        &self,
+        external_reference: &mut Option<String>,
+        display_label: &mut Option<String>,
+        internal_notes: &mut Option<String>,
+    ) {
+        for (attribute, value) in &self.edit.values {
+            let slot = match attribute {
+                AdminAttribute::ExternalReference => &mut *external_reference,
+                AdminAttribute::DisplayLabel => &mut *display_label,
+                AdminAttribute::InternalNotes => &mut *internal_notes,
+            };
+            slot.clone_from(value);
+        }
+    }
+}
+#[async_trait]
+impl DocumentWriter for AdminWriter {
+    async fn write(&self, docs: &ChildDocuments<'_, '_>) -> Result<(), ScopeError> {
+        let at = docs.transition_time();
+        let order_id = docs.order_id();
+        let by = || self.updated_by.clone();
+        match self.edit.line_id {
+            None => {
+                let current = docs.order_admin().await?;
+                let mut next = current.clone().unwrap_or_else(|| order_admin::Model {
+                    order_id,
+                    external_reference: None,
+                    display_label: None,
+                    internal_notes: None,
+                    updated_by: by(),
+                    updated_at: at,
+                });
+                self.apply(
+                    &mut next.external_reference,
+                    &mut next.display_label,
+                    &mut next.internal_notes,
+                );
+                next.updated_by = by();
+                next.updated_at = at;
+                match current {
+                    Some(current) => docs.replace_order_admin(&current, next).await,
+                    None => docs.insert_order_admin(next).await.map(|_| ()),
+                }
+            }
+            Some(line_id) => {
+                let current = docs.order_line_admin(line_id).await?;
+                let mut next = current.clone().unwrap_or_else(|| order_line_admin::Model {
+                    order_id,
+                    line_id,
+                    external_reference: None,
+                    display_label: None,
+                    internal_notes: None,
+                    updated_by: by(),
+                    updated_at: at,
+                });
+                self.apply(
+                    &mut next.external_reference,
+                    &mut next.display_label,
+                    &mut next.internal_notes,
+                );
+                next.updated_by = by();
+                next.updated_at = at;
+                match current {
+                    Some(current) => docs.replace_order_line_admin(&current, next).await,
+                    None => docs.insert_order_line_admin(next).await.map(|_| ()),
+                }
+            }
+        }
+    }
 }
 
 /// The create row's contribution: its category guard only; no documents, no event.
@@ -567,6 +738,31 @@ fn draft_row(
         authored_term: term.authored,
         billing_cycle: line.billing_cycle.map(|c| c.token().to_owned()),
     })
+}
+
+/// A proposed amendment line as its content row (synthetic: never written to the working table),
+/// through the same authored codec as a draft line, so the commit admits it exactly as submit
+/// admits a working line (04 §3.6 steps 3-4).
+///
+/// # Errors
+/// An unrepresentable authored value: an integration failure, logged with the line identity.
+pub fn content_row(
+    order_id: Uuid,
+    line: &bss_orders_sdk::authoring::DraftLine,
+) -> Result<draft_content::Model, PrepareError> {
+    let authored = AddLine {
+        plan_id: line.plan_id,
+        plan_revision_id: line.plan_revision_id,
+        selected_items: line.selected_items.clone(),
+        currency: line.currency.clone(),
+        contract_effective_date: line.contract_effective_date,
+        service_activation_date: line.service_activation_date,
+        acceptance_due_date: line.acceptance_due_date,
+        term_duration: line.term_duration,
+        billing_cycle: line.billing_cycle,
+    };
+    draft_row(order_id, line.line_id, &authored)
+        .map_err(|failure| failure.integration(order_id, line.line_id))
 }
 
 /// The named commercial changes applied to the locked working row; every unnamed value is

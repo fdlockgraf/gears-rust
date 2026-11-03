@@ -70,6 +70,49 @@ fn a_stored_order_view_with_unknown_members_at_every_level_still_decodes() {
     assert_eq!(view.order.order_number, "ORD-1");
     assert_eq!(view.lines.len(), 1);
     assert_eq!(view.draft_revision.map(i64::from), Some(1));
+    assert_eq!(
+        view.admin, None,
+        "a body stored before D-263 has no projection"
+    );
+}
+
+/// D-263: the administrative projection is part of the stored `OrderView` shape, so its members
+/// tolerate a newer build's members too, and an absent value is an omitted member.
+#[test]
+fn a_stored_order_view_admin_projection_tolerates_unknown_members() {
+    let stored = json!({
+        "order": {
+            "order_id": "00000000-0000-0000-0000-000000000001",
+            "order_number": "ORD-1",
+            "state": "submitted",
+            "category": bss_orders_sdk::authoring::Category::NEW_SALE,
+            "resource_tenant_id": "00000000-0000-0000-0000-00000000000a",
+            "seller_tenant_id": "00000000-0000-0000-0000-000000000014",
+            "payer_tenant_id": "00000000-0000-0000-0000-00000000001e",
+            "contract_id": null,
+            "sales_path": "self_service",
+            "created_at": "2026-10-18T10:00:00Z",
+            "state_entered_at": "2026-10-18T10:00:00Z",
+        },
+        "version": {"version": 4, "supersedes_version": 1, "created_at": "2026-10-18T10:00:00Z"},
+        "lines": [],
+        "admin": {
+            "order": {"external_reference": "PO-1", "flag": "a newer build"},
+            "lines": [{
+                "line_id": "00000000-0000-0000-0000-000000000002",
+                "display_label": "L",
+                "colour": "a newer build",
+            }],
+            "revision": "a newer build",
+        },
+    });
+    let view: OrderView = serde_json::from_value(stored).unwrap();
+    let admin = view.admin.unwrap();
+    let order = admin.order.unwrap();
+    assert_eq!(order.external_reference.as_deref(), Some("PO-1"));
+    assert_eq!(order.display_label, None);
+    assert_eq!(admin.lines.len(), 1);
+    assert_eq!(admin.lines[0].display_label.as_deref(), Some("L"));
 }
 
 /// The members nested in a stored line (its selected items and its authored term) are part of
@@ -189,4 +232,28 @@ fn committed_total_scale_is_u8_and_old_bodies_decode() {
             serde_json::from_value::<bss_orders_sdk::reads::CommittedTotal>(total(bad)).is_err()
         );
     }
+}
+
+/// A settled `administrative-field-in-amendment` refusal stored by a newer build may name a route
+/// this SDK does not know; the refusal still decodes, and the known route keeps its spelling.
+#[test]
+fn a_stored_refusal_naming_an_unknown_administrative_route_still_decodes() {
+    use bss_orders_sdk::errors::{AdministrativeRoute, RefusalDiagnostics};
+
+    let stored = json!({"field": "display_label", "use": "PATCH /bss-orders/v2/orders/{orderId}"});
+    let data: RefusalDiagnostics = serde_json::from_value(stored).unwrap();
+    assert_eq!(data.field.as_deref(), Some("display_label"));
+    assert_eq!(data.use_instead, Some(AdministrativeRoute::Unknown));
+
+    let known = RefusalDiagnostics {
+        use_instead: Some(AdministrativeRoute::PatchOrder),
+        ..RefusalDiagnostics::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&known).unwrap(),
+        json!({"use": "PATCH /bss-orders/v1/orders/{orderId}"})
+    );
+    let decoded: RefusalDiagnostics =
+        serde_json::from_value(json!({"use": "PATCH /bss-orders/v1/orders/{orderId}"})).unwrap();
+    assert_eq!(decoded.use_instead, Some(AdministrativeRoute::PatchOrder));
 }

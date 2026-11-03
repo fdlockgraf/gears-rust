@@ -55,6 +55,9 @@ const TAG: &str = "Orders";
 /// the 409 draft-revision conflict.
 pub(super) const STALE_IF_MATCH: &str =
     "PRECONDITION_FAILED: If-Match is not the current version (names current_version)";
+/// The documented 428 of a route whose `If-Match` is required (boundary, D-212).
+pub(super) const MISSING_IF_MATCH: &str =
+    "EXPECTED_VERSION_REQUIRED: If-Match is absent or not a strong \"N\" ETag";
 
 fn invalid() -> OrdersError {
     OrdersError::Refused(Reason::RequestInvalid)
@@ -456,7 +459,7 @@ pub fn router(
         .description(
             "The named fields' classes alone select the trigger (no state is read to choose it): \
              any commercial or commercial-frozen field is a draft mutation; administrative fields \
-             only are an administrative edit, which is not yet delivered (503). A request naming \
+             only are an administrative edit (last write wins, no version, no event). A request naming \
              both refuses MIXED_FIELD_CLASSES in draft; seller_tenant_id refuses \
              TENANT_AXIS_IMMUTABLE; outside draft a commercial edit refuses NOT_ADMISSIBLE first. \
              expected_draft_revision is optional here and compared after admissibility.",
@@ -510,7 +513,7 @@ pub fn router(
         .summary("Edit a draft line")
         .description(
             "Commercial line fields are a draft mutation (draft only); administrative fields \
-                 only are an administrative edit, not yet delivered (503). LINE_NOT_FOUND for a \
+                 only are an administrative edit (last write wins, no version, no event). LINE_NOT_FOUND for a \
                  line that is not, or is no longer, a working-set member.",
         )
         .tag(TAG)

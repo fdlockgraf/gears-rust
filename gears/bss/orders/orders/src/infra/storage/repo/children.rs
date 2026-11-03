@@ -4,7 +4,7 @@ use super::{
     SecureInsertExt, TransactionRunner, Uuid, order,
 };
 use crate::infra::storage::entity;
-use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, QueryFilter, QueryOrder, QuerySelect};
 use toolkit_db::secure::secure_insert_many;
 pub async fn order_version_for_order(
     runner: &impl DBRunner,
@@ -207,6 +207,21 @@ pub async fn acceptance_for_order(
         .scope_with(&AccessScope::for_resources(vec![id]))
         .and_scope_for::<order::Entity>(scope)
         .all(runner)
+        .await
+}
+/// The consent of exactly the committed `version`, if one is recorded (D-256).
+pub async fn acceptance(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Option<entity::acceptance::Model>, ScopeError> {
+    entity::acceptance::Entity::find_by_id((id, version))
+        .inner_join(order::Entity)
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .one(runner)
         .await
 }
 pub async fn approval_reflection_for_order(
@@ -476,6 +491,59 @@ pub async fn committed_content_for_lines(
         .and_scope_for::<order::Entity>(scope)
         .all(runner)
         .await
+}
+/// The line identities of exactly the committed `version` (administrative-edit membership, S4-05).
+pub async fn committed_line_ids(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Vec<Uuid>, ScopeError> {
+    Ok(entity::order_line::Entity::find()
+        .inner_join(order::Entity)
+        .filter(entity::order_line::Column::OrderId.eq(id))
+        .filter(entity::order_line::Column::Version.eq(version))
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await?
+        .into_iter()
+        .map(|line| line.line_id)
+        .collect())
+}
+/// The earliest line acceptance due date of committed `version` (D-258 consent signal).
+pub async fn earliest_acceptance_due(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    id: Uuid,
+    version: i32,
+) -> Result<Option<time::Date>, ScopeError> {
+    #[derive(Debug, sea_orm::FromQueryResult)]
+    struct Earliest {
+        due: Option<time::Date>,
+    }
+    let rows = entity::order_line::Entity::find()
+        .inner_join(order::Entity)
+        .filter(entity::order_line::Column::OrderId.eq(id))
+        .filter(entity::order_line::Column::Version.eq(version))
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![id]))
+        .and_scope_for::<order::Entity>(scope)
+        .project_all(runner, |q| {
+            q.select_only()
+                .column_as(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::min(
+                        sea_orm::sea_query::Expr::col(
+                            entity::order_line::Column::AcceptanceDueDate,
+                        ),
+                    )),
+                    "due",
+                )
+                .into_model::<Earliest>()
+        })
+        .await?;
+    Ok(rows.into_iter().find_map(|row| row.due))
 }
 /// Totals of exactly the snapshot's current commercial version.
 pub async fn committed_totals(

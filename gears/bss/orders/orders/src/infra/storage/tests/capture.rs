@@ -131,6 +131,8 @@ pub(super) struct T {
     pub(super) env: Env,
     _bound: BoundProducer,
     pub(super) sink: crate::infra::events::EventSink,
+    /// Every engine this harness builds reports its decided attempts here (D-258).
+    pub(super) transitions: Arc<crate::infra::engine::signals::RecordingTransitionSignals>,
 }
 impl T {
     pub(super) async fn new() -> Self {
@@ -141,6 +143,7 @@ impl T {
             env,
             _bound: bound,
             sink,
+            transitions: Arc::default(),
         }
     }
     pub(super) fn engine(&self, api: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> Engine {
@@ -152,6 +155,7 @@ impl T {
                 identities: identities(),
                 admin_key: Arc::new(AdminTextKey::new("k1", &[7u8; 32]).unwrap()),
                 lease: LeaseDuration::from_seconds(30).unwrap(),
+                signals: Arc::clone(&self.transitions) as Arc<_>,
             },
             Registries::compile().unwrap(),
         )
@@ -770,7 +774,7 @@ async fn structural_and_field_refusals_follow_the_declared_precedence() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn outside_draft_inadmissibility_wins_and_administrative_edits_stay_unavailable() {
+async fn outside_draft_inadmissibility_wins_and_administrative_edits_are_row_3() {
     let t = T::new().await;
     let svc = t.service();
     let id = create(&t, &svc, "c-1").await;
@@ -811,52 +815,186 @@ async fn outside_draft_inadmissibility_wins_and_administrative_edits_stay_unavai
         .await
         .unwrap();
     assert_eq!(refused(&r), Reason::NotAdmissible);
-    // Administrative-only edits select administrative-edit (S4-05, undelivered): unavailable
-    // with no authorization, audit, registry row or write, in draft and outside it.
+    // An administrative-only edit is delivered (S4-05): it commits on a draft too, as row 3
+    // (no draft revision, no version), and an unknown draft line is `line-not-found`.
     let draft = create(&t, &svc, "c-2").await;
-    for target in [id, draft] {
-        let audits = t.audits(target).await;
-        let registry = t.registry().await;
-        let row = t.order_row(target).await;
-        let header = svc
-            .patch_order(
+    let before = t.order_row(draft).await;
+    let outbox = t.outbox().await;
+    let r = svc
+        .patch_order(
+            &buyer(),
+            draft,
+            HeaderPatch {
+                external_reference: Some(Some("PO-1".into())),
+                ..HeaderPatch::default()
+            },
+            &write("adm-1", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.response.status(), 200, "{r:?}");
+    assert_eq!(
+        t.order_row(draft).await["draft_revision"],
+        before["draft_revision"]
+    );
+    assert_eq!(
+        t.order_row(draft).await["current_version"],
+        before["current_version"]
+    );
+    assert_eq!(
+        t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__transition_audit \
+             WHERE order_id='{draft}' AND trigger='administrative-edit' AND outcome='committed'"
+        ))
+        .await,
+        1,
+        "exactly one committed audit entry"
+    );
+    assert_eq!(
+        t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__order_admin WHERE order_id='{draft}'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(t.outbox().await, outbox, "no event");
+    let r = svc
+        .patch_line(
+            &buyer(),
+            draft,
+            u(5),
+            LinePatch {
+                display_label: Some(Some("x".into())),
+                ..LinePatch::default()
+            },
+            &write("adm-2", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused(&r), Reason::LineNotFound);
+}
+
+/// Row 3's preparation with a concurrent draft write between the preparation snapshot and the
+/// engine's lock: the named line is removed by a committed `remove_line` before the lock.
+struct RemovedBeforeTheLock<'a> {
+    inner: crate::infra::capture::AdminPreparation,
+    svc: &'a CaptureService,
+    order: Uuid,
+    line: Uuid,
+    revision: i64,
+}
+#[async_trait::async_trait]
+impl crate::infra::engine::Preparation for RemovedBeforeTheLock<'_> {
+    async fn prepare(
+        &self,
+        view: &crate::infra::engine::PreparationView,
+    ) -> Result<crate::infra::engine::Prepared, crate::infra::engine::PrepareError> {
+        let prepared = crate::infra::engine::Preparation::prepare(&self.inner, view).await?;
+        let removed = self
+            .svc
+            .remove_line(
                 &buyer(),
-                target,
-                HeaderPatch {
-                    external_reference: Some(Some("PO-1".into())),
-                    ..HeaderPatch::default()
-                },
-                &write("adm-1", 1, None),
+                self.order,
+                self.line,
+                &write("race-remove", 1, Some(self.revision)),
             )
-            .await;
-        assert!(
-            matches!(header, Err(OrdersError::Unavailable)),
-            "{header:?}"
-        );
-        let line_edit = svc
-            .patch_line(
-                &buyer(),
-                target,
-                u(5),
-                LinePatch {
-                    display_label: Some(Some("x".into())),
-                    ..LinePatch::default()
-                },
-                &write("adm-2", 1, None),
-            )
-            .await;
-        assert!(matches!(line_edit, Err(OrdersError::Unavailable)));
-        assert_eq!(t.audits(target).await, audits);
-        assert_eq!(t.registry().await, registry);
-        assert_eq!(t.order_row(target).await, row);
-        assert_eq!(
-            t.n(&format!(
-                "SELECT count(*) AS n FROM bss_orders__order_admin WHERE order_id='{target}'"
-            ))
-            .await,
-            0
-        );
+            .await
+            .unwrap();
+        assert_eq!(removed.response.status(), 200, "{removed:?}");
+        Ok(prepared)
     }
+}
+
+/// S4-05 fix round 1: in `draft` a line edit's membership is the working set read under the
+/// aggregate lock. A working line commits as `lines/<id>/<attr>`; a line removed after the
+/// preparation and before the lock settles `line-not-found` with no administrative write and
+/// no committed audit entry (04 §3.6: membership, then field class, then change, at the lock).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn draft_line_admin_edits_check_working_membership_under_the_lock() {
+    use crate::domain::administrative_edit::AdminEdit;
+    use crate::infra::engine::OutcomeKind;
+    use bss_orders_sdk::catalog::Trigger;
+    let t = T::new().await;
+    let svc = t.service();
+    let id = create(&t, &svc, "c-1").await;
+    let mut lines = Vec::new();
+    for (key, revision) in [("a-1", 0), ("a-2", 1)] {
+        let added = result(
+            svc.add_line(
+                &buyer(),
+                id,
+                line("EUR", Some(BillingCycle::Month)),
+                &write(key, 1, Some(revision)),
+            )
+            .await
+            .unwrap(),
+        );
+        lines.push(added.line_id.unwrap());
+    }
+    let (kept, raced) = (lines[0], lines[1]);
+    let label = LinePatch {
+        display_label: Some(Some("x".into())),
+        ..LinePatch::default()
+    };
+    let committed = format!(
+        "SELECT coalesce(jsonb_agg(changed_field ORDER BY sequence), '[]'::jsonb) AS j \
+         FROM bss_orders__transition_audit \
+         WHERE order_id='{id}' AND trigger='administrative-edit' AND outcome='committed'"
+    );
+    let line_admin = |line: Uuid| {
+        format!(
+            "SELECT count(*) AS n FROM bss_orders__order_line_admin WHERE order_id='{id}' AND line_id='{line}'"
+        )
+    };
+    // A working line of the draft commits as row 3 (no revision, no version, no event).
+    let before = t.order_row(id).await;
+    let outbox = t.outbox().await;
+    let r = svc
+        .patch_line(&buyer(), id, kept, label.clone(), &write("adm-1", 1, None))
+        .await
+        .unwrap();
+    assert_eq!(r.response.status(), 200, "{r:?}");
+    assert_eq!(
+        t.json(&committed).await,
+        json!([format!("lines/{}/display_label", kept.hyphenated())])
+    );
+    assert_eq!(t.n(&line_admin(kept)).await, 1);
+    let after = t.order_row(id).await;
+    assert_eq!(after["draft_revision"], before["draft_revision"]);
+    assert_eq!(after["current_version"], before["current_version"]);
+    assert_eq!(t.outbox().await, outbox, "no event");
+    // The preparation saw `raced` as a working line; a concurrent removal commits before the
+    // lock. Membership is decided at the locked read, so the edit is `line-not-found`.
+    let engine = t.engine(policy());
+    let racing = RemovedBeforeTheLock {
+        inner: crate::infra::capture::AdminPreparation::new(
+            AdminEdit::from_line(raced, &label),
+            u(BUYER.0).to_string(),
+        ),
+        svc: &svc,
+        order: id,
+        line: raced,
+        revision: 2,
+    };
+    let out = engine
+        .transition(
+            &buyer(),
+            super::engine::request(id, Trigger::AdministrativeEdit, "adm-race", 1),
+            &racing,
+        )
+        .await
+        .unwrap();
+    let OutcomeKind::Refused { reason, .. } = out.kind else {
+        panic!("{out:?}");
+    };
+    assert_eq!(reason, Reason::LineNotFound);
+    assert_eq!(t.n(&line_admin(raced)).await, 0, "no administrative write");
+    assert_eq!(
+        t.json(&committed).await,
+        json!([format!("lines/{}/display_label", kept.hyphenated())]),
+        "no committed audit entry for the removed line"
+    );
 }
 
 #[tokio::test]
@@ -1260,8 +1398,10 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
         stale.2["context"]["data"],
         json!({"current_version": 1, "draft_revision": 2})
     );
-    // Administrative-only PATCH: 503 Problem, nothing recorded.
-    let registry = t.registry().await;
+    // Administrative-only PATCH (S4-05): row 3 commits on the wire, no version moves.
+    let wire_order = Uuid::parse_str(&id).unwrap();
+    let version_before = t.order_row(wire_order).await["current_version"].clone();
+    let outbox_before = t.outbox().await;
     let admin = http(
         &router,
         "PATCH",
@@ -1270,9 +1410,12 @@ async fn the_mounted_routes_carry_engine_outcomes_on_the_wire() {
         Some(json!({"fields": {"external_reference": "PO-1"}})),
     )
     .await;
-    assert_eq!(admin.0, 503);
-    assert!(problem(&admin.1));
-    assert_eq!(t.registry().await, registry);
+    assert_eq!(admin.0, 200, "{admin:?}");
+    assert_eq!(
+        t.order_row(wire_order).await["current_version"],
+        version_before
+    );
+    assert_eq!(t.outbox().await, outbox_before, "no event");
     // DELETE without a body omits the revision (409); with the body it removes the member.
     let omitted = http(
         &router,

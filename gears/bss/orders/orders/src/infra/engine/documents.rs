@@ -112,6 +112,22 @@ impl<'l, 'a> ChildDocuments<'l, 'a> {
             .into_iter()
             .find(|row| row.line_id == line_id))
     }
+    /// Reserve a never-used line identity at the transition time for a line an amendment adds
+    /// to the committed version (04 §3.6 step 4): its immutable `order_line` row needs it, and
+    /// the primary key rejects reuse of any identity the order ever had.
+    ///
+    /// # Errors
+    /// Foreign parent, reused identity, scope or store failure.
+    pub async fn reserve_line_identity(&self, line_id: uuid::Uuid) -> Result<(), ScopeError> {
+        self.locked
+            .insert_order_line_identity(entity::order_line_identity::Model {
+                order_id: self.order_id(),
+                line_id,
+                created_at: self.transition_time,
+            })
+            .await
+            .map(|_| ())
+    }
     /// One batch for a submit version's line rows (n107).
     ///
     /// # Errors
@@ -319,6 +335,18 @@ impl<'l, 'a> EventEnqueue<'l, 'a> {
             locked,
             summary,
         }
+    }
+    /// The engine's single transition timestamp `t` (the summary's `occurred_at`, the instant
+    /// [`ChildDocuments::transition_time`] gives the writers): a payload reporting an instant
+    /// this transition stored reads it here, never from a clock (S4-08a).
+    #[must_use]
+    pub fn occurred_at(&self) -> OffsetDateTime {
+        self.summary.occurred_at
+    }
+    /// The committed post-state's order version.
+    #[must_use]
+    pub fn order_version(&self) -> i32 {
+        self.summary.order_version
     }
     /// Enqueue the row's payload; consumes the handle.
     ///

@@ -83,7 +83,7 @@ Product-owned TTL durations have no code default; they ship as provisional, migr
 **Input**: target, authenticated context, idempotency key and `expected_version` for each separate request; optional hold reason.
 
 1. Request `POST /bss-orders/v1/orders/{orderId}/hold` through the shared authorization pre-guard and engine. The caller supplies no resume target.
-2. For a post-spawn fulfillment hold, first stage engine-owned pause coordination under [D-198](../DESIGN.md#contract-06-activation-admission), block new grants and obtain every receiver barrier outside SQL locks; return existing still-processing until ready. The engine admits only `submitted`, `pending_approval`, `approved` or `in_fulfillment`, stores the outgoing state in `pre_hold_state`, and commits `on_hold`, audit and `OrderHeld` atomically. The optional reason is `caller_reason`, NULL when omitted.
+2. For a post-spawn fulfillment hold, first stage engine-owned pause coordination under [D-198](../DESIGN.md#contract-06-activation-admission), block new grants and obtain every receiver barrier outside SQL locks; return existing still-processing until ready. The engine admits only `submitted`, `pending_approval`, `approved` or `in_fulfillment`, stores the outgoing state in `pre_hold_state`, and commits `on_hold`, audit and `OrderHeld` atomically. The optional reason is `caller_reason`, NULL when omitted. The authorized order read returns the stored value as `OrderView.order.pre_hold_state` while the order is `on_hold` (D-261). A pending post-spawn pause that an unwind supersedes by revoke never takes effect: its key settles `fulfillment-control-superseded` ([D-259](../DESIGN.md#contract-06-supersede-fulfillment-control)). Both are designed, not implemented.
 3. Later request `/resume` with its own key and expected version. After shared authorization/idempotency checks, the engine checks admissibility and expected version, then evaluates the registered resume-cap guard before resolving or validating the stored resume target, all under the aggregate lock.
 4. On success, restore exactly `pre_hold_state`, clear it, reset the state dwell clock, increment `resume_count`, and commit audit and `OrderResumed` in the same transaction.
 
@@ -179,6 +179,8 @@ Foundation's table remains the sole state authority; the following is this featu
 The implementation MUST route hold/resume/cancel and their business refusals through the shared engine, preserving authorization, version checks, principal-bound idempotency and atomic state/audit/event effects.
 
 **Implements**: `cpt-cf-bss-orders-flow-hold-and-expiry-hold-resume`, `cpt-cf-bss-orders-flow-hold-and-expiry-cancel`, `cpt-cf-bss-orders-flow-hold-and-expiry-force-fail`.
+
+> **Status (2026-11-02): D-261 and the hold side of D-259 designed, not implemented** (the `pre_hold_state` read member; the `fulfillment-control-superseded` settlement of a superseded pause's key).
 
 **Touches**: `/hold`, `/resume`, `/cancel`, `/forced-failure`; `orders_order.pre_hold_state`, `resume_count`, `state_entered_at`, `compensation_evidence` (forced variant); transition audit and producer enqueue. **Constraints**: `cpt-cf-bss-orders-constraint-hold-does-not-pause-draft-ttl`.
 

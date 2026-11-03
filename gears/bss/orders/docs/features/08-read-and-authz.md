@@ -201,6 +201,8 @@ The implementation MUST deliver the common wrapper to every REST/SDK read, corre
 
 **Implements**: `cpt-cf-bss-orders-flow-read-and-authz-point-read`, `cpt-cf-bss-orders-flow-read-and-authz-collections`, `cpt-cf-bss-orders-flow-read-and-authz-audit`, `cpt-cf-bss-orders-algo-read-and-authz-access-log`, `cpt-cf-bss-orders-state-read-and-authz-outcomes`.
 
+> **Status (2026-11-02): D-260 implemented, D-261 designed, not implemented.** The version read's role actors and the order read's `pre_hold_state` ([08 §4.2](../DESIGN.md#contract-08-4-2)) are disclosed to every principal the PDP lets read the order, as `VersionRecord.actor` already is; so are the version read's metadata and header (D-262) and the current administrative projection on both reads (D-263, no new action; the administrative history stays `audit × read`). The role actors, metadata, header and projection are built; `pre_hold_state` has no code yet.
+
 **Touches**: order/list, version detail/list, lines, acceptance history and audit reads; `cpt-cf-bss-orders-dbtable-read-access-log`; current aggregate, version, line identity/projection and scoped audit tables. **Constraints**: `cpt-cf-bss-orders-constraint-read-fails-closed`, `cpt-cf-bss-orders-constraint-bounded-page-size`.
 
 ## 6. Acceptance Criteria

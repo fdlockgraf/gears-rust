@@ -214,7 +214,7 @@ fn instant(value: &Value) -> time::OffsetDateTime {
 /// the operational proof classification) so the tests can assert that a failure or refusal
 /// actually raised its instrument.
 #[derive(Default)]
-struct RecordingSignals {
+pub(super) struct RecordingSignals {
     log_failures: parking_lot::Mutex<Vec<AccessOutcome>>,
     refusals: parking_lot::Mutex<Vec<(Reason, Option<ProofDenial>)>>,
 }
@@ -222,7 +222,7 @@ impl RecordingSignals {
     fn log_failures(&self) -> Vec<AccessOutcome> {
         self.log_failures.lock().clone()
     }
-    fn refusals(&self) -> Vec<(Reason, Option<ProofDenial>)> {
+    pub(super) fn refusals(&self) -> Vec<(Reason, Option<ProofDenial>)> {
         self.refusals.lock().clone()
     }
 }

@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use super::rest::error::RefusalEnvelope;
 use crate::authz::Caller;
+use crate::infra::acceptance::AcceptanceService;
+use crate::infra::amend::AmendService;
 use crate::infra::capture::{CaptureService, Settled, SettledOutcome, WriteMeta};
 use crate::infra::diagnostics::serde_category;
 use crate::infra::engine::errors::not_delivered;
@@ -38,6 +40,10 @@ pub struct LocalOrdersClient {
     /// The submit service, present only in the same development delivery (M2-1); otherwise
     /// submit is undelivered.
     submit: Option<Arc<SubmitService>>,
+    /// The amendment service (S4-03), present only in the same development delivery.
+    amend: Option<Arc<AmendService>>,
+    /// The record-acceptance service (S4-08b), present only in the same development delivery.
+    acceptance: Option<Arc<AcceptanceService>>,
 }
 impl LocalOrdersClient {
     /// A client over the shared capture and read services; Preview and submit undelivered.
@@ -48,6 +54,8 @@ impl LocalOrdersClient {
             reads,
             preview: None,
             submit: None,
+            amend: None,
+            acceptance: None,
         }
     }
 
@@ -64,6 +72,22 @@ impl LocalOrdersClient {
     #[must_use]
     pub fn with_submit(mut self, submit: Option<Arc<SubmitService>>) -> Self {
         self.submit = submit;
+        self
+    }
+
+    /// Deliver amendment through `amend` (the gear passes `Some` only in the development
+    /// delivery, D-235).
+    #[must_use]
+    pub fn with_amend(mut self, amend: Option<Arc<AmendService>>) -> Self {
+        self.amend = amend;
+        self
+    }
+
+    /// Deliver record-acceptance through `acceptance` (the gear passes `Some` only in the
+    /// development delivery, D-235, D-256).
+    #[must_use]
+    pub fn with_acceptance(mut self, acceptance: Option<Arc<AcceptanceService>>) -> Self {
+        self.acceptance = acceptance;
         self
     }
 }
@@ -232,6 +256,36 @@ impl OrdersV1 for LocalOrdersClient {
         let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
         self.reads.list_lines(&caller, order_id, &request).await
     }
+    async fn list_versions(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::reads::VersionList,
+        meta: ReadMeta,
+    ) -> Result<bss_orders_sdk::reads::VersionPage, OrdersError> {
+        let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
+        self.reads.list_versions(&caller, order_id, &request).await
+    }
+    async fn get_version(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        version: bss_orders_sdk::models::OrderVersion,
+        meta: ReadMeta,
+    ) -> Result<bss_orders_sdk::reads::OrderVersionView, OrdersError> {
+        let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
+        self.reads.get_version(&caller, order_id, version).await
+    }
+    async fn get_acceptance(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::reads::AcceptanceList,
+        meta: ReadMeta,
+    ) -> Result<bss_orders_sdk::reads::AcceptancePage, OrdersError> {
+        let caller = Caller::new(ctx.clone(), meta.delegation_proof_ref);
+        self.reads.get_acceptance(&caller, order_id, &request).await
+    }
     async fn submit(
         &self,
         ctx: &SecurityContext,
@@ -257,6 +311,52 @@ impl OrdersV1 for LocalOrdersClient {
                 )
                 .await
                 .map_err(OrdersError::from)?,
+        )
+    }
+    async fn amend(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::amend::AmendOrder,
+        meta: CallMeta,
+    ) -> Result<TransitionResult, OrdersError> {
+        // Production: amendment is Stage 4 (S4-04), undelivered; the development delivery runs
+        // the amendment service (D-235).
+        let Some(service) = &self.amend else {
+            return Err(not_delivered("amend (S4-04)").into());
+        };
+        // The same well-formedness the REST boundary decides (the body before the headers'
+        // authority, as REST's `amend_body` precedes the service), before any authorization.
+        crate::domain::versioning::AmendmentDelta::from_request(&request)
+            .check_well_formed()
+            .map_err(|_| OrdersError::Refused(bss_orders_sdk::catalog::Reason::RequestInvalid))?;
+        // D-202 before any PDP or store work, as on the REST header path.
+        let caller = Caller::from_meta(ctx, meta.delegation_proof_ref.as_ref())?;
+        sdk_result(
+            service
+                .amend(&caller, order_id, request, &meta, &CancellationToken::new())
+                .await?,
+        )
+    }
+    async fn record_acceptance(
+        &self,
+        ctx: &SecurityContext,
+        order_id: Uuid,
+        request: bss_orders_sdk::acceptance::Acceptance,
+        meta: CallMeta,
+    ) -> Result<TransitionResult, OrdersError> {
+        // Production: recording consent after submit is Stage 4 (S4-08b), development-delivered
+        // like amendment (D-235, D-256).
+        let Some(service) = &self.acceptance else {
+            return Err(not_delivered("record_acceptance (S4-08b)").into());
+        };
+        // D-202 before any PDP or store work, as on the REST header path. The body has no
+        // member, so it has nothing further to check.
+        let caller = Caller::from_meta(ctx, meta.delegation_proof_ref.as_ref())?;
+        sdk_result(
+            service
+                .record(&caller, order_id, request, &meta, &CancellationToken::new())
+                .await?,
         )
     }
     async fn preview(

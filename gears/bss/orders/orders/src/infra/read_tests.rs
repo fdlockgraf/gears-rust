@@ -8,8 +8,13 @@ use serde_json::{Value, json};
 use time::macros::date;
 use uuid::Uuid;
 
-use super::{committed_line, committed_total, compose_committed_lines, validate_totals};
-use crate::infra::storage::entity::{order, order_line, order_line_identity, resolved_total};
+use super::{
+    Axes, Snapshot, admin_view, committed_line, committed_total, compose_committed_lines,
+    validate_totals,
+};
+use crate::infra::storage::entity::{
+    order, order_admin, order_line, order_line_admin, order_line_identity, resolved_total,
+};
 
 /// The SDK's golden schema-2 pin (`orders-sdk/tests/fixtures`), the commercial conformance
 /// vector every codec test decodes.
@@ -132,7 +137,7 @@ fn identity(line_id: Uuid) -> order_line_identity::Model {
 
 #[test]
 fn a_consistent_committed_line_composes_with_its_pin() {
-    let line = committed_line(&parent(), &row()).expect("the golden pair composes");
+    let line = committed_line(Axes::current(&parent()), &row()).expect("the golden pair composes");
     assert_eq!(line.line_id, id(0xc));
     assert_eq!(line.selected_items.len(), 3);
     let committed = line.committed.expect("a committed line carries its pin");
@@ -142,7 +147,7 @@ fn a_consistent_committed_line_composes_with_its_pin() {
 }
 
 fn line_of(row: &order_line::Model) -> DraftLine {
-    committed_line(&parent(), row).expect("the golden pair composes")
+    committed_line(Axes::current(&parent()), row).expect("the golden pair composes")
 }
 
 type Corruption = fn(&mut order::Model, &mut order_line::Model);
@@ -181,7 +186,10 @@ fn every_single_field_corruption_of_a_committed_line_is_integration() {
         let (mut parent, mut row) = (parent(), row());
         corrupt(&mut parent, &mut row);
         assert!(
-            matches!(committed_line(&parent, &row), Err(OrdersError::Integration)),
+            matches!(
+                committed_line(Axes::current(&parent), &row),
+                Err(OrdersError::Integration)
+            ),
             "{name}"
         );
     }
@@ -197,7 +205,7 @@ fn a_missing_digest_column_is_integration() {
         let mut row = row();
         corrupt(&mut row);
         assert!(matches!(
-            committed_line(&parent(), &row),
+            committed_line(Axes::current(&parent()), &row),
             Err(OrdersError::Integration)
         ));
     }
@@ -207,11 +215,11 @@ fn a_missing_digest_column_is_integration() {
 fn a_committed_identity_without_its_row_is_integration() {
     let identities = [identity(id(0xc)), identity(id(0xd))];
     assert!(matches!(
-        compose_committed_lines(&parent(), &identities, &[row()]),
+        compose_committed_lines(Axes::current(&parent()), &identities, &[row()]),
         Err(OrdersError::Integration)
     ));
     assert_eq!(
-        compose_committed_lines(&parent(), &identities[..1], &[row()])
+        compose_committed_lines(Axes::current(&parent()), &identities[..1], &[row()])
             .expect("the member composes")
             .len(),
         1
@@ -298,7 +306,7 @@ fn a_committed_refusal_logs_the_row_identity_and_the_first_failing_check() {
     for (_, corrupt) in CORRUPTIONS {
         let (mut parent, mut row) = (parent(), row());
         corrupt(&mut parent, &mut row);
-        assert!(committed_line(&parent, &row).is_err());
+        assert!(committed_line(Axes::current(&parent), &row).is_err());
     }
     logs_assert(|lines: &[&str]| {
         let read: Vec<_> = lines
@@ -355,4 +363,62 @@ fn committed_total_refuses_a_scale_outside_u8() {
         ));
     }
     assert!(logs_contain("check=\"currency_scale\""));
+}
+
+fn order_admin_row(notes: Option<&str>) -> order_admin::Model {
+    order_admin::Model {
+        order_id: id(0xb),
+        external_reference: None,
+        display_label: None,
+        internal_notes: notes.map(str::to_owned),
+        updated_by: "user".to_owned(),
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+fn line_admin_row(line_id: Uuid, label: Option<&str>) -> order_line_admin::Model {
+    order_line_admin::Model {
+        order_id: id(0xb),
+        line_id,
+        external_reference: None,
+        display_label: label.map(str::to_owned),
+        internal_notes: None,
+        updated_by: "user".to_owned(),
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+/// D-263 item 4: a cleared value reads as absent, so stored rows whose values were all cleared
+/// read as no projection at all, never `{"order": {}, "lines": []}`.
+#[test]
+fn an_all_cleared_administrative_projection_is_absent() {
+    let line = line_of(&row());
+    let mut snapshot = Snapshot::of(parent());
+    snapshot.order_admin = vec![order_admin_row(None)];
+    snapshot.line_admin = vec![line_admin_row(line.line_id, None)];
+    assert!(admin_view(&snapshot, std::slice::from_ref(&line)).is_none());
+}
+
+/// Only the cleared parts fold: a cleared order row with one set line value keeps the line.
+#[test]
+fn a_cleared_order_row_folds_but_a_set_line_value_stays() {
+    let line = line_of(&row());
+    let mut snapshot = Snapshot::of(parent());
+    snapshot.order_admin = vec![order_admin_row(None)];
+    snapshot.line_admin = vec![line_admin_row(line.line_id, Some("label"))];
+    let view = admin_view(&snapshot, std::slice::from_ref(&line)).expect("a set line value");
+    assert!(view.order.is_none());
+    assert_eq!(view.lines.len(), 1);
+    assert_eq!(view.lines[0].display_label.as_deref(), Some("label"));
+    let json = serde_json::to_value(&view).expect("serializes");
+    assert_eq!(json.get("order"), None, "{json}");
+
+    snapshot.order_admin = vec![order_admin_row(Some("note"))];
+    snapshot.line_admin = vec![line_admin_row(line.line_id, None)];
+    let view = admin_view(&snapshot, std::slice::from_ref(&line)).expect("a set order value");
+    assert_eq!(
+        view.order.and_then(|o| o.internal_notes).as_deref(),
+        Some("note")
+    );
+    assert!(view.lines.is_empty());
 }

@@ -276,11 +276,12 @@ fn service_principal_identities_are_required_and_fail_closed() {
     }
 }
 
-/// The E2E producer grants name exactly the configured producer principal: an exact unconditional
-/// grant for the concrete submitted event `produce` check and a root-tenant-constrained rule
-/// for the tenant-scope check. The test reads the parsed YAML and pins only what Orders owns;
-/// the plugin's schema and `validate` are the plugin's own tests, and the live E2E host loads
-/// this fragment (D-227 item 4, D-248).
+/// The E2E producer grants name exactly the configured producer principal: an unconditional
+/// grant for the concrete event `produce` check over the Orders event family (a prefix, so
+/// `OrderSubmitted` and `OrderAmended` both match and no other gear's event does) and a
+/// root-tenant-constrained rule for the tenant-scope check. The test reads the parsed YAML and
+/// pins only what Orders owns; the plugin's schema and `validate` are the plugin's own tests, and
+/// the live E2E host loads this fragment (D-227 item 4, D-248).
 #[test]
 fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
     let text = include_str!("../../../config/e2e-orders.yaml");
@@ -313,10 +314,21 @@ fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
     assert_eq!(
         (grant["resource_type"].as_str(), grant["action"].as_str()),
         (
-            Some("gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~"),
+            Some(crate::infra::events::EVENT_TYPE_WILDCARD),
             Some("produce")
         )
     );
+    let family = grant["resource_type"]
+        .as_str()
+        .unwrap()
+        .trim_end_matches('*');
+    for event in [
+        <crate::infra::events::payload::OrderSubmitted as crate::infra::events::EventKind>::TYPE_ID,
+        <crate::infra::events::payload::OrderAmended as crate::infra::events::EventKind>::TYPE_ID,
+    ] {
+        assert!(event.starts_with(family), "{event}");
+    }
+    assert!(!"gts.cf.core.events.event.v1~cf.bss.pricing.event.v1~".starts_with(family));
     let Some([rule]) = policy["rules"].as_array().map(Vec::as_slice) else {
         panic!("exactly one tenant-scope rule")
     };
@@ -497,8 +509,47 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
         crate::api::rest::problem(result.unwrap_err()).status,
         Some(503)
     );
-    // S2-09 mounts exactly the five delivered authoring operations and the early-S6 package
-    // the three draft read operations; nothing else.
+    // Without the development delivery the local client has no amendment service: not
+    // delivered (503), even for a body the boundary would refuse.
+    let amended = client
+        .amend(
+            &caller,
+            Uuid::from_u128(3),
+            serde_json::from_value(json!({"reason": "r", "lines": [
+                {"op": "remove", "line_id": Uuid::from_u128(4)},
+                {"op": "remove", "line_id": Uuid::from_u128(4)}]}))?,
+            CallMeta {
+                expected_version: OrderVersion::try_from(1)?,
+                idempotency_key: IdempotencyKey::try_from("key-amend".to_owned())?,
+                correlation_id: None,
+                delegation_proof_ref: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        crate::api::rest::problem(amended.unwrap_err()).status,
+        Some(503)
+    );
+    // Nor a record-acceptance service (S4-08b, D-256): not delivered (503).
+    let recorded = client
+        .record_acceptance(
+            &caller,
+            Uuid::from_u128(3),
+            bss_orders_sdk::acceptance::Acceptance,
+            CallMeta {
+                expected_version: OrderVersion::try_from(2)?,
+                idempotency_key: IdempotencyKey::try_from("key-accept".to_owned())?,
+                correlation_id: None,
+                delegation_proof_ref: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        crate::api::rest::problem(recorded.unwrap_err()).status,
+        Some(503)
+    );
+    // S2-09 mounts exactly the five delivered authoring operations, the early-S6 package the
+    // three draft read operations and S4-06 the three history reads (D-255); nothing else.
     let openapi = toolkit::api::OpenApiRegistryImpl::new();
     let router = gear.register_rest(&ctx, axum::Router::new(), &openapi)?;
     let document =
@@ -521,12 +572,23 @@ async fn postgres_boot_registers_unavailable_sdk_and_shutdown_is_cooperative() -
             "DELETE /bss-orders/v1/orders/{orderId}/lines/{lineId}",
             "GET /bss-orders/v1/orders",
             "GET /bss-orders/v1/orders/{orderId}",
+            "GET /bss-orders/v1/orders/{orderId}/acceptance",
             "GET /bss-orders/v1/orders/{orderId}/lines",
+            "GET /bss-orders/v1/orders/{orderId}/versions",
+            "GET /bss-orders/v1/orders/{orderId}/versions/{version}",
             "PATCH /bss-orders/v1/orders/{orderId}",
             "PATCH /bss-orders/v1/orders/{orderId}/lines/{lineId}",
             "POST /bss-orders/v1/orders",
             "POST /bss-orders/v1/orders/{orderId}/lines",
         ]
+    );
+    assert!(
+        document["paths"]["/bss-orders/v1/orders/{orderId}/amendments"].is_null(),
+        "the amendment route is absent without the development delivery"
+    );
+    assert!(
+        document["paths"]["/bss-orders/v1/orders/{orderId}/acceptance"]["post"].is_null(),
+        "the record-acceptance route is absent without the development delivery"
     );
     assert_delivered_census(&router, &openapi, &document, &operations, &caller).await?;
     // Before `serve` binds the engine the routes answer unavailable: no write before readiness.
@@ -748,6 +810,9 @@ async fn assert_delivered_census(
             "get",
             "list",
             "list_lines",
+            "list_versions",
+            "get_version",
+            "get_acceptance",
         ]
         .contains(&op.id)
     }) {
@@ -818,6 +883,94 @@ async fn boot_promotes_the_date_policy_and_refuses_a_missing_default() -> anyhow
         assert!(error.to_string().contains("date policy"), "{error}");
         assert!(hub.get::<dyn OrdersV1>().is_err());
     }
+    Ok(())
+}
+
+/// S4-07 at boot (D-251): the configured policy elections are promoted after the date policy;
+/// a repeated boot only reads, so a runtime-role connection boots with the same configuration;
+/// a changed promotion without the policy grants refuses startup with nothing written, and an
+/// invalid block refuses it before any write.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn boot_promotes_policy_elections() -> anyhow::Result<()> {
+    use sea_orm::ConnectionTrait;
+    let (_container, port) = pg_container::start_postgres().await?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let db = toolkit_db::connect_db(&url, toolkit_db::ConnectOpts::default()).await?;
+    let raw = sea_orm::Database::connect(url).await?;
+    let gear = Arc::new(BssOrdersGear::default());
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
+    raw.execute_unprepared(
+        "CREATE ROLE test_runtime LOGIN PASSWORD 'fixture' INHERIT; GRANT bss_orders_runtime TO test_runtime",
+    )
+    .await?;
+    let runtime = toolkit_db::connect_db(
+        &format!("postgres://test_runtime:fixture@127.0.0.1:{port}/postgres"),
+        toolkit_db::ConnectOpts::default(),
+    )
+    .await?;
+    let mut cfg = config();
+    cfg["policy_elections"] = json!({
+        "elected_by": "deploy-1",
+        "platform": {"acceptance_required": true},
+        "sellers": [{"seller_tenant_id": "00000000-0000-0000-0000-000000000014",
+            "tolerate_authorization_failure": true}]
+    });
+    let state = || async {
+        raw.query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT string_agg(concat_ws(':', election, scope_id, elected, elected_by, policy_id, elected_at), ',' ORDER BY scope_id NULLS FIRST, election) AS s FROM bss_orders__policy_election",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<Option<String>>("", "s")
+        .unwrap()
+    };
+    let boot = |config: serde_json::Value, db: toolkit_db::Db| async move {
+        let hub = dependencies("complete");
+        let ctx = context(Some(config), Arc::clone(&hub)).with_db(toolkit_db::DBProvider::new(db));
+        let result = BssOrdersGear::default().init(&ctx).await;
+        (result, hub.get::<dyn OrdersV1>().is_ok())
+    };
+    // A changed promotion through the runtime role refuses startup and writes nothing.
+    let (result, published) = boot(cfg.clone(), runtime.clone()).await;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("policy election"), "{error}");
+    assert!(!published);
+    assert_eq!(state().await, None);
+    // The privileged boot promotes; the same configuration again only reads, so the runtime role
+    // boots and the rows (identities and instants included) are unchanged.
+    boot(cfg.clone(), db.clone()).await.0?;
+    let promoted = state().await.unwrap();
+    assert!(
+        promoted.starts_with("acceptance_required:t:deploy-1:"),
+        "{promoted}"
+    );
+    assert!(
+        promoted.contains(
+            ",tolerate_authorization_failure:00000000-0000-0000-0000-000000000014:t:deploy-1:"
+        ),
+        "{promoted}"
+    );
+    let (result, published) = boot(cfg.clone(), runtime.clone()).await;
+    result?;
+    assert!(published);
+    boot(cfg.clone(), db.clone()).await.0?;
+    assert_eq!(state().await.unwrap(), promoted);
+    // An invalid block refuses startup before any write.
+    let mut bad = cfg.clone();
+    bad["policy_elections"]["sellers"][0] =
+        json!({"seller_tenant_id": "00000000-0000-0000-0000-000000000014"});
+    let (result, published) = boot(bad, db.clone()).await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("names no election")
+    );
+    assert!(!published);
+    assert_eq!(state().await.unwrap(), promoted);
     Ok(())
 }
 
@@ -1158,12 +1311,11 @@ async fn boot_binds_the_gate_ports_and_names_every_missing_provider() -> anyhow:
 #[ignore = "requires Docker (testcontainers)"]
 async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
     use bss_orders_sdk::catalog::Reason;
+    use sea_orm::ConnectionTrait as _;
     let (_container, port) = pg_container::start_postgres().await?;
-    let db = toolkit_db::connect_db(
-        &format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
-        toolkit_db::ConnectOpts::default(),
-    )
-    .await?;
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let db = toolkit_db::connect_db(&url, toolkit_db::ConnectOpts::default()).await?;
+    let raw = sea_orm::Database::connect(url).await?;
     let gear = BssOrdersGear::default();
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
     // A per-run copy of the shipped example fixture, as the e2e suite writes its own.
@@ -1180,7 +1332,8 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
     )?;
     let mut cfg = config();
     cfg["gate"] = json!({"dev_stubs": true, "dev_stub_fixture": fixture});
-    let ctx = context(Some(cfg), dependencies("complete")).with_db(toolkit_db::DBProvider::new(db));
+    let hub = dependencies("complete");
+    let ctx = context(Some(cfg), Arc::clone(&hub)).with_db(toolkit_db::DBProvider::new(db));
     let booted = gear.init(&ctx).await;
     std::fs::remove_file(&fixture)?;
     booted?;
@@ -1285,6 +1438,288 @@ async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
             expect(error),
             "{headers:?} {body}"
         );
+    }
+
+    // S4-03: the amendment route is mounted under the same development delivery, outside the
+    // census, with its headers and problem responses documented.
+    let amend_route = crate::api::rest::wire::route("amend").unwrap();
+    assert_eq!(
+        amend_route.path,
+        "/bss-orders/v1/orders/{orderId}/amendments"
+    );
+    let amend_doc = &document["paths"][amend_route.path]["post"];
+    assert_eq!(amend_doc["operationId"], json!("bss_orders.amend"));
+    assert_eq!(amend_doc["requestBody"]["required"], json!(true));
+    let params: Vec<_> = amend_doc["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    for name in [
+        "orderid",
+        "if-match",
+        "idempotency-key",
+        "x-delegation-proof-ref",
+    ] {
+        assert!(params.contains(&name.to_owned()), "{name} in {params:?}");
+    }
+    for status in ["200", "400", "412", "428", "429", "503"] {
+        assert!(amend_doc["responses"][status].is_object(), "{status}");
+    }
+    assert!(!crate::api::rest::DELIVERED_OPERATIONS.contains(&"amend"));
+    crate::api::rest::validate_delivered()?;
+
+    let amend_path = amend_route
+        .path
+        .replace("{orderId}", &Uuid::from_u128(3).to_string());
+    let amend = |headers: &[(&str, &str)], body: &'static str| {
+        let mut request =
+            axum::http::Request::post(&amend_path).header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(axum::body::Body::from(body)).unwrap();
+        tower::ServiceExt::oneshot(
+            router.clone().layer(axum::Extension(caller.clone())),
+            request,
+        )
+    };
+    let line_a = "00000000-0000-0000-0000-00000000000a";
+    let twice: &'static str = Box::leak(
+        json!({"reason": "r", "lines": [
+            {"op": "remove", "line_id": line_a}, {"op": "remove", "line_id": line_a}
+        ]})
+        .to_string()
+        .into_boxed_str(),
+    );
+    let amend_valid = r#"{"reason":"bigger plan","header":{"display_label":"x"}}"#;
+    for (headers, body, error) in [
+        // No If-Match: 428 before the key, the body and the service.
+        (
+            &[key][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // An unparseable If-Match is the same 428.
+        (
+            &[("if-match", "1"), key][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // If-Match without an Idempotency-Key: the key is enforced before the service.
+        (
+            &[if_match][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // An unknown key is refused at the boundary.
+        (
+            &[if_match, key][..],
+            r#"{"reason":"r","x":1}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A line named twice is refused at the boundary.
+        (
+            &[if_match, key][..],
+            twice,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A missing reason is not a boundary failure: it reaches the service, which answers
+        // unavailable before `serve` binds the engine (the audited `amendment-reason-invalid`
+        // refusal is the engine's, `infra::storage::tests::amend`).
+        (
+            &[if_match, key][..],
+            r#"{"lines":[{"op":"remove","line_id":"00000000-0000-0000-0000-00000000000a"}]}"#,
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+        // A well-formed request reaches the service: unavailable before `serve`.
+        (
+            &[if_match, key][..],
+            amend_valid,
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+    ] {
+        let response = amend(headers, body).await?;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            answered(status, &bytes),
+            expect(error),
+            "{headers:?} {body}"
+        );
+    }
+    // S4-08b (D-256): the record-acceptance route is mounted under the same development
+    // delivery beside the delivered GET on the same path, outside the census.
+    let accept_route = crate::api::rest::wire::route("record_acceptance").unwrap();
+    assert_eq!(
+        accept_route.path,
+        "/bss-orders/v1/orders/{orderId}/acceptance"
+    );
+    let accept_doc = &document["paths"][accept_route.path]["post"];
+    assert_eq!(
+        accept_doc["operationId"],
+        json!("bss_orders.record_acceptance")
+    );
+    assert_eq!(accept_doc["requestBody"]["required"], json!(true));
+    assert!(
+        document["paths"][accept_route.path]["get"].is_object(),
+        "the delivered read keeps its GET"
+    );
+    let params: Vec<_> = accept_doc["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    for name in [
+        "orderid",
+        "if-match",
+        "idempotency-key",
+        "x-delegation-proof-ref",
+    ] {
+        assert!(params.contains(&name.to_owned()), "{name} in {params:?}");
+    }
+    for status in ["200", "400", "412", "428", "429", "503"] {
+        assert!(accept_doc["responses"][status].is_object(), "{status}");
+    }
+    assert!(!crate::api::rest::DELIVERED_OPERATIONS.contains(&"record_acceptance"));
+    let accept_path = accept_route
+        .path
+        .replace("{orderId}", &Uuid::from_u128(3).to_string());
+    let accept = |headers: &[(&str, &str)], body: &'static str| {
+        let mut request =
+            axum::http::Request::post(&accept_path).header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(axum::body::Body::from(body)).unwrap();
+        tower::ServiceExt::oneshot(
+            router.clone().layer(axum::Extension(caller.clone())),
+            request,
+        )
+    };
+    for (headers, body, error) in [
+        // No If-Match: 428 before the key, the body and the service.
+        (
+            &[key][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // An unparseable If-Match is the same 428.
+        (
+            &[("if-match", "2"), key][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // If-Match without an Idempotency-Key: the key is enforced before the service.
+        (
+            &[if_match][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A caller-supplied timestamp is an unknown key, refused at the boundary.
+        (
+            &[if_match, key][..],
+            r#"{"accepted_at":"2020-01-01T00:00:00Z"}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // So is any other member, and a body that is not an object.
+        (
+            &[if_match, key][..],
+            r#"{"x":1}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        (
+            &[if_match, key][..],
+            "[]",
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A well-formed request reaches the service: unavailable before `serve`.
+        (
+            &[if_match, key][..],
+            "{}",
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+    ] {
+        let response = accept(headers, body).await?;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            answered(status, &bytes),
+            expect(error),
+            "{headers:?} {body}"
+        );
+    }
+
+    // The local client decides the same well-formedness before any authority or store work,
+    // and a well-formed request reaches the same service.
+    let client = hub.get::<dyn OrdersV1>()?;
+    let call = |text: &str| -> anyhow::Result<CallMeta> {
+        Ok(CallMeta {
+            expected_version: OrderVersion::try_from(1)?,
+            idempotency_key: IdempotencyKey::try_from(text.to_owned())?,
+            correlation_id: None,
+            delegation_proof_ref: None,
+        })
+    };
+    let local = client
+        .amend(
+            &caller,
+            Uuid::from_u128(3),
+            serde_json::from_str(twice)?,
+            call("k-local-1")?,
+        )
+        .await;
+    assert!(
+        matches!(
+            local,
+            Err(bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid))
+        ),
+        "{local:?}"
+    );
+    let local = client
+        .amend(
+            &caller,
+            Uuid::from_u128(3),
+            serde_json::from_str(amend_valid)?,
+            call("k-local-2")?,
+        )
+        .await;
+    assert!(
+        matches!(local, Err(bss_orders_sdk::OrdersError::Unavailable)),
+        "{local:?}"
+    );
+    let local = client
+        .record_acceptance(
+            &caller,
+            Uuid::from_u128(3),
+            bss_orders_sdk::acceptance::Acceptance,
+            call("k-local-3")?,
+        )
+        .await;
+    assert!(
+        matches!(local, Err(bss_orders_sdk::OrdersError::Unavailable)),
+        "{local:?}"
+    );
+    // Neither the boundary refusals nor the unbound service wrote an audit, access-log or
+    // idempotency row. (A reaching amendment's audit and idempotency rows are asserted on a bound
+    // engine in `infra::storage::tests::amend`; this host has no Event Broker, so `serve` never
+    // binds one here.)
+    for table in [
+        "bss_orders__transition_audit",
+        "bss_orders__read_access_log",
+        "bss_orders__idempotency",
+    ] {
+        let count = raw
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table}"),
+            ))
+            .await?
+            .unwrap()
+            .try_get::<i64>("", "n")?;
+        assert_eq!(count, 0, "{table}");
     }
     Ok(())
 }

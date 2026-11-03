@@ -49,6 +49,13 @@ bss-orders:
       platform_default:
         service_activation_required: false
         acceptance_due_required: false
+    # S4-07 policy-election channel (D-251). The migrations seed no election and the E2E host runs
+    # as the runtime login without `bss_orders_policy`, so naming an election here would make the
+    # boot insert and refuse startup. The block names none: the boot validates it and reads the
+    # table through the runtime role, writing nothing. A scenario that needs an election grants
+    # `bss_orders_policy` to the host login and names it.
+    policy_elections:
+      elected_by: "e2e"
 # The pre-engine request limiter's gateway half (Foundation contract §3.7, D-185; S2-12),
 # deep-merged into the E2E host's `api-gateway` block. The identity key is the authenticated
 # `subject_id`, so the zones are bound through `ThrottlingSpec { require_security_context: true,
@@ -89,18 +96,21 @@ event-broker:
         partitions: 4
 # Orders producer authorization for the e2e policy AuthZ plugin, merged into the E2E host's
 # `bss-orders-test-authz-plugin` block. Event Broker authorizes the concrete event GTS resource.
-# Grant only the delivered submitted event (no wildcard, no allow-all); later lifecycle events
-# need their own grants when delivered. The separate tenant-scope `request` `produce` rule
-# remains confined to the platform root tenant (D-95). A gear test pins both grants to
+# One prefix grant covers the Orders event family, exactly the producer's declared event-type
+# pattern (`OrderSubmitted`, and `OrderAmended` since S4-03/S4-04), as the suite grants Pricing
+# and Products their families (#5383): the plugin matches a `resource_type` ending in `*` as a
+# prefix. It names only the Orders producer and only `produce`; no allow-all. The separate
+# tenant-scope `request` `produce` rule remains confined to the platform root tenant (D-95). A
+# gear test pins both grants to
 # `events.producer_*`.
 bss-orders-test-authz-plugin:
   config:
     unconditional_grants:
-      - id: "orders-producer-submitted-produce"
+      - id: "orders-producer-event-type-produce"
         subject:
           id: "0e0e0000-0000-4000-8000-000000000005"
           tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
-        resource_type: "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~"
+        resource_type: "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.*"
         action: "produce"
     rules:
       - id: "orders-producer-root-tenant-produce"

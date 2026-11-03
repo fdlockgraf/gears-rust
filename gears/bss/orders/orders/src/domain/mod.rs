@@ -1,5 +1,7 @@
 //! Pure Orders domain rules. The application services that enter the engine live in `infra`.
 
+/// Administrative order and line edits (S4-05): named values, row-3 guards.
+pub mod administrative_edit;
 pub mod audit;
 /// Draft capture (S2-09): trigger selection, capture guards and authored term geometry.
 pub mod capture;
@@ -14,6 +16,8 @@ pub mod failure;
 pub mod gate;
 pub mod idempotency;
 pub mod overlap;
+/// Acceptance preconditions (S4-08): automatic consent and the requirement's precedence.
+pub mod preconditions;
 /// Read surfaces (early S6-01/S6-04): page bounds, cursor codec and the access-log decision.
 pub mod read;
 // The S2-04 engine's declarative core. Slice operations bind guards, select triggers from the
@@ -22,3 +26,5 @@ pub mod contributions;
 pub mod guards;
 pub mod state_table;
 pub mod transition;
+/// Amendment (S4-03): the delta merge onto committed version N and the five versioning guards.
+pub mod versioning;

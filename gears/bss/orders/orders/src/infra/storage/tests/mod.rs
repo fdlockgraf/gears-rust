@@ -265,12 +265,27 @@ mod repositories;
 mod roles;
 mod workers;
 
+#[cfg(feature = "gate-dev-stubs")]
+mod acceptance;
+#[cfg(feature = "gate-dev-stubs")]
+mod administrative;
+#[cfg(feature = "gate-dev-stubs")]
+mod amend;
 mod capture;
 mod dates;
 mod engine;
 mod events;
+#[cfg(feature = "gate-dev-stubs")]
+mod fulfillment;
+#[cfg(feature = "gate-dev-stubs")]
+mod history;
 mod platform;
+mod policy;
 mod reads;
+#[cfg(feature = "gate-dev-stubs")]
+mod signals;
+#[cfg(feature = "gate-dev-stubs")]
+mod stage4;
 #[cfg(feature = "gate-dev-stubs")]
 mod submit;
 mod throttling;

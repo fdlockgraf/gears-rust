@@ -15,6 +15,7 @@ use toolkit_macros::domain_model;
 
 use bss_orders_sdk::catalog::{OrderState, Reason, Trigger};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use super::audit::AdminChange;
 use super::contributions::AggregateFacts;
@@ -77,6 +78,16 @@ pub struct GuardSubject<'a> {
     /// engine's locked read, unchanged fields dropped (04 §3.6 step 2). The change guard refuses
     /// `administrative-edit-unchanged` when it is empty; empty on every other row.
     pub administrative: &'a [AdminChange],
+    /// Row 3 line edits only: the order's line identities at the engine's locked read — the
+    /// working lines in `draft`, the lines committed at the locked current version otherwise
+    /// (04 §3.6: membership is checked under the lock). Empty on every other row.
+    pub admin_lines: &'a [Uuid],
+    /// Rows 25 and 11 only: whether the locked current version already has a recorded consent,
+    /// read under the aggregate lock. Row 25 (05 *Record Acceptance* step 5, D-256): two
+    /// independent recordings of one version cannot both pass. Row 11 (05 §3.3 step 2, D-257):
+    /// begin-fulfillment decides consent on the version it admits, never on a pre-lock read.
+    /// `false` on every other row.
+    pub acceptance_recorded: bool,
 }
 
 /// A guard predicate's result.
@@ -247,10 +258,24 @@ pub enum DecisionError {
     /// for one of them.
     #[error("draft revisions are required exactly for draft-mutate and submit")]
     DraftRevisions,
-    /// Administrative changes were supplied for a row other than the administrative-edit row, or
-    /// missing for it.
+    /// Administrative changes or line memberships were supplied for a row other than the
+    /// administrative-edit row.
     #[error("administrative changes belong to the administrative-edit row exactly")]
     Administrative,
+    /// A locked consent fact was supplied for a row other than record-acceptance and
+    /// begin-fulfillment.
+    #[error("the locked consent fact belongs to the record-acceptance and begin-fulfillment rows")]
+    LockedAcceptance,
+}
+
+/// Whether the engine reads, under the aggregate lock, whether the locked current version has a
+/// consent: record-acceptance (D-256) and begin-fulfillment (D-257).
+#[must_use]
+pub fn reads_locked_acceptance(trigger: Trigger) -> bool {
+    matches!(
+        trigger,
+        Trigger::RecordAcceptance | Trigger::BeginFulfillment
+    )
 }
 
 /// Whether the trigger carries client/prepared draft revisions (OL-4).
@@ -371,13 +396,18 @@ pub fn decide<'t>(
         inputs,
         transition_time,
         &[],
+        &[],
+        false,
     )
 }
 
-/// [`decide`] with row 3's administrative changes as reconciled at the engine's locked read.
+/// [`decide`] with row 3's administrative changes as reconciled at the engine's locked read and,
+/// for a line edit, the order's line identities read under the same lock; and, for rows 25 and
+/// 11, whether the locked current version already has a consent (D-256, D-257).
 ///
 /// # Errors
-/// Binding/input contract violations, or administrative changes on another trigger.
+/// Binding/input contract violations, administrative changes or lines on another trigger, or a
+/// locked consent fact on a trigger other than record-acceptance or begin-fulfillment.
 #[expect(
     clippy::too_many_arguments,
     reason = "the pure transition decision takes every input of §3.4 explicitly (state table, \
@@ -395,9 +425,16 @@ pub fn decide_with<'t>(
     inputs: &Inputs,
     transition_time: OffsetDateTime,
     administrative: &[AdminChange],
+    admin_lines: &[Uuid],
+    acceptance_recorded: bool,
 ) -> Result<Decision<'t>, DecisionError> {
-    if trigger != Trigger::AdministrativeEdit && !administrative.is_empty() {
+    if trigger != Trigger::AdministrativeEdit
+        && (!administrative.is_empty() || !admin_lines.is_empty())
+    {
         return Err(DecisionError::Administrative);
+    }
+    if acceptance_recorded && !reads_locked_acceptance(trigger) {
+        return Err(DecisionError::LockedAcceptance);
     }
     let row = match admit(table, trigger, locked, expected_version, revisions)? {
         Ok(row) => row,
@@ -412,6 +449,8 @@ pub fn decide_with<'t>(
         transition_time,
         inputs,
         administrative,
+        admin_lines,
+        acceptance_recorded,
     };
     if let Some(decision) = evaluate(guards, bindings, &subject)? {
         return Ok(decision);
@@ -456,6 +495,8 @@ pub fn decide_create(
         transition_time,
         inputs,
         administrative: &[],
+        admin_lines: &[],
+        acceptance_recorded: false,
     };
     Ok(match evaluate(guards, bindings, &subject)? {
         Some(

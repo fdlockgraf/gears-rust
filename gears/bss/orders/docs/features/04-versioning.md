@@ -64,7 +64,7 @@ Append a new immutable commercial version when an order is amended, re-run the f
 - **Dependencies**: [Foundation](01-foundation.md), [Capture](02-capture.md), [Gate and Pin](03-gate-and-pin.md).
 - **Consumers**: [Workflow Seam](06-workflow-seam.md), [Read and Authorization](08-read-and-authz.md).
 
-DESIGN owns schemas and architectural rationale; this feature owns the complete guard registration and behavior contracts. D-174 selects two-step re-approval and S1-01 reconciles Q-12's stale PRD wording. [DECISIONS.md](../DECISIONS.md) Q-28 (payer/seller rebinding) and Q-41 (`OrderAmended` trigger wording, split from Q-25 by D-186) retain their product scope. D-82's version/audit reason split also remains explicitly disclosed by the design.
+DESIGN owns schemas and architectural rationale; this feature owns the complete guard registration and behavior contracts. Q-12 is closed as an algorithm choice: two-step reapproval is selected (D-174), and the Workflow PRD amendment is a delivery task (`…-upreq-workflow-amendment-verdict`), not an open question. Event triggers follow Q-41: version creation is event-less, submit publishes `OrderSubmitted`, and only an actual amendment (rows 18-20) publishes `OrderAmended`. The submitted role version is the committed version whose reason is `submit`; because version history is sparse (D-188) it is not necessarily version 2, and role resolution never assumes a version number. [DECISIONS.md](../DECISIONS.md) Q-28 (cross-seller transfer and payer/seller rebinding) and Q-30 (customer acceptance surface for partner-placed orders) remain open limitations that this feature does not resolve, and Q-41 (`OrderAmended` trigger wording in PRD §6.5, split from Q-25 by D-186) retains its product scope. D-82's version/audit reason split also remains explicitly disclosed by the design.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -95,9 +95,9 @@ DESIGN owns schemas and architectural rationale; this feature owns the complete 
 **Actor**: An authorized administrative editor or history reader.
 
 1. [ ] Submit order or line `PATCH` through Capture with expected version and idempotency key. Capture selects the trigger from named field classes: administrative-only selects the administrative edit; any commercial field selects `draft-mutate` and refuses outside `draft`.
-2. [ ] Apply §3.2 and return the unchanged commercial version with corrected administrative values.
+2. [ ] Apply §3.2 and return the settled result naming the unchanged commercial version; the corrected administrative values are read through the order and version reads' current `admin` projection, which every `order × read` principal sees (D-263).
 3. [ ] Read `/orders/{orderId}/versions` or `/orders/{orderId}/versions/{version}` through Read and Authorization's common wrapper, with current-parent authorization and access logging.
-4. [ ] Return the full requested commercial content and actor, timestamp, machine reason and supersession metadata. Return `version-not-found` for a missing version only after parent authorization; expose administrative history only through the separately authorized audit trail (Partner Admin or Seller Operator paths; Direct Customer history access does not grant audit reads).
+4. [ ] Return the full requested commercial content (lines, pins, totals and the header at that version: payer, category, contract, market) and actor, timestamp, machine reason and supersession metadata on the version read itself (D-262), with the version's role actors (§4.5, D-260). Return `version-not-found` for a missing version only after parent authorization; expose administrative history only through the separately authorized audit trail (Partner Admin or Seller Operator paths; Direct Customer history access does not grant audit reads).
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -108,14 +108,27 @@ DESIGN owns schemas and architectural rationale; this feature owns the complete 
 **Input**: Current version, delta, amendment reason, expected version, actor and key.
 **Output**: New version contribution or ordered guard inputs for an audited refusal.
 
-1. [ ] Register guards in this order: amendment cap; nonempty delta; valid reason; no administrative field; no commercial-frozen field; payer within seller scope; Capture structural guards (`category-not-admitted`, `currency-mixed`, `line-cap-exceeded`); shared date guard; full gate composite. Preserve their registered refusal names.
+1. [ ] Register guards in this order: amendment cap; nonempty delta; valid reason; no administrative field; no commercial-frozen field; line membership (`line-not-found`, D-253); at least one proposed line (`no-lines`, D-253); Capture structural guards (`category-not-admitted`, `currency-mixed`, `line-cap-exceeded`); the accepted-binding admission guard (`gate.binding-admission`: `order-binding-expired`, `purchase-capacity-exceeded`, D-253 item 4); shared date guard; full gate composite. Preserve their registered refusal names.
 2. [ ] Enforce the finite amendment cap (baseline 20, never unlimited). An inadmissible state still refuses `not-admissible` before this guard; cap exhaustion is `amendment-cap-exhausted` with cap and count.
 3. [ ] Carry forward every unnamed commercial field and apply the delta. Reject any administrative field, including mixed deltas, with `administrative-field-in-amendment`; reject resource/seller axis fields with `tenant-axis-immutable`.
-4. [ ] For a payer change, resolve the commercial profile through Gate and Pin once and reuse it in the gate. A non-confirmed seller relationship refuses `payer-rebinding-requires-seller`; an unavailable identity input refuses `identity-party-unavailable`. Seller remains immutable; no paired rebinding is offered.
+4. [ ] For a payer change, resolve the commercial profile through Gate and Pin once and reuse it in the gate. The payer relationship is checked once, by gate predicate 1 (`payer-relationship-unconfirmed`, D-215, D-232; D-249 removed the separate amendment guard and its reason); an unavailable identity input refuses `identity-party-unavailable`. Seller remains immutable; no paired rebinding is offered.
 5. [ ] Skip external work precluded by earlier failing local guards, preserving ordered engine refusal precedence. Otherwise first prepare the policy snapshot, proposed dates and date basis under Capture §4.2, before any date-dependent external calls. Then resolve all proposed lines against a fixed revision per line in one seller-scoped assessment, recomposing every pin, market, resolved total and TCV. Retain full gate/pin outcomes when any input fails.
 6. [ ] Carry the prepared dates, date basis and policy snapshot into the contribution. Contribute the entire distinct `(proposed payer_tenant_id, resource_tenant_id, overlap_scope_key)` claim set, including retained lines; never treat absent claims as permission to bypass maintenance.
 7. [ ] Let the engine validate the final date basis and expected version, replace claims and append the version atomically. On a partial claim collision, release only the exact fresh claim IDs returned by this attempt, retain pre-existing claims and commercial content, then commit the released reservation history with the refusal audit and settlement. A cleanup-count mismatch or persistence failure instead rolls back the transaction under Foundation’s contract.
 8. [ ] Persist the explanation as `amendment_reason` on the version and `caller_reason` on audit; machine reason remains `amendment`. Only the engine assigns `supersedes_version` and moves the current pointer.
+
+**Implementation note (S4-03/S4-04, D-253, D-254).** Delivered in the development delivery only
+(D-235): `AmendService` (`infra/amend.rs`) behind `POST /orders/{orderId}/amendments` and
+`OrdersV1::amend`. It runs submit's assessment, reservation and phases B and C over the proposed
+version (steps 2 and 5 to 8), merging the delta onto the committed version named by `If-Match`
+(steps 3 and 4). Step 5's preclusion covers the seven versioning guards, the structural guards
+and authored-selection capacity: they are decided before any date, gate, authority or Pricing
+call. The engine rechecks state and expected version under the reservation lock (E1), and a
+concurrent writer that makes the order amendable between the read and the lock is decided from
+the locked state (D-254 item 10). Step 7's partial-collision cleanup and its rollback on failure
+are covered by the PostgreSQL tests named in D-254. `OrderAmended { supersedesVersion }` is
+emitted on rows 18–20. Production delivery, the maintenance recovery body (D-236) and a
+per-caller amendment limiter remain open.
 
 ### 3.2 Apply an administrative edit
 
@@ -162,6 +175,8 @@ All amendment rows increment `amendment_count`; no transition resets it. Once M 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-versioning-amendment`
 
+> **Status (2026-10-29): locally complete in the development delivery (D-235, D-254); open pending real providers.** Unchecked on purpose. Open gates: the gate's providers (Account Management payer profile, Contracts, Subscriptions occupancy and overlap, Rating evaluation; development stubs only); PDP policy evidence for `order × amend` and the proposed-payer decision; production delivery of submit and amendment, which first needs D-252 item 9 (the post-hold election read, the rolling-deploy `FrozenOrder` decoder); Q-28 cross-seller transfer; the Workflow mirror (S3-15). These production prerequisites are recorded in D-266. See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-258).
+
 The system **MUST** implement §2.1 and §3.1 through the shared engine, retaining its refusal, transaction and replay guarantees.
 
 **Implements**: `cpt-cf-bss-orders-flow-versioning-amend`, `cpt-cf-bss-orders-algo-versioning-append`.
@@ -171,6 +186,8 @@ The system **MUST** implement §2.1 and §3.1 through the shared engine, retaini
 ### 5.2 Administrative and history implementation
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-dod-versioning-history`
+
+> **Status (2026-10-29): production scope, no doubles (D-255, S4-05); open pending evidence.** Unchecked on purpose. Open gates: deployed PDP policy evidence for `order × read` (history) and `order × edit` (administrative edits); history-read p95 < 200 ms at 20 versions, unmeasured (S6-06); the Stage 4 alerts are documentation only and unratified (D-258 item 4, D-266 item 3); the amended-`submitted` dwell signal against Workflow's reflection lead time is assigned to Stage 5 (D-266 item 2). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-258). **D-260 implemented (2026-11-02):** `OrderVersionView.actors` (creator, submitter, amender with actor tenants; §4.5), with the version metadata and header (D-262) and the current `admin` projection on both reads (D-263). **D-264 implemented (2026-11-02):** `amendment-cap-exhausted` carries `{cap, amendment_count}` and `administrative-field-in-amendment` carries `{field, use}` (the `PATCH` route) in `context.data`, stored and replayed.
 
 The system **MUST** preserve the immutable chain, separately audit mutable administrative corrections and supply authorized historical reads. Instrument amendment depth, gate outcomes, stale workflow results and administrative changes; alert on stale-result rate and amended orders dwelling in `submitted` beyond Workflow's reflection lead time.
 
@@ -228,13 +245,15 @@ Output: the new version, or a registered refusal
    - (3) a valid explanation: `amendment_reason` present and 1–4096 characters, matching [01 §3.7](../DESIGN.md#contract-01-3-7) `orders_order_version.amendment_reason` (`amendment-reason-invalid`, D-129);
    - (4) no administrative field (`administrative-field-in-amendment`, naming the field and directing the caller to `PATCH /orders/{orderId}`);
    - (5) no commercial-frozen field (`tenant-axis-immutable`);
-   - (6) no payer change that crosses seller scope, as §2.2 defines it (`payer-rebinding-requires-seller`, D-128);
-   - (7) capture's shared structural guards ([01 §3.6](01-foundation.md#contract-01-3-6)): `category-not-admitted`, `currency-mixed`, and `line-cap-exceeded` applied to the complete proposed line set, since an amendment can add lines (the declared cap, baseline 200, [02-capture — Database Schemas and Tables](../DESIGN.md#contract-02-3-7));
-   - (8) the shared date guard (`date-cascade-invalid`, capture §4.2);
-   - (9) the gate composite owned by [`03-gate-and-pin`](../DESIGN.md#contract-03-1-1), including its pin outcomes.
+   - (6) line membership: every line the delta changes or removes is a committed line of version N (`line-not-found`, D-253). N's lines are immutable and the engine verifies under the aggregate lock that the order is still at N, so membership prepared against N is the locked membership;
+   - (7) at least one line in the proposed version (`no-lines`, the reason Submit's `gate.has-lines` uses, D-253), so a delta removing every line is refused;
+   - (8) capture's shared structural guards ([01 §3.6](01-foundation.md#contract-01-3-6)): `category-not-admitted`, `currency-mixed`, and `line-cap-exceeded` applied to the complete proposed line set, since an amendment can add lines (the declared cap, baseline 200, [02-capture — Database Schemas and Tables](../DESIGN.md#contract-02-3-7));
+   - (9) the accepted-binding admission guard `gate.binding-admission` (`order-binding-expired`, `purchase-capacity-exceeded`), registered by Stage 3 between the line cap and the date guard ([03 step 15](03-gate-and-pin.md), D-253 item 4);
+   - (10) the shared date guard (`date-cascade-invalid`, capture §4.2);
+   - (11) the gate composite owned by [`03-gate-and-pin`](../DESIGN.md#contract-03-1-1), including its pin outcomes.
 
-   The engine first applies authorization, idempotency resolution, state-table admissibility and expected-version checking ([01 §4.1](../DESIGN.md#contract-01-4-1)); admissibility is not a slice guard. Thus an amendment from `in_fulfillment` returns `not-admissible` even when the amendment cap is exhausted. An unclassified field fails startup ([02-capture — Field classification (normative)](../DESIGN.md#contract-02-4-3)); there is no runtime refusal for it, so every delta field has a class at runtime. A delta key naming no authored field is rejected at boundary validation with `request-invalid` ([01 §4.7](../DESIGN.md#contract-01-4-7) *Validation flow at the boundary*, D-142), before authorization and before the engine
-2. [ ] - `p1` - Resolve those guards' inputs: classify every delta field through the shared declaration, and determine whether a `payer_tenant_id` change crosses seller scope (§2.2, D-128) from the payer's commercial profile returned by the identity operation, resolved through [`03-gate-and-pin`](../DESIGN.md#contract-03-1-1) ([03 §3.6](03-gate-and-pin.md#contract-03-3-6) *Run Gate and Submit* step 2) once per run and reused by step 5's gate run rather than read again; that operation's unavailability or deadline contributes `identity-party-unavailable`. Do not treat a paired seller change as permission: `sellerTenantId` is commercial-frozen and its guard has precedence inside the engine. When a local guard already fails on its resolved inputs, skip dependent external work and contribute the failing input to step 11 for the engine to decide and audit (§2.2, §4.1); the skipped inputs are **precluded** as defined in [01 §4.1](../DESIGN.md#contract-01-4-1) *Precluded inputs* (D-113). A precluded input is never unresolvable, so the engine reports the earlier guard's reason — e.g. `amendment-cap-exhausted`, not a 503 — and, even where another input is genuinely unavailable, its step 3.1 settles an earlier-registered failing guard first - `inst-am-resolve-guard-inputs`
+   The engine first applies authorization, idempotency resolution, state-table admissibility and expected-version checking ([01 §4.1](../DESIGN.md#contract-01-4-1)); admissibility is not a slice guard. Thus an amendment from `in_fulfillment` returns `not-admissible` even when the amendment cap is exhausted. An unclassified field fails startup ([02-capture — Field classification (normative)](../DESIGN.md#contract-02-4-3)); there is no runtime refusal for it, so every delta field has a class at runtime. A delta key naming no authored field is rejected at boundary validation with `request-invalid` ([01 §4.7](../DESIGN.md#contract-01-4-7) *Validation flow at the boundary*, D-142), before authorization and before the engine; so is a delta naming one line id more than once (D-253)
+2. [ ] - `p1` - Resolve those guards' inputs: classify every delta field through the shared declaration, and resolve the payer profile once for gate predicate 1 (payer ↔ seller and payer ↔ resource, D-232) from the commercial profile returned by the identity operation, resolved through [`03-gate-and-pin`](../DESIGN.md#contract-03-1-1) ([03 §3.6](03-gate-and-pin.md#contract-03-3-6) *Run Gate and Submit* step 2) once per run and reused by step 5's gate run rather than read again; that operation's unavailability or deadline contributes `identity-party-unavailable`. Do not treat a paired seller change as permission: `sellerTenantId` is commercial-frozen and its guard has precedence inside the engine. When a local guard already fails on its resolved inputs, skip dependent external work and contribute the failing input to step 11 for the engine to decide and audit (§2.2, §4.1); the skipped inputs are **precluded** as defined in [01 §4.1](../DESIGN.md#contract-01-4-1) *Precluded inputs* (D-113). A precluded input is never unresolvable, so the engine reports the earlier guard's reason — e.g. `amendment-cap-exhausted`, not a 503 — and, even where another input is genuinely unavailable, its step 3.1 settles an earlier-registered failing guard first - `inst-am-resolve-guard-inputs`
 3. [ ] - `p1` - Carry forward the current version's commercial content - `inst-am-carry-forward`
 4. [ ] - `p1` - Apply the delta over the carried-forward content - `inst-am-apply-delta`
 5. [ ] - `p1` - Run the complete shared gate over amended content with a new assessment/time, seller scope and revision per line. Resolve every proposed line's authoritative overlap key, accepted binding/deadline and then Rating totals, preserving independent diagnostics. Reuse no old gate outputs. Carry the complete distinct proposed payer/key claims, including retained lines, into the engine - `inst-am-rerun-gate`
@@ -391,10 +410,11 @@ administrative change with no `PATCH` audit entry. The caller **MUST** send the 
 **Precedence is the one registration order of §3.6 *Append Amendment* step 1.** Guards refuse
 in **registration order** ([01 §4.1](../DESIGN.md#contract-01-4-1)), after the engine's authorization, idempotency, state and
 expected-version checks: amendment cap, `amendment-empty`, `amendment-reason-invalid`,
-`administrative-field-in-amendment`, `tenant-axis-immutable`, `payer-rebinding-requires-seller`,
-capture's shared structural guards (`category-not-admitted`, `currency-mixed`, and
-`line-cap-exceeded` over the complete proposed line set), `date-cascade-invalid`, then the gate
-composite. So where a delta names both an administrative field and a commercial-frozen axis, the
+`administrative-field-in-amendment`, `tenant-axis-immutable`, `line-not-found`, `no-lines`
+(D-253), capture's shared structural guards (`category-not-admitted`, `currency-mixed`, and
+`line-cap-exceeded` over the complete proposed line set), `gate.binding-admission`
+(`order-binding-expired`, `purchase-capacity-exceeded`), `date-cascade-invalid`, then the gate
+composite (whose predicate 1 checks the payer relationships, D-249). So where a delta names both an administrative field and a commercial-frozen axis, the
 refusal is `administrative-field-in-amendment`; where an empty delta also carries a bad
 explanation, it is `amendment-empty` — the outcome is deterministic rather than
 implementation-dependent. An unclassified field fails startup ([02 §4.3](../DESIGN.md#contract-02-4-3)); there is no runtime
@@ -403,8 +423,11 @@ boundary validation, with `request-invalid` ([01 §4.7](../DESIGN.md#contract-01
 
 **The tenant axes are not uniformly amendable.** `payerTenantId` **MAY** change through an
 amendment **only where the change does not cross seller scope**; a cross-seller payer change
-**MUST** be refused with `payer-rebinding-requires-seller`, because the paired seller rebinding it
-would require is unavailable — see §2.2 *A payer change must not cross seller scope*.
+**MUST** be refused, because no seller rebinding is possible — see §2.2 *A payer change must not
+cross seller scope*. Payer relationships are checked once, by gate predicate 1 (payer ↔ seller and
+payer ↔ resource, `payer-relationship-unconfirmed`; D-215, D-232, D-249 removed the separate
+amendment guard and its reason): a proposed payer without a confirmed relationship to the order's
+seller is refused there.
 `resourceTenantId` **MUST NOT** change through any path once the order is `submitted`, and
 `sellerTenantId` through any path once the order is created; an amendment delta naming either
 **MUST** be refused with `tenant-axis-immutable`, which also refuses a draft edit naming
@@ -468,8 +491,8 @@ amendment from `approved` impossible.
 unconditionally on the grounds that it "left row 20's `pending_approval` target unreachable and
 silently narrowed a PRD edge". Half of that objection is now moot and half is met head-on. The
 earlier two-row split is folded into the `approved → submitted` row, which carries the §3.6 amendment guards but no guard on the approval verdict,
-and `pending_approval` is reached by row 7, a real edge the sibling gear already drives. The historical divergence was recorded by D-61/Q-12. D-174 subsequently selected this
-two-step shape, and S1-01 aligns PRD §6.1, §6.2 and AC-5 with it. Amendments from all three
+and `pending_approval` is reached by row 7, a real edge the sibling gear already drives. The historical divergence was recorded by D-61/Q-12. D-174 selected this
+two-step shape, and S1-01 aligned PRD §6.1, §6.2 and AC-5 with it; the Workflow PRD amendment remains a delivery task. Amendments from all three
 admitted source states commit in `submitted`; only a fresh version-specific Workflow
 reflection can then move the new version to `pending_approval` or `approved`. No new verdict
 port or direct amendment edge is introduced.
@@ -520,8 +543,32 @@ path **MAY** update or delete a version row.
 The reason vocabulary is registered rather than free text — `create`, `submit` and `amendment` —
 because a consumer reconstructing the commercial trail keys on it.
 
+The version read **MUST** also return the version's **role actors** (D-260): the creator (the
+`actor` of version 1), the submitter (the `actor` of the order's one `submit` version, present
+from that version on) and the amender (the `actor` of the requested version where its reason is
+`amendment`), each with its stored `actor_tenant_id`. They are the subjects the recording-party
+bar reads ([05 §4.2](05-preconditions.md#contract-05-4-2), D-130, D-146) and that Orders Workflow bars from the
+version's approval gate. All three come from the immutable version rows; nothing new is stored.
+Field shapes: [Workflow SDK contract](../DESIGN.md#orders-workflow-sdk-version-actors).
+
 
 <!-- /contract -->
+
+**Implementation status (S4-06, D-255).** Delivered in production (the route census):
+`GET /orders/{orderId}/versions` (`OrdersV1::list_versions`),
+`GET /orders/{orderId}/versions/{version}` (`OrdersV1::get_version`) and
+`GET /orders/{orderId}/acceptance` (`OrdersV1::get_acceptance`), on the common read wrapper with
+current-parent `order × read` authorization before any history row is read and the access-log
+decision table under each catalog operation id. Versions are read directly from the stored
+version rows (no chain or event reconstruction); the history page is keyed by the committed
+version number, so a burned candidate is a gap, never a placeholder, and reading one is an
+authorized `version-not-found`. A version is composed at that version (its own payer axis,
+lines, pins and totals). `get_version` also returns the version row's metadata as its
+`VersionRecord` spells it and the header at that version (D-262), and the role actors read
+with the requested row in one query, a missing role row being an integration failure (D-260).
+`get` and `get_version` carry the order's **current** administrative projection (`admin`, the
+order's and the composed lines' values, absent when none is stored) to every `order × read`
+principal; the administrative history stays the separately authorized audit trail (D-263).
 
 <a id="contract-04-4-6"></a>
 

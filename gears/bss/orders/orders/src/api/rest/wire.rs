@@ -59,7 +59,6 @@ pub const fn reason_status(reason: Reason) -> u16 {
         Reason::IndicativeTaxUnavailable => 503,
         Reason::MarketDivergence => 400,
         Reason::OverlapCollision => 400,
-        Reason::PayerRebindingRequiresSeller => 400,
         Reason::TenantAxisImmutable => 400,
         Reason::AdministrativeFieldInAmendment => 400,
         Reason::AmendmentEmpty => 400,

@@ -505,6 +505,69 @@ pub async fn date_policy_rows(
     query.secure().scope_with(scope).all(runner).await
 }
 
+/// Every policy-election row `scope` admits (S4-07), optionally locked `FOR UPDATE` for
+/// promotion.
+pub async fn policy_election_rows(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    lock: bool,
+) -> Result<Vec<entity::policy_election::Model>, ScopeError> {
+    let query = entity::policy_election::Entity::find()
+        .order_by_asc(entity::policy_election::Column::PolicyId);
+    let query = if lock { query.lock_exclusive() } else { query };
+    query.secure().scope_with(scope).all(runner).await
+}
+
+/// The one row for `(election, scope, scope_id)` that `scope` admits, if any (the unique key),
+/// optionally locked `FOR UPDATE`.
+pub async fn policy_election_row(
+    runner: &impl DBRunner,
+    access: &AccessScope,
+    election: &str,
+    scope: &str,
+    scope_id: Option<Uuid>,
+    lock: bool,
+) -> Result<Option<entity::policy_election::Model>, ScopeError> {
+    use entity::policy_election::Column as C;
+    use sea_orm::{ColumnTrait, QueryFilter};
+    let query = entity::policy_election::Entity::find()
+        .filter(C::Election.eq(election))
+        .filter(C::Scope.eq(scope))
+        .filter(scope_id.map_or_else(|| C::ScopeId.is_null(), |id| C::ScopeId.eq(id)));
+    let query = if lock { query.lock_exclusive() } else { query };
+    query.secure().scope_with(access).one(runner).await
+}
+
+/// Insert a policy-election row unless its `(election, scope, scope_id)` key exists. `false`
+/// means a concurrent promotion holds or committed that key; the caller re-reads it (the
+/// `offer_idempotency` shape).
+pub async fn offer_policy_election(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    row: entity::policy_election::Model,
+) -> Result<bool, ScopeError> {
+    let active = row.into_active_model();
+    let result = entity::policy_election::Entity::insert(active.clone())
+        .secure()
+        .scope_with_model(scope, &active)?
+        .on_conflict_raw(
+            sea_orm::sea_query::OnConflict::columns([
+                entity::policy_election::Column::Election,
+                entity::policy_election::Column::Scope,
+                entity::policy_election::Column::ScopeId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(tx)
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(ScopeError::Db(sea_orm::DbErr::RecordNotInserted)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 #[derive(Debug, sea_orm::FromQueryResult)]
 struct ObservedPolicy {
     policy_id: Uuid,

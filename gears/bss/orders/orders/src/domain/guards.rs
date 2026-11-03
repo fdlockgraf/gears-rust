@@ -46,6 +46,11 @@ pub enum InputPort {
     ContractResolution,
     /// Live acceptance requirement (05 §3.3 step 1, *Record Acceptance* step 2).
     AcceptanceRequirement,
+    /// The seller/platform tolerate-failure election of a `failed` authorization (05 §3.3
+    /// `inst-bg-resolve-requirement`, D-257 item 4). Its unavailability is the same
+    /// `acceptance-requirement-unevaluable` as the requirement's: 05 §3.3 step 1 resolves both
+    /// policies before the transaction and routes either outage through the engine.
+    AuthorizationTolerance,
 }
 impl InputPort {
     /// Registered reasons an unresolvable value of this input may carry.
@@ -58,9 +63,20 @@ impl InputPort {
             Self::PinComposition => &[Reason::CatalogPinCompositionUnavailable],
             Self::OverlapKey => &[Reason::OverlapKeyUnavailable],
             Self::Occupancy => &[Reason::OverlapPresenceUnevaluable],
-            Self::Evaluation => &[Reason::EvaluationUnavailable],
+            // The port's own reason first; then the prerequisite outages an unasked evaluation
+            // retains (D-240 item 9: the orchestrator skips Rating when the payer profile, the
+            // revision, the catalog or the pin inputs did not answer).
+            Self::Evaluation => &[
+                Reason::EvaluationUnavailable,
+                Reason::IdentityPartyUnavailable,
+                Reason::PricingRevisionUnavailable,
+                Reason::CatalogPredicatesUnavailable,
+                Reason::CatalogPinCompositionUnavailable,
+            ],
             Self::ContractResolution => &[Reason::ContractResolutionUnavailable],
-            Self::AcceptanceRequirement => &[Reason::AcceptanceRequirementUnevaluable],
+            Self::AcceptanceRequirement | Self::AuthorizationTolerance => {
+                &[Reason::AcceptanceRequirementUnevaluable]
+            }
         }
     }
 }
@@ -160,12 +176,21 @@ pub const GUARDS: &[GuardDecl] = &[
         reasons: &["tenant-axis-immutable"],
         inputs: &[],
     },
+    // Line membership, then at least one proposed line, after the request-shape guards and
+    // before the shared structural guards (D-253). Row 4's `gate.has-lines` keeps its place.
     GuardDecl {
-        name: "versioning.payer-within-seller",
+        name: "versioning.amendment-line-membership",
         owner: "S4-01",
         rows: AMEND,
-        reasons: &["payer-rebinding-requires-seller"],
-        inputs: &[P::Identity],
+        reasons: &["line-not-found"],
+        inputs: &[],
+    },
+    GuardDecl {
+        name: "versioning.amendment-has-lines",
+        owner: "S4-01",
+        rows: AMEND,
+        reasons: &["no-lines"],
+        inputs: &[],
     },
     // Shared structural guards, registered once and reused (Foundation step 19).
     GuardDecl {
@@ -314,7 +339,7 @@ pub const GUARDS: &[GuardDecl] = &[
         owner: "S4-10",
         rows: &[11],
         reasons: &["authorization-pending", "authorization-failed"],
-        inputs: &[],
+        inputs: &[P::AuthorizationTolerance],
     },
     GuardDecl {
         name: "gate.binding-deadline",
@@ -675,7 +700,7 @@ impl GuardRegistry {
 }
 
 /// Every input port.
-pub const ALL_PORTS: [InputPort; 9] = [
+pub const ALL_PORTS: [InputPort; 10] = [
     InputPort::Identity,
     InputPort::PricingRevision,
     InputPort::CatalogPredicates,
@@ -685,6 +710,7 @@ pub const ALL_PORTS: [InputPort; 9] = [
     InputPort::Evaluation,
     InputPort::ContractResolution,
     InputPort::AcceptanceRequirement,
+    InputPort::AuthorizationTolerance,
 ];
 
 fn reason_index(reason: Reason) -> usize {

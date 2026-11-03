@@ -71,11 +71,41 @@ use crate::infra::storage::scoped::{self, AuthorizedLock, AuthorizedRead, Privat
 
 pub mod documents;
 pub mod errors;
+/// The engine's decision signals (S4-12, D-258).
+pub mod signals;
+use signals::{Decision as Decided, TransitionObservation, TransitionSignals};
+#[cfg(test)]
+#[path = "signals_tests.rs"]
+mod signals_tests;
 
 pub use documents::{
     ChildDocuments, DiagnosticsContribution, DiagnosticsSettled, DocumentWriter, EventSpec,
 };
 pub use errors::{Abort, EngineError, FaultPoint};
+
+/// The decision an attempt's result reports (D-258 item 1), or `None` when it is not one.
+fn decided(result: &Result<EngineOutcome, EngineError>) -> Option<Decided> {
+    match result {
+        Ok(EngineOutcome {
+            kind: OutcomeKind::Committed { .. },
+            ..
+        }) => Some(Decided::Committed),
+        Ok(EngineOutcome {
+            kind: OutcomeKind::Refused { reason, .. },
+            ..
+        })
+        | Err(EngineError::Refused(reason)) => (!matches!(
+            reason,
+            Reason::IdempotencyMismatch | Reason::StillProcessing
+        ))
+        .then_some(Decided::Refused(*reason)),
+        Ok(EngineOutcome {
+            kind: OutcomeKind::Replayed { .. },
+            ..
+        })
+        | Err(_) => None,
+    }
+}
 
 /// Transaction attempts for transient contention (deadlock/serialization) before giving up.
 const TX_ATTEMPTS: u32 = 3;
@@ -102,6 +132,14 @@ pub struct Prepared {
     pub event: Option<Arc<dyn EventSpec>>,
     /// Administrative changes (row 3 only), audited one entry per changed field (D-117).
     pub admin_changes: Vec<AdminChange>,
+    /// Row 3 line edits only: the target line. The engine reads the order's lines under the
+    /// aggregate lock for the membership guard (04 §3.6), never from the preparation view.
+    pub admin_line: Option<Uuid>,
+    /// `context.data` the slice supplies for a refusing guard, by reason (04 §3.1 step 3:
+    /// `administrative-field-in-amendment` names the field). A guard verdict carries only a
+    /// reason, so detail only the request knows travels here; detail the locked order knows
+    /// (the amendment cap's count) the engine adds itself.
+    pub refusal_detail: Vec<(Reason, Value)>,
     /// The reached gate assessment snapshot stored with the response (S3 owns its contents).
     pub assessment: Option<Value>,
     /// The gate's diagnostic run, written by the engine on a composite-gate refusal, an
@@ -112,6 +150,21 @@ pub struct Prepared {
     pub line_id: Option<Uuid>,
     /// Frozen commercial assessment identity returned on successful submit.
     pub assessment_id: Option<Uuid>,
+    /// Begin-fulfillment only: the authorization outcome Workflow presented, reported with the
+    /// decision whatever it is (S4-12, D-258). Observability only; the engine decides nothing
+    /// from it.
+    pub authorization: Option<bss_orders_sdk::fulfillment::Authorization>,
+    /// The consent the child documents record when the transition commits (submit's
+    /// self-service consent, D-252; record-acceptance, D-256), reported on commit (D-258).
+    /// Observability only; the documents write the row.
+    pub consent: Option<signals::ConsentObservation>,
+    /// The preparation read nothing because its snapshot could not be admitted (a state outside
+    /// the row, another current version): the engine is expected to refuse by precedence. Should
+    /// the locked decision get past precedence (the order became admissible between the snapshot
+    /// and the lock), the attempt aborts unsettled and writes nothing ([`Abort::Raced`]); the
+    /// caller, holding the [`Reached`] witness of its passing guards, runs once more from a
+    /// fresh snapshot (D-254 item 10, D-256 item 9, D-257 item 9).
+    pub unread: bool,
 }
 impl Prepared {
     /// A contribution with no inputs, guards, documents or event.
@@ -125,11 +178,51 @@ impl Prepared {
             documents: None,
             event: None,
             admin_changes: Vec::new(),
+            admin_line: None,
+            refusal_detail: Vec::new(),
             assessment: None,
             diagnostics: None,
             line_id: None,
             assessment_id: None,
+            authorization: None,
+            consent: None,
+            unread: false,
         }
+    }
+}
+
+/// The witness of a read-to-lock race (D-254 item 10, D-256 item 9, D-257 item 9). A
+/// preparation whose snapshot cannot be admitted reads nothing, sets [`Prepared::unread`] and
+/// binds its guards through [`Self::passing`]. The engine evaluates guards only when the locked
+/// order is admissible, so a reached witness with an error proves the race: the attempt aborted
+/// unsettled ([`Abort::Raced`]), wrote nothing, and the caller runs once more from a fresh
+/// snapshot, once. A race on that second pass answers what the engine answered (`unavailable`).
+#[derive(Debug, Clone, Default)]
+pub struct Reached(Arc<AtomicBool>);
+impl Reached {
+    /// A witness nothing has reached yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// The guards `names` bound passing, each recording that the engine evaluated it. They
+    /// never admit: the engine aborts an unread preparation that gets past precedence.
+    #[must_use]
+    pub fn passing(&self, names: impl IntoIterator<Item = &'static str>) -> GuardBindings {
+        names
+            .into_iter()
+            .fold(GuardBindings::new(), |bindings, name| {
+                let reached = Arc::clone(&self.0);
+                bindings.bind(name, move |_: &transition::GuardSubject<'_>| {
+                    reached.store(true, Ordering::SeqCst);
+                    transition::GuardVerdict::Pass
+                })
+            })
+    }
+    /// Whether the engine evaluated a guard of the unread preparation.
+    #[must_use]
+    pub fn reached(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -144,6 +237,26 @@ pub struct PreparationView {
     pub draft_lines: Vec<draft_content::Model>,
     /// A recovered D-188/D-198 execution's frozen inputs, loaded before any fresh assessment.
     pub frozen: Option<Frozen>,
+    /// The attempt's trusted actor, as the audit, version and consent rows record it.
+    pub actor: AuditActor,
+    /// Record-acceptance only (row 25, D-256): the stored facts the recording-party bar reads.
+    pub recording: Option<RecordingFacts>,
+}
+
+/// The stored facts of the recording-party bar (05 §3.2 step 1, D-256), read in the engine's
+/// authorized snapshot under the authorized scope: the immutable sales path and every committed
+/// version row (each names its appending actor and reason). Committed version rows are never
+/// changed, and the engine checks under the lock that the expected version is still current
+/// before any guard, so a bar decided from them equals one decided under the lock (D-253 item 3).
+#[derive(Debug, Clone)]
+pub struct RecordingFacts {
+    /// `orders_order.sales_path`, fixed at create (D-106, D-140).
+    pub sales_path: SalesPath,
+    /// Every committed version row, ascending by version.
+    pub versions: Vec<order_version::Model>,
+    /// The current version's earliest line acceptance due date, reported with a recorded
+    /// consent (D-258; observability only, never a guard input).
+    pub acceptance_due: Option<time::Date>,
 }
 
 /// Slice input resolution failure that is not an unresolvable guard input.
@@ -267,6 +380,8 @@ pub struct EngineParts {
     pub admin_key: Arc<AdminTextKey>,
     /// The idempotency execution lease.
     pub lease: LeaseDuration,
+    /// Where decided attempts are reported (S4-12, D-258).
+    pub signals: Arc<dyn TransitionSignals>,
 }
 
 /// The compiled declarations the engine runs (startup-validated, Foundation §3.4 step 1).
@@ -306,6 +421,10 @@ impl Registries {
 #[async_trait]
 pub trait FaultHook: Send + Sync {
     async fn at(&self, point: FaultPoint, tx: &DbTx<'_>) -> Result<(), Abort>;
+    /// Runs after a caller transition's preparation and before its transaction takes the
+    /// aggregate lock: a concurrent writer between the snapshot and the lock (the read-to-lock
+    /// race, D-254 item 10, D-256, D-257).
+    async fn prepared(&self) {}
 }
 
 struct Inner {
@@ -315,6 +434,7 @@ struct Inner {
     identities: ActorIdentities,
     admin_key: Arc<AdminTextKey>,
     lease: LeaseDuration,
+    signals: Arc<dyn TransitionSignals>,
     registries: Registries,
     #[cfg(test)]
     fault: Option<Arc<dyn FaultHook>>,
@@ -371,6 +491,43 @@ struct Attempt {
     correlation_id: Option<Uuid>,
     prepared: Prepared,
     completed: AtomicBool,
+    /// Set by the admitting body, read only for a committed outcome (D-258).
+    committed: parking_lot::Mutex<Option<CommitNote>>,
+}
+
+/// What an admitted body knew that the decision signal reports (D-258).
+#[derive(Debug, Clone, Copy)]
+struct CommitNote {
+    /// The order's amendment count after the transition.
+    amendment_count: i32,
+    /// Administrative audit entries appended (one per changed field).
+    admin_audits: usize,
+    /// The transition time.
+    at: OffsetDateTime,
+}
+
+/// What [`Engine::transition`] learnt about its attempt for the decision signal (D-258).
+#[derive(Default)]
+struct Observed {
+    authorization: Option<bss_orders_sdk::fulfillment::Authorization>,
+    consent: Option<signals::ConsentObservation>,
+    tolerated: bool,
+    note: Option<CommitNote>,
+}
+
+impl Observed {
+    /// The preparation's facts and, once the body ran, its commit note.
+    fn of(attempt: &Attempt) -> Self {
+        Self {
+            authorization: attempt.prepared.authorization,
+            consent: attempt.prepared.consent,
+            tolerated: matches!(
+                attempt.prepared.aggregate,
+                AggregateContribution::BeginFulfillment { tolerated: true }
+            ),
+            note: *attempt.committed.lock(),
+        }
+    }
 }
 
 /// What a committed transaction produced.
@@ -395,6 +552,7 @@ impl Engine {
                 identities: parts.identities,
                 admin_key: parts.admin_key,
                 lease: parts.lease,
+                signals: parts.signals,
                 registries,
                 #[cfg(test)]
                 fault: None,
@@ -414,6 +572,7 @@ impl Engine {
                 identities: inner.identities.clone(),
                 admin_key: Arc::clone(&inner.admin_key),
                 lease: inner.lease,
+                signals: Arc::clone(&inner.signals),
                 registries: inner.registries.clone(),
                 fault: Some(hook),
             }),
@@ -486,6 +645,8 @@ impl Engine {
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
             frozen: None,
+            actor,
+            recording: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
         let create = Arc::new(CreateAttempt {
@@ -543,6 +704,56 @@ impl Engine {
         caller: &Caller,
         request: TransitionRequest,
         preparation: &dyn Preparation,
+    ) -> Result<EngineOutcome, EngineError> {
+        let trigger = request.trigger;
+        let observed = parking_lot::Mutex::new(Observed::default());
+        let result = self
+            .decide_transition(caller, request, preparation, &observed)
+            .await;
+        self.observe(trigger, &result, &observed.into_inner());
+        result
+    }
+
+    /// Report a decided attempt (S4-12, D-258): a commit or a business refusal, settled or not.
+    /// A replay, an outage, an integration failure and an idempotency answer (mismatch or still
+    /// processing) are not decisions and report nothing.
+    fn observe(
+        &self,
+        trigger: Trigger,
+        result: &Result<EngineOutcome, EngineError>,
+        observed: &Observed,
+    ) {
+        let Some(decision) = decided(result) else {
+            return;
+        };
+        let mut observation = TransitionObservation::new(trigger, decision);
+        observation.authorization = observed.authorization;
+        if decision == Decided::Committed {
+            if let Some(note) = observed.note {
+                observation.amendment_count =
+                    (trigger == Trigger::Amendment).then_some(note.amendment_count);
+                observation.admin_audits = note.admin_audits;
+            }
+            observation.tolerated = observed.tolerated;
+            observation.consent = observed.consent;
+            observation.consent_margin_days = observed
+                .consent
+                .and_then(|c| c.due)
+                .zip(observed.note)
+                .map(|(due, note)| {
+                    (due - note.at.to_offset(time::UtcOffset::UTC).date()).whole_days()
+                });
+        }
+        self.inner.signals.settled(&observation);
+    }
+
+    /// [`Self::transition`]'s body; `observed` collects the decision signal's facts.
+    async fn decide_transition(
+        &self,
+        caller: &Caller,
+        request: TransitionRequest,
+        preparation: &dyn Preparation,
+        observed: &parking_lot::Mutex<Observed>,
     ) -> Result<EngineOutcome, EngineError> {
         let inner = &self.inner;
         // D-105: create runs its dedicated branch and never this existing-order algorithm.
@@ -636,7 +847,7 @@ impl Engine {
         };
         let disclosure = self.disclosure(caller, request.trigger).await?;
         let view = match self
-            .snapshot(&target, AbortContext::of(&request), frozen)
+            .snapshot(&target, AbortContext::of(&request), frozen, actor)
             .await?
         {
             Ok(view) => view,
@@ -647,6 +858,10 @@ impl Engine {
             }
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
+        #[cfg(test)]
+        if let Some(hook) = &inner.fault {
+            hook.prepared().await;
+        }
         let attempt = Arc::new(Attempt {
             caller: caller.clone(),
             actor,
@@ -666,6 +881,7 @@ impl Engine {
             correlation_id: request.correlation_id,
             prepared,
             completed: AtomicBool::new(false),
+            committed: parking_lot::Mutex::new(None),
         });
         let result = self.run(&attempt).await;
         let target = ReplayTarget::Order {
@@ -673,8 +889,11 @@ impl Engine {
             prefetch: &prefetch,
         };
         let context = AbortContext::of(&*attempt);
-        self.finish(caller, target, result, &attempt.completed, context)
-            .await
+        let finished = self
+            .finish(caller, target, result, &attempt.completed, context)
+            .await;
+        *observed.lock() = Observed::of(&attempt);
+        finished
     }
 
     /// Internal worker entry (Foundation *Internal worker entry*; 08 §3.5): only the allowlisted
@@ -757,6 +976,8 @@ impl Engine {
             prepared_draft_revision: None,
             draft_lines: Vec::new(),
             frozen: None,
+            actor,
+            recording: None,
         };
         let prepared = preparation.prepare(&view).await.map_err(prepare_error)?;
         let attempt = Arc::new(Attempt {
@@ -778,6 +999,7 @@ impl Engine {
             correlation_id: request.correlation_id,
             prepared,
             completed: AtomicBool::new(false),
+            committed: parking_lot::Mutex::new(None),
         });
         let result = self.run(&attempt).await;
         match result {
@@ -908,11 +1130,12 @@ impl Engine {
     /// that transaction, and only for a new execution. Its failure aborts the transaction, so no
     /// candidate, attempt or marker link survives it.
     ///
-    /// A new submit execution first rechecks, under the same aggregate lock, that the submit is
-    /// admissible from the locked state and that the locked draft revision is both the caller's
-    /// `expected_draft_revision` and the attempt's `prepared_draft_revision` (E1): a draft edit
-    /// that landed after the slice's read answers the same unsettled refusal the ordinary path
-    /// decides (`version-conflict`, `precondition-failed` or `not-admissible`) and the whole
+    /// A new execution first rechecks, under the same aggregate lock, that the trigger is
+    /// admissible from the locked state and that the locked version is the caller's expected one;
+    /// a submit also that the locked draft revision is both the caller's `expected_draft_revision`
+    /// and the attempt's `prepared_draft_revision` (E1). A draft edit, an amendment or a state
+    /// change that landed after the slice's read answers the same unsettled refusal the ordinary
+    /// path decides (`version-conflict`, `precondition-failed` or `not-admissible`) and the whole
     /// transaction rolls back, so no candidate is allocated and no attempt or claim survives.
     ///
     /// # Errors
@@ -1140,23 +1363,30 @@ impl Engine {
                         // E2: a recovery never starts an execution; the fresh claim rolls back.
                         DurableStart::Recover => return Err(Abort::NothingToResume),
                         DurableStart::Commercial(inputs, lines) => {
-                            // E1: the draft revision and admissibility under this lock.
-                            if trigger == Trigger::Submit {
-                                let revisions = DraftRevisions::Draft {
+                            // E1: admissibility from the locked state and the expected
+                            // version under this lock, and for submit the draft revision too.
+                            let revisions = match trigger {
+                                Trigger::Submit => DraftRevisions::Draft {
                                     client: client_revision,
                                     prepared: inputs.prepared_draft_revision.ok_or(
                                         Abort::Integration("submit without a draft revision"),
                                     )?,
-                                };
-                                if let Err(refusal) = transition::admit(
-                                    &engine.registries.table,
-                                    trigger,
-                                    &aggregate_facts(locked.row())?,
-                                    expected_version,
-                                    revisions,
-                                )? {
-                                    return Err(Abort::UnreservedRefusal(refusal.reason()));
+                                },
+                                Trigger::Amendment => DraftRevisions::NotApplicable,
+                                _ => {
+                                    return Err(Abort::Integration(
+                                        "a commercial attempt for another trigger",
+                                    ));
                                 }
+                            };
+                            if let Err(refusal) = transition::admit(
+                                &engine.registries.table,
+                                trigger,
+                                &aggregate_facts(locked.row())?,
+                                expected_version,
+                                revisions,
+                            )? {
+                                return Err(Abort::UnreservedRefusal(refusal.reason()));
                             }
                             // A failed snapshot aborts before the attempt insert; the
                             // rollback releases the candidate and the fresh claim.
@@ -1341,6 +1571,7 @@ impl Engine {
         target: &TargetAuthorization,
         context: AbortContext,
         frozen: Option<Frozen>,
+        actor: AuditActor,
     ) -> Result<Result<PreparationView, Reason>, EngineError> {
         let trigger = context.trigger;
         let target = target.clone();
@@ -1381,11 +1612,30 @@ impl Engine {
                     } else {
                         Vec::new()
                     };
+                    let recording = if trigger == Trigger::RecordAcceptance {
+                        Some(RecordingFacts {
+                            sales_path: SalesPath::from_token(&row.sales_path)
+                                .ok_or(Abort::Integration("stored sales path"))?,
+                            versions: children::versions(tx, target.access_scope(), row.order_id)
+                                .await?,
+                            acceptance_due: children::earliest_acceptance_due(
+                                tx,
+                                target.access_scope(),
+                                row.order_id,
+                                row.current_version,
+                            )
+                            .await?,
+                        })
+                    } else {
+                        None
+                    };
                     Ok::<_, Abort>(Ok(PreparationView {
                         facts: aggregate_facts(&row)?,
                         prepared_draft_revision: draft.then_some(row.draft_revision),
                         draft_lines,
                         frozen,
+                        actor,
+                        recording,
                     }))
                 })
             })
@@ -1768,6 +2018,17 @@ impl AbortContext {
 /// the `error` field and a fixed message.
 fn log_abort(abort: &Abort, body_completed: bool, context: AbortContext) -> EngineError {
     let error = errors::terminate(abort, body_completed);
+    if matches!(abort, Abort::Raced) {
+        tracing::debug!(
+            target: "orders.engine",
+            trigger = context.trigger.token(),
+            order_id = context.order_id.map(tracing::field::display),
+            correlation_id = context.correlation_id.map(tracing::field::display),
+            "bss-orders: the order became admissible between the snapshot and the lock; \
+             nothing written"
+        );
+        return error;
+    }
     if let EngineError::NotDelivered(capability) = error {
         errors::log_not_delivered(capability);
         return error;
@@ -2347,6 +2608,8 @@ fn created_view(row: &order::Model) -> Result<OrderView, Abort> {
             created_at: row.created_at,
         },
         lines: Vec::new(),
+        // No administrative row exists at create (D-263).
+        admin: None,
         draft_revision: Some(
             DraftRevision::try_from(row.draft_revision)
                 .map_err(|_| Abort::Integration("draft revision"))?,
@@ -2454,6 +2717,25 @@ async fn existing_body<'a>(
     } else {
         Vec::new()
     };
+    // Row 3 line edits: membership is the line set at this locked read (04 §3.6), so a
+    // concurrent removal or addition after preparation cannot be decided on a stale snapshot.
+    let admin_lines = match (a.trigger, a.prepared.admin_line) {
+        (Trigger::AdministrativeEdit, Some(_)) => locked_line_ids(&locked, &facts).await?,
+        // As administrative changes (`check_documents`): a line edit belongs to row 3 only.
+        (_, Some(_)) => {
+            return Err(Abort::Integration(
+                "an administrative line belongs to row 3",
+            ));
+        }
+        (_, None) => Vec::new(),
+    };
+    // Rows 25 and 11: whether the locked current version already has a consent, read under
+    // this lock. Row 25 (D-256): of two independent recordings of one version only the first is
+    // admitted and the second is refused `acceptance-already-recorded`, never a key violation.
+    // Row 11 (D-257): begin-fulfillment decides consent on the version it admits, so a consent
+    // recorded on a superseded version never satisfies it.
+    let acceptance_recorded = transition::reads_locked_acceptance(a.trigger)
+        && locked_acceptance_recorded(&locked, &facts).await?;
     let registries = &inner.registries;
     let decision = transition::decide_with(
         &registries.table,
@@ -2466,7 +2748,14 @@ async fn existing_body<'a>(
         &a.prepared.inputs,
         t,
         &administrative,
+        &admin_lines,
+        acceptance_recorded,
     )?;
+    // A preparation that read nothing never settles past precedence: the order became
+    // admissible between its snapshot and this lock (D-254 item 10). Abort unsettled.
+    if a.prepared.unread && !precedence(&decision) {
+        return Err(Abort::Raced);
+    }
     let execution_id = owned.record().execution_id;
     let settle = Settle {
         owned,
@@ -2512,10 +2801,23 @@ async fn existing_body<'a>(
         } => {
             // D-233: a composite-gate refusal (the only guard whose `assessment` is set) carries
             // the authorized gate report in `context.data`; every other guard carries none.
+            let data = match reason {
+                // 04 §4.1: the refusal names the cap and the count, the locked one.
+                Reason::AmendmentCapExhausted => json!({
+                    "cap": crate::domain::versioning::AMENDMENT_CAP,
+                    "amendment_count": facts.amendment_count,
+                }),
+                _ => a
+                    .prepared
+                    .refusal_detail
+                    .iter()
+                    .find(|(r, _)| *r == reason)
+                    .map_or_else(|| json!({}), |(_, data)| data.clone()),
+            };
             let refusal = Refusal {
                 overlap_conflict: None,
                 reason,
-                data: json!({}),
+                data,
                 reach: if assessment {
                     GateReach::Assessed
                 } else {
@@ -2537,6 +2839,15 @@ async fn existing_body<'a>(
         &administrative,
     ))
     .await
+}
+
+/// Whether `decision` is the state table's precedence refusal, decided before any guard.
+fn precedence(decision: &Decision<'_>) -> bool {
+    matches!(
+        decision,
+        Decision::Engine(refusal)
+            if !matches!(refusal, transition::EngineRefusal::ResumeTargetMissing)
+    )
 }
 
 /// Registry ownership and, for D-188/D-198, the recovered durable execution.
@@ -2764,6 +3075,11 @@ async fn admit<'a>(
     fault(inner, FaultPoint::Audit, tx).await?;
     step_event(a, locked, row, &after, t, events).await?;
     fault(inner, FaultPoint::Enqueue, tx).await?;
+    *a.committed.lock() = Some(CommitNote {
+        amendment_count: after.amendment_count,
+        admin_audits: administrative.len(),
+        at: t,
+    });
     let response = success_response(
         row.trigger,
         &after,
@@ -3126,6 +3442,41 @@ pub(super) async fn locked_line_admin<'a>(
         id,
     )
     .await
+}
+
+/// The order's line identities at this locked read (row 3 line membership, 04 §3.6): the working
+/// lines in `draft`, otherwise the lines committed at the locked current version.
+async fn locked_line_ids<'a>(
+    locked: &LockedOrder<'a, DbTx<'a>>,
+    facts: &AggregateFacts,
+) -> Result<Vec<Uuid>, ScopeError> {
+    let id = locked.row().order_id;
+    let scope = toolkit_security::AccessScope::for_resources(vec![id]);
+    if facts.state == OrderState::Draft {
+        Ok(
+            children::draft_content_for_order(locked.transaction(), &scope, id)
+                .await?
+                .into_iter()
+                .map(|row| row.line_id)
+                .collect(),
+        )
+    } else {
+        children::committed_line_ids(locked.transaction(), &scope, id, facts.current_version).await
+    }
+}
+
+/// Whether the locked current version has a consent row (rows 25 and 11, D-256, D-257).
+async fn locked_acceptance_recorded<'a>(
+    locked: &LockedOrder<'a, DbTx<'a>>,
+    facts: &AggregateFacts,
+) -> Result<bool, ScopeError> {
+    let id = locked.row().order_id;
+    let scope = toolkit_security::AccessScope::for_resources(vec![id]);
+    Ok(
+        children::acceptance(locked.transaction(), &scope, id, facts.current_version)
+            .await?
+            .is_some(),
+    )
 }
 
 /// Row 3's named changes reconciled with the administrative values stored at this locked read.

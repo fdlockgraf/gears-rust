@@ -11,6 +11,6 @@ pub mod orchestrate;
 mod preview;
 mod pricing_read;
 mod readiness;
-mod signals;
+pub mod signals;
 mod stubs;
 mod writer;

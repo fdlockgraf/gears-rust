@@ -147,6 +147,20 @@ pub struct RefusalDiagnostics {
     /// populates it today) and `overlap-collision`: the blocked overlap tuples (D-179).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Vec<BlockedOverlap>>,
+    /// `amendment-cap-exhausted`: the finite amendment cap (04 §3.1 step 2, §4.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<i32>,
+    /// `amendment-cap-exhausted`: the order's locked amendment count when the cap refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_count: Option<i32>,
+    /// `administrative-field-in-amendment`: the first administrative field the delta names (04
+    /// §3.1 step 3, §4.1), in delta order (header fields, then lines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<Box<str>>,
+    /// `administrative-field-in-amendment`: where the caller edits it instead
+    /// (`PATCH /bss-orders/v1/orders/{orderId}`). Serialized as `use`.
+    #[serde(default, rename = "use", skip_serializing_if = "Option::is_none")]
+    pub use_instead: Option<AdministrativeRoute>,
     /// Every composite-gate refusal of a submit or amendment (the gate's catalog, axis, contract,
     /// overlap, date and pin reasons) and the step-17.5 `order-in-flight-for-key` claim refusal:
     /// the complete authorized gate report, whose primary blocking result is this refusal itself
@@ -155,6 +169,22 @@ pub struct RefusalDiagnostics {
     /// Boxed so the report does not grow every [`OrdersError`] (clippy `result_large_err`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assessment: Option<Box<GateReport>>,
+}
+
+/// Where an administrative field is edited instead of amended (04 §3.1 step 3, §4.1). One
+/// route today; an enum rather than a string so the diagnostics stay small
+/// (`OrdersError` is returned by value everywhere). Decoding is tolerant, as for the other
+/// stored-response enums (`PinOutcomeView`, `DiscountView`): a route a newer Orders names reads
+/// as [`AdministrativeRoute::Unknown`], so a stored refusal still decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum AdministrativeRoute {
+    /// The administrative edit of the order.
+    #[serde(rename = "PATCH /bss-orders/v1/orders/{orderId}")]
+    PatchOrder,
+    /// A route this SDK version does not know (decode only; this Orders never produces it).
+    #[serde(other)]
+    Unknown,
 }
 
 /// One blocked overlap tuple of an `overlap-collision` refusal.

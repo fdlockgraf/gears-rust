@@ -99,6 +99,12 @@ pub struct BssOrdersGear {
     /// The submit service (S3-12), under the same development-delivery condition as `preview`;
     /// the REST route (M3b, D-238) and the local SDK delegate to it, `None` in every other build.
     submit: ArcSwapOption<crate::infra::gate::submit::SubmitService>,
+    /// The amendment service (S4-03/S4-04), under the same development-delivery condition; the
+    /// REST route and the local SDK delegate to it, `None` in every other build.
+    amend: ArcSwapOption<crate::infra::amend::AmendService>,
+    /// The record-acceptance service (S4-08b, D-256), under the same development-delivery
+    /// condition; the REST route and the local SDK delegate to it, `None` in every other build.
+    acceptance: ArcSwapOption<crate::infra::acceptance::AcceptanceService>,
 }
 
 /// Submit's development acceptance double (M2-6): with the `gate-dev-stubs` feature and the stubs
@@ -129,6 +135,33 @@ fn dev_acceptance(
     _hub: Arc<toolkit::ClientHub>,
 ) -> Option<Arc<dyn bss_pricing_sdk::acceptance::SellabilityV1>> {
     None
+}
+
+/// The services that ride the submit service's development delivery (D-235): the amendment
+/// service runs the submit pipeline (S4-03/S4-04), and recording consent after submit (S4-08b,
+/// D-256) reads its requirement through the gate's contract port (the development stub here,
+/// fail-closed otherwise) and the policy elections. Both `None` without the submit service.
+fn dev_writes(
+    submit: Option<&Arc<crate::infra::gate::submit::SubmitService>>,
+    engine: &Arc<ArcSwapOption<crate::infra::engine::Engine>>,
+    gate: &crate::infra::gate::GatePorts,
+    db: &toolkit_db::Db,
+) -> (
+    Option<Arc<crate::infra::amend::AmendService>>,
+    Option<Arc<crate::infra::acceptance::AcceptanceService>>,
+) {
+    let Some(submit) = submit else {
+        return (None, None);
+    };
+    let amend = Arc::new(crate::infra::amend::AmendService::new(Arc::clone(submit)));
+    let acceptance = Arc::new(crate::infra::acceptance::AcceptanceService::new(
+        Arc::clone(engine),
+        crate::infra::acceptance::RequirementResolver::new(
+            Arc::clone(&gate.contracts),
+            Some(db.clone()),
+        ),
+    ));
+    (Some(amend), Some(acceptance))
 }
 
 /// M2-1: the gate's development delivery switch. Both the `gate-dev-stubs` feature and
@@ -164,6 +197,8 @@ impl Default for BssOrdersGear {
             gate: Arc::new(ArcSwapOption::from(None)),
             preview: ArcSwapOption::from(None),
             submit: ArcSwapOption::from(None),
+            amend: ArcSwapOption::from(None),
+            acceptance: ArcSwapOption::from(None),
         }
     }
 }
@@ -195,6 +230,9 @@ impl BssOrdersGear {
                         identities: runtime.identities.clone(),
                         admin_key: Arc::clone(&runtime.admin_text_key),
                         lease: runtime.lease,
+                        signals: Arc::new(
+                            crate::infra::engine::signals::OtelTransitionSignals::new(),
+                        ),
                     },
                     runtime.registries.clone(),
                 ))));
@@ -469,6 +507,7 @@ impl Gear for BssOrdersGear {
             "bss-orders: PostgreSQL is required; other backends are unproven"
         );
         let date_policy = config.date_policy_plan()?;
+        let policy_elections = config.policy_elections_plan()?;
         crate::gts::validate_catalog()?;
         crate::authz::validate_census()?;
         // S2-12: only delivered, caller-facing operations are mounted; a delivered route bound to
@@ -609,25 +648,36 @@ impl Gear for BssOrdersGear {
                         ),
                     )
                     .with_acceptance_hub(ctx.client_hub())
-                    .with_acceptance(dev_acceptance(&gate, ctx.client_hub())),
+                    .with_acceptance(dev_acceptance(&gate, ctx.client_hub()))
+                    // S4-08a (D-252): the consent requirement's elections.
+                    .with_policy_store(runtime.db.clone()),
                 ))
             })
             .transpose()?;
+        let (amend, acceptance) = dev_writes(submit.as_ref(), &self.engine, &gate, &runtime.db);
         let throttle = runtime._config.throttle_settings()?;
-        // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows with
-        // the deployment, and startup refuses a missing or invalid platform default. It is the
-        // only init step with a persistent effect, so it runs after every fallible step (the
-        // registry registration, the worker connection attestation, the settings): a start that
-        // fails earlier writes nothing (review finding 186). It is bounded like the registry
-        // step (finding 45). The promotion is one transaction under the namespace lock: an
-        // elapse before its commit rolls it back; one during the commit leaves it either applied
-        // or not, and the next start's compare-and-apply converges on the same plan.
+        // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows and
+        // policy elections (S4-07, D-251) with the deployment, and startup refuses a missing or
+        // invalid date-policy platform default. The two policy promotions are the only init steps
+        // with a persistent effect, so they run after every fallible step (the registry
+        // registration, the worker connection attestation, the settings): a start that fails
+        // earlier writes nothing (review finding 186). Each is bounded like the registry step
+        // (finding 45) and is one transaction: an elapse before its commit rolls it back; one
+        // during the commit leaves it either applied or not, and the next start's
+        // compare-and-apply converges on the same plan. A date policy promoted before a failed
+        // election promotion stays, and converges the same way.
         tokio::time::timeout(
             dependency_timeout,
             crate::infra::dates::install(&runtime.db, date_policy.as_ref()),
         )
         .await
         .context("bss-orders: date policy installation timed out")??;
+        tokio::time::timeout(
+            dependency_timeout,
+            crate::infra::policy::install(&runtime.db, policy_elections.as_ref()),
+        )
+        .await
+        .context("bss-orders: policy election installation timed out")??;
         // Registration is last: failed prerequisites cannot leave a discoverable local client.
         ctx.client_hub()
             .register::<dyn bss_orders_sdk::OrdersV1>(Arc::new(
@@ -636,7 +686,9 @@ impl Gear for BssOrdersGear {
                     Arc::clone(&reads),
                 )
                 .with_preview(preview.clone())
-                .with_submit(submit.clone()),
+                .with_submit(submit.clone())
+                .with_amend(amend.clone())
+                .with_acceptance(acceptance.clone()),
             ));
         self.limiter
             .store(Some(crate::infra::throttle::PerOrderLimiter::new(throttle)));
@@ -644,6 +696,8 @@ impl Gear for BssOrdersGear {
         self.gate.store(Some(gate));
         self.preview.store(preview);
         self.submit.store(submit);
+        self.amend.store(amend);
+        self.acceptance.store(acceptance);
         self.capture.store(Some(capture));
         self.reads.store(Some(reads));
         self.runtime.store(Some(runtime));
@@ -664,9 +718,9 @@ impl RestApiCapability for BssOrdersGear {
     ) -> anyhow::Result<axum::Router> {
         // Only delivered, authorized handlers are mounted (the S2-12 census,
         // `crate::api::rest::DELIVERED_OPERATIONS`): the S2-09 draft authoring routes, bound to
-        // the gateway caller zone and the edge limiter, and the early S6-01/S6-04 draft read
-        // routes. They answer unavailable until `serve` binds the engine and the read parts (no
-        // write or read before readiness).
+        // the gateway caller zone and the edge limiter, the early S6-01/S6-04 read routes and
+        // the S4-06 history read routes (D-255). They answer unavailable until `serve` binds the
+        // engine and the read parts (no write or read before readiness).
         // A gear whose init failed publishes no route, as it publishes no SDK client.
         let (Some(capture), Some(reads), Some(limiter)) = (
             self.capture.load_full(),
@@ -690,8 +744,23 @@ impl RestApiCapability for BssOrdersGear {
         }
         if let Some(submit) = self.submit.load_full() {
             router = router.merge(crate::api::rest::gate::submit_router(
-                submit, limiter, openapi,
+                submit,
+                Arc::clone(&limiter),
+                openapi,
             ));
+            if let Some(amend) = self.amend.load_full() {
+                router = router.merge(crate::api::rest::amend::amend_router(
+                    amend,
+                    Arc::clone(&limiter),
+                    openapi,
+                ));
+            }
+            // S4-08b (D-256): POST beside the delivered GET on the same path.
+            if let Some(acceptance) = self.acceptance.load_full() {
+                router = router.merge(crate::api::rest::acceptance::acceptance_router(
+                    acceptance, limiter, openapi,
+                ));
+            }
         }
         Ok(router)
     }

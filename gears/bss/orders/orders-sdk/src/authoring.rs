@@ -739,8 +739,9 @@ pub struct DraftLine {
 }
 
 /// The composed order view (`models.json` `OrderView`): the order at its current version and its
-/// lines. Create returns the empty draft's view; the S6-01 read package owns the remaining
-/// optional members (`resolved_total`, `acceptance`, `admin`, fulfillment, read-through terms).
+/// lines, with the current administrative projection when one is stored (`admin`, D-263). Create
+/// returns the empty draft's view; the S6-01 read package owns the remaining optional members
+/// (`acceptance`, fulfillment, read-through terms).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // Stored response: no `deny_unknown_fields`. Settled bodies are replayed from the idempotency
 // registry for its whole window, so a body written by a newer build must still decode on an older
@@ -754,4 +755,7 @@ pub struct OrderView {
     pub lines: Vec<DraftLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<DraftRevision>,
+    /// The current administrative values of the order and its composed lines (D-263).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<crate::reads::AdministrativeView>,
 }

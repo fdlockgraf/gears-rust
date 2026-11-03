@@ -270,20 +270,28 @@
         "draft_revision"
       ],
       "additional_fields": false,
-      "semantics": "Composition of catalog table schemas under consistent current-parent authority; no attempts/grants/controls, outbox, private diagnostics or historical authority bypass."
+      "semantics": "Composition of catalog table schemas under consistent current-parent authority; no attempts/grants/controls, outbox, private diagnostics or historical authority bypass. admin is the current administrative projection of the order and its composed lines, absent when no row is stored or every value is cleared (D-263)."
     },
     "OrderVersionView": {
       "required_fields": [
         "order_id",
         "version",
+        "reason",
+        "actor",
+        "actor_tenant_id",
+        "created_at",
+        "header",
+        "actors",
         "lines"
       ],
       "optional_fields": [
+        "amendment_reason",
+        "supersedes_version",
         "resolved_total",
         "admin"
       ],
       "additional_fields": false,
-      "semantics": "Exact committed version with complete schema-2 receipt/query/BillingTerms/selected bindings and exclusions. Separate mutable admin projection. Reserved candidates never readable."
+      "semantics": "Exact committed version with complete schema-2 receipt/query/BillingTerms/selected bindings and exclusions. The version row's metadata as its VersionRecord spells it and header {category, resource_tenant_id, seller_tenant_id, payer_tenant_id, contract_id?, market? {currency, region?}} at that version (D-262); role actors {creator, submitter?, amender?} of {actor, actor_tenant_id} from version 1, the submit version and the requested amendment, a missing role row is an integration failure (D-260). Separate mutable admin projection {order? {external_reference?, display_label?, internal_notes?}, lines [{line_id, ...}]}: current values, absent when no row is stored or every value is cleared (D-263). Reserved candidates never readable."
     },
     "PreviewResult": {
       "required_fields": [

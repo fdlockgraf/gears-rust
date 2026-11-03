@@ -1,10 +1,14 @@
 //! The REST boundary adapter: shared header/caller parsing and the delivered route groups.
 //! S2-09 mounts the five draft authoring routes, the early S6-01/S6-04 package the three draft
-//! read routes; S2-12 owns the pre-engine throttling ([`throttle`]) and the route census
-//! ([`DELIVERED_OPERATIONS`], [`validate_delivered`]). The REST error gear ([`error`]) and the
+//! read routes, S4-06 the three history read routes (D-255); S2-12 owns the pre-engine
+//! throttling ([`throttle`]) and the route census ([`DELIVERED_OPERATIONS`],
+//! [`validate_delivered`]). The REST error gear ([`error`]) and the
 //! generated wire bindings of the SDK catalog ([`wire`]) own every HTTP fact (D-219). The S3-11
 //! Preview route ([`gate`]) is mounted only in the development build (M2-1) and is not part of
-//! the census.
+//! the census; so are the submit, amendment ([`amend`]) and record-acceptance ([`acceptance`],
+//! D-256) routes.
+pub mod acceptance;
+pub mod amend;
 pub mod capture;
 pub mod dto;
 pub mod error;
@@ -29,7 +33,7 @@ use toolkit_security::SecurityContext;
 /// operations (`reflect_approval`, `begin_fulfillment`, `report_spawn_signal`, `acknowledge`,
 /// `workflow_cancel`) are service-only seams: they are never reachable from a human authoring
 /// path, and when S5-08 mounts them they bind their own gateway zone.
-pub const DELIVERED_OPERATIONS: [&str; 8] = [
+pub const DELIVERED_OPERATIONS: [&str; 11] = [
     "create",
     "patch_order",
     "add_line",
@@ -38,6 +42,9 @@ pub const DELIVERED_OPERATIONS: [&str; 8] = [
     "get",
     "list",
     "list_lines",
+    "list_versions",
+    "get_version",
+    "get_acceptance",
 ];
 
 /// The delivered operations that enter the engine, which the gateway caller zone bounds.

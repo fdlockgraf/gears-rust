@@ -244,7 +244,7 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
             ..
         }
     ));
-    // Nothing earlier fails: the unevaluable input is the outcome, at the payer guard.
+    // Nothing earlier fails: the unevaluable input is the outcome, at the gate composite.
     let d = decide(
         &table,
         &registry,
@@ -260,9 +260,9 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
     assert_eq!(
         d,
         Decision::Unevaluable {
-            guard: "versioning.payer-within-seller",
+            guard: "gate.sellability-composite",
             reason: Reason::IdentityPartyUnavailable,
-            assessment: false
+            assessment: true
         }
     );
     // Engine refusals outrank the unevaluable input too (early-branch precedence).
@@ -320,7 +320,7 @@ fn unresolvable_inputs_never_mask_earlier_refusals_and_precluded_is_not_unresolv
             t(),
         )
         .unwrap_err(),
-        DecisionError::PrecludedReached("versioning.payer-within-seller")
+        DecisionError::PrecludedReached("gate.sellability-composite")
     );
     // The gate composite's unevaluable input reaches the assessment.
     let pricing_down = resolved(&registry, 4).with(
@@ -552,6 +552,25 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         &resolved(&registry, 21),
         t(),
         &change,
+        &[],
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err, DecisionError::Administrative);
+    // Locked line memberships belong to row 3 exactly, too.
+    let err = decide_with(
+        &table,
+        &registry,
+        Trigger::Hold,
+        &facts,
+        facts.current_version,
+        DraftRevisions::NotApplicable,
+        &bindings(&registry, 21, &[]),
+        &resolved(&registry, 21),
+        t(),
+        &[],
+        &[uuid::Uuid::from_u128(77)],
+        false,
     )
     .unwrap_err();
     assert_eq!(err, DecisionError::Administrative);
@@ -576,6 +595,8 @@ fn administrative_changes_reach_only_the_administrative_edit_row() {
         &resolved(&registry, 3),
         t(),
         &change,
+        &[],
+        false,
     )
     .unwrap();
     assert!(matches!(d, Decision::Admitted(_)));
@@ -626,5 +647,113 @@ fn stale_authorization_refusal_follows_the_version_precedence() {
             stale_refusal(None, 2, trigger),
             Reason::AuthorizationContextChanged
         );
+    }
+}
+
+/// S4-08b (D-256): whether the locked current version already has a consent is read under the
+/// aggregate lock and reaches row 25's guards only; on any other row it is a contract violation.
+#[test]
+fn the_locked_acceptance_fact_reaches_only_the_consent_rows() {
+    let (table, registry) = env();
+    let facts = facts(S::Submitted);
+    let err = decide_with(
+        &table,
+        &registry,
+        Trigger::Hold,
+        &facts,
+        facts.current_version,
+        DraftRevisions::NotApplicable,
+        &bindings(&registry, 21, &[]),
+        &resolved(&registry, 21),
+        t(),
+        &[],
+        &[],
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(err, DecisionError::LockedAcceptance);
+    for recorded in [false, true] {
+        let b = bindings(&registry, 25, &[]).bind(
+            "preconditions.acceptance-not-recorded",
+            |s: &GuardSubject<'_>| {
+                if s.acceptance_recorded {
+                    GuardVerdict::Fail(Reason::AcceptanceAlreadyRecorded)
+                } else {
+                    GuardVerdict::Pass
+                }
+            },
+        );
+        let d = decide_with(
+            &table,
+            &registry,
+            Trigger::RecordAcceptance,
+            &facts,
+            facts.current_version,
+            DraftRevisions::NotApplicable,
+            &b,
+            &resolved(&registry, 25),
+            t(),
+            &[],
+            &[],
+            recorded,
+        )
+        .unwrap();
+        if recorded {
+            assert!(matches!(
+                d,
+                Decision::Guard {
+                    reason: Reason::AcceptanceAlreadyRecorded,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(d, Decision::Admitted(_)), "{d:?}");
+        }
+    }
+}
+
+/// S4-10 (D-257): row 11 reads the same locked fact, whether the locked current version has a
+/// consent, so the begin-fulfillment consent guard decides on it rather than a pre-lock read.
+#[test]
+fn the_locked_acceptance_fact_reaches_begin_fulfillment() {
+    let (table, registry) = env();
+    let facts = facts(S::Approved);
+    for recorded in [false, true] {
+        let b = bindings(&registry, 11, &[]).bind(
+            "preconditions.acceptance-recorded",
+            |s: &GuardSubject<'_>| {
+                if s.acceptance_recorded {
+                    GuardVerdict::Pass
+                } else {
+                    GuardVerdict::Fail(Reason::AcceptanceRequiredNotRecorded)
+                }
+            },
+        );
+        let d = decide_with(
+            &table,
+            &registry,
+            Trigger::BeginFulfillment,
+            &facts,
+            facts.current_version,
+            DraftRevisions::NotApplicable,
+            &b,
+            &resolved(&registry, 11),
+            t(),
+            &[],
+            &[],
+            recorded,
+        )
+        .unwrap();
+        if recorded {
+            assert!(matches!(d, Decision::Admitted(_)), "{d:?}");
+        } else {
+            assert!(matches!(
+                d,
+                Decision::Guard {
+                    reason: Reason::AcceptanceRequiredNotRecorded,
+                    ..
+                }
+            ));
+        }
     }
 }

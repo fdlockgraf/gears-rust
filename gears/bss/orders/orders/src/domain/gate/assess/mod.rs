@@ -31,7 +31,7 @@ use crate::domain::gate::answers::{
     AcceptancePolicy, AssessmentAnswer, ContractFacts, ContractStatus, OccupancyObservation,
     OccupancyQuery, OrderEvaluation, OverlapKey, PayerProfile, ResolvedTerms,
 };
-use crate::domain::guards::InputPort;
+use crate::domain::guards::{GATE_COMPOSITE, GUARDS, InputPort};
 use crate::domain::transition::{InputState, Inputs};
 use assessed::{assessed_results, assessed_row};
 use bss_orders_sdk::catalog::Reason;
@@ -322,14 +322,17 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
     let failures = vector.failure_list();
     let primary = vector.primary(input.operation).cloned();
     let definitive = primary.as_ref().is_some_and(definitive_local);
-    mark_unusable_answers(&vector, &mut down);
+    mark_unusable_answers(input, &vector, &mut down);
     let mut resolved_inputs = inputs(&down, withheld.is_some(), definitive);
     if !definitive
         && withheld.is_none()
         && let PortAnswer::Skipped(reason) = &input.evaluation
     {
-        resolved_inputs =
-            resolved_inputs.with(InputPort::Evaluation, InputState::Unresolvable(*reason));
+        resolved_inputs = skipped_evaluation(
+            resolved_inputs,
+            *reason,
+            primary.as_ref().and_then(|o| o.reason),
+        );
     }
     Ok(Assessment {
         vector,
@@ -338,6 +341,44 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
         pins,
         primary,
     })
+}
+
+/// The Evaluation input of an unasked evaluation (D-240 item 9, D-265). The orchestrator skips
+/// Rating when a prerequisite did not answer (the payer profile, the revision, the catalog, the
+/// pin inputs) and also when a line already failed locally (predicate 1, an unresolvable pin).
+/// - Another gate input is unresolvable (an outage) and the Evaluation input registers the
+///   skip's reason: the input carries that source reason, so the prerequisite settles its own
+///   503.
+/// - Otherwise, when the primary refusal is one the composite gate admits: `Resolved`, as the
+///   definitive override presents it, so the engine reaches the gate and its predicate settles
+///   the primary refusal, never a fictitious `evaluation-unavailable`.
+/// - Otherwise (no primary, or one the gate does not admit, which the engine would refuse as
+///   `DecisionError::GuardReason`, a 500): `Unresolvable` with the skip's reason when the input
+///   registers it, else `evaluation-unavailable`. The engine never reaches the gate with an
+///   unadmitted reason.
+fn skipped_evaluation(inputs: Inputs, reason: Reason, primary: Option<Reason>) -> Inputs {
+    let registered = InputPort::Evaluation
+        .unevaluable_reasons()
+        .contains(&reason);
+    let outage = GatePort::ALL.iter().flat_map(|port| port.feeds()).any(|p| {
+        *p != InputPort::Evaluation && matches!(inputs.get(*p), Some(InputState::Unresolvable(_)))
+    });
+    let admitted = primary.is_some_and(|primary| {
+        GUARDS
+            .iter()
+            .find(|g| g.name == GATE_COMPOSITE)
+            .is_some_and(|gate| gate.reasons.contains(&primary.token()))
+    });
+    let state = if outage && registered {
+        InputState::Unresolvable(reason)
+    } else if admitted {
+        InputState::Resolved
+    } else if registered {
+        InputState::Unresolvable(reason)
+    } else {
+        InputState::Unresolvable(Reason::EvaluationUnavailable)
+    };
+    inputs.with(InputPort::Evaluation, state)
 }
 
 /// The first unavailable port a predicate reads, as that port's reason (rule b).
@@ -387,7 +428,7 @@ fn dates_resolvable(input: &AssessmentInput, date_failures: &BTreeSet<Uuid>, id:
 }
 
 /// Marks down the ports that answered but whose answer cannot resolve the engine input.
-fn mark_unusable_answers(vector: &Vector, down: &mut BTreeSet<GatePort>) {
+fn mark_unusable_answers(input: &AssessmentInput, vector: &Vector, down: &mut BTreeSet<GatePort>) {
     // An answered but invalid assessment cannot resolve the engine's catalog input.
     // Use the same input path as an unavailable port, including definitive-refusal
     // and payer-withholding precedence, while keeping the complete diagnostic vector.
@@ -407,6 +448,24 @@ fn mark_unusable_answers(vector: &Vector, down: &mut BTreeSet<GatePort>) {
             && outcome.reason == Some(Reason::OverlapPresenceUnevaluable)
     }) {
         down.insert(GatePort::Occupancy);
+    }
+    // An answered billing-terms list may omit a line it was asked for (`verify_terms` keeps the
+    // omission per line): that line's required pin row is unevaluable for want of terms. The
+    // answer cannot resolve the pin-composition input, so it takes the port's unavailable path,
+    // as a missing answer does, never a gate refusal the composite guard does not admit.
+    if let Some(terms) = input.billing_terms.answered()
+        && vector.outcomes().iter().any(|outcome| {
+            outcome.key.predicate == P::PinComposition
+                && outcome.applicability == Applicability::Required
+                && outcome.verdict == Verdict::Unevaluable
+                && outcome.reason == Some(Reason::CatalogPinCompositionUnavailable)
+                && outcome
+                    .key
+                    .line_id
+                    .is_some_and(|line| !terms.iter().any(|t| t.line_id == line))
+        })
+    {
+        down.insert(GatePort::BillingTerms);
     }
 }
 

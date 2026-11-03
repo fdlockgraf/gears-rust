@@ -122,7 +122,7 @@ All five operations use `/bss-orders/v1/orders/{orderId}` and require expected v
 **Actor**: Orders Workflow.
 
 1. [ ] Complete operational compensation, including voiding wave-1 drafts where no activation was dispatched.
-2. [ ] First revoke the receiver attempt and settle its entire frozen inventory under [D-198](../DESIGN.md#contract-06-activation-admission); no delayed create/activation may remain applicable. Carry exact typed barrier evidence separately from public compensation evidence. Call `POST /workflow-cancel` with mandatory cancel reason, evidence, version, key and correlation. Evidence is required before the spawn signal as well as after it.
+2. [ ] First revoke the receiver attempt and settle its entire frozen inventory under [D-198](../DESIGN.md#contract-06-activation-admission); no delayed create/activation may remain applicable. Where a post-spawn pause control is still pending, settle it first with the revoke evidence through the internal [supersede-by-revoke terminal](../DESIGN.md#contract-06-supersede-fulfillment-control) (D-259; designed, not implemented), so this call and a failure acknowledgement are not answered `still-processing`. Carry exact typed barrier evidence separately from public compensation evidence. Call `POST /workflow-cancel` with mandatory cancel reason, evidence, version, key and correlation. Evidence is required before the spawn signal as well as after it.
 3. [ ] After engine authorization, expected-version and admissibility checks, evaluate registered guards in source order: mandatory cancel reason, pre-hold state, compensation evidence, then the shared cancel-window guard (§3.5). Preserve that refusal precedence.
 4. [ ] Commit `cancelled`, evidence, caller reason, audit and `OrderCancelled` atomically. Keep the spawn signal permanently recorded.
 
@@ -223,6 +223,8 @@ Completion from hold requires resume first; current-version completion from hold
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-workflow-seam-operations`
 
+> **Status (2026-11-02): D-259 designed, not implemented.** The internal supersede-by-revoke terminal (`supersede_fulfillment_control`, Workflow ask `…-upreq-lifecycle-control-supersede-by-revoke`) is specified in [DESIGN](../DESIGN.md#contract-06-supersede-fulfillment-control); its SDK operation, engine writer, migration, reasons and tests are a follow-up. See the Stage 4 readiness register (DESIGN, D-258).
+
 The system **MUST** implement all five operations using Foundation's transaction, authorization, version, idempotency, audit and event contracts, with no state-setting bypass. Persist all contributions atomically, including requirement/gate verdict uniqueness and correlation. Instrument each operation's rate, latency and refusals, stand-in authority use, stale results, evidence refusals and begin-to-spawn interval; alert on evidence-incomplete acknowledgements.
 
 **Implements**: `cpt-cf-bss-orders-flow-workflow-seam-reflect`, `cpt-cf-bss-orders-flow-workflow-seam-begin-spawn`, `cpt-cf-bss-orders-flow-workflow-seam-acknowledge`, `cpt-cf-bss-orders-flow-workflow-seam-cancel`.
@@ -257,6 +259,8 @@ The system **MUST** supply executable contract scenarios for the pre-dispatch fe
 - [ ] Commit latency meets p95 < 1 s independently of Workflow re-check duration; fault injection proves atomic rollback, and recovery preserves the committed spawn signal with the order.
 
 - [ ] Workflow's event handler passes every `orders-events` corpus case of the [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract): one effect per event ID including republished duplicates, no inferred effect across a gap, out-of-order and stale triggers judged by the current read, `on_hold` deferring rather than retiring, unknown values ignored, and read 503/denial leaving the trigger pending through restart.
+
+- [ ] *(D-259, designed, not implemented.)* An unwind meeting a pending pause control settles it `superseded` on complete revoke evidence; the following `acknowledge(failed)` or `workflow-cancel` then proceeds instead of `still-processing`, the hold's key replays `fulfillment-control-superseded`, and evidence, generation and non-pause-control mismatches refuse without clearing the pointer.
 
 - [ ] Failed acknowledgement with both invalid compensation evidence and a wrong pre-hold origin returns `compensation-evidence-incomplete` first; with valid evidence it reaches `prehold-not-in-fulfillment`. Missing reason and boundary-invalid inputs retain their earlier precedence.
 
@@ -693,6 +697,7 @@ would leave orders non-terminal for reasons the order has no visibility into.
 - **Consumers**: [`08-read-and-authz`](../DESIGN.md#contract-08-1-1) serves the per-line projection; [`07-hold-and-expiry`](../DESIGN.md#contract-07-1-1) exempts `in_fulfillment` (and holds whose `pre_hold_state` is `in_fulfillment`) from expiry by state, and reads the spawn signal only by deferring to §3.6 *Evaluate Cancel From In-Fulfillment (shared guard)* from its ordinary `POST /cancel`
 - **Sibling gear**: [`orders-workflow/docs/PRD.md`](../../../orders-workflow/docs/PRD.md)
 - **Upstream asks**: `SUB-O1`, `SUB-O2`, `SUB-O5`, `SUB-O9`, `SUB-O10`, `…-upreq-event-consumer-conformance` (UPSTREAM_REQS §2.7, D-186), `…-upreq-workflow-amendment-verdict` and `…-upreq-overlap-activation-atomicity` (a release gate for submit/activation, D-180) — per §4.6; additional recheck and progress integration requirements are recorded in UPSTREAM_REQS §2.6
+- **Workflow asks received** (Orders Workflow `UPSTREAM_REQS.md`, PR #4787), each designed; D-259 and D-261 are not yet implemented and D-260 is implemented (2026-11-02): `…-upreq-lifecycle-control-supersede-by-revoke` → D-259 ([supersede-by-revoke terminal](../DESIGN.md#contract-06-supersede-fulfillment-control)); `…-upreq-lifecycle-version-actors` → D-260 (`OrderVersionView.actors`, [Workflow SDK contract](../DESIGN.md#orders-workflow-sdk-version-actors)); `…-upreq-lifecycle-order-read-pre-hold-state` → D-261 (`OrderView.order.pre_hold_state`, [Workflow SDK contract](../DESIGN.md#orders-workflow-sdk-pre-hold-state)). Registered in UPSTREAM_REQS §2.6
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition
 
 <!-- /contract -->

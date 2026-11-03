@@ -6,10 +6,12 @@
 //! The orchestrator's pure half (S3-11/S3-12; F03 §3.6 steps 2–5; D-215, D-180, M2-6): what one
 //! run asks of each port, the identity gate, the occupancy dedup, the evaluation request and the
 //! assembled assessment input.
+use bss_orders::domain::contributions::AggregateFacts;
 use bss_orders::domain::dates::{
     DateBasis, DatePolicySnapshot, PLATFORM_DEFAULT_POLICY_ID, PolicyRow, SuppliedDates,
 };
 use bss_orders::domain::gate::answers::*;
+use bss_orders::domain::gate::assess::Assessment;
 use bss_orders::domain::gate::assess::{BasketLine, assess};
 use bss_orders::domain::gate::commercial::CommercialError;
 use bss_orders::domain::gate::orchestrate::{
@@ -22,9 +24,15 @@ use bss_orders::domain::gate::predicates::PredicateId;
 use bss_orders::domain::gate::pricing_map::*;
 use bss_orders::domain::gate::vector::{Operation, ProducerResult, Verdict};
 use bss_orders::domain::guards::InputPort;
+use bss_orders::domain::guards::{GATE_COMPOSITE, GuardRegistry};
+use bss_orders::domain::state_table::{RowId, StateTable};
 use bss_orders::domain::transition::InputState;
+use bss_orders::domain::transition::{
+    Decision, DecisionError, DraftRevisions, GuardBindings, GuardSubject, GuardVerdict, decide,
+};
 use bss_orders_sdk::authoring::{AuthoredTerm, BillingCycle};
 use bss_orders_sdk::catalog::Reason;
+use bss_orders_sdk::catalog::{OrderState, Trigger};
 use bss_orders_sdk::gate_report::CatalogSelection;
 use bss_pricing_sdk::read::*;
 use bss_pricing_sdk::terms::{BillingTiming, InputSource, InvoiceInputs, Rounding};
@@ -975,6 +983,251 @@ fn a_port_not_asked_is_missing_and_unconfirmed_payer_inputs_are_resolved_by_with
         out.failures
     );
     assert_eq!(out.primary.and_then(|o| o.reason), Some(unconfirmed));
+}
+
+/// Audit 4.16: an unavailable identity profile skips the evaluation (its request carries the
+/// payer's billing terms), and the skipped Evaluation input retains the identity reason
+/// (D-240 item 9). Every unresolvable input carries a reason its own input registers, so the
+/// engine settles `identity-party-unavailable` (503) instead of refusing the presentation
+/// (`DecisionError::InputReason`, 500).
+#[test]
+fn an_unavailable_identity_skips_the_evaluation_with_registered_input_reasons() {
+    let b = basket(Operation::Submit, two_lines());
+    let mut a = answered(&b);
+    a.identity = PortAnswer::Unavailable(Unavailable::Missing);
+    a.evaluation = None;
+    let input = assemble(&b, a);
+    assert_eq!(
+        input.evaluation,
+        PortAnswer::Skipped(Reason::IdentityPartyUnavailable)
+    );
+    let out = assess(&input).unwrap();
+    assert_eq!(
+        out.inputs.get(InputPort::Identity),
+        Some(InputState::Unresolvable(Reason::IdentityPartyUnavailable))
+    );
+    assert_eq!(
+        out.inputs.get(InputPort::Evaluation),
+        Some(InputState::Unresolvable(Reason::IdentityPartyUnavailable))
+    );
+    for p in [
+        InputPort::Identity,
+        InputPort::PricingRevision,
+        InputPort::CatalogPredicates,
+        InputPort::ContractResolution,
+        InputPort::OverlapKey,
+        InputPort::Occupancy,
+        InputPort::PinComposition,
+        InputPort::Evaluation,
+    ] {
+        if let Some(InputState::Unresolvable(reason)) = out.inputs.get(p) {
+            assert!(
+                p.unevaluable_reasons().contains(&reason),
+                "{p:?}: {reason:?}"
+            );
+        }
+    }
+}
+
+// ---- engine level: a skipped evaluation settles through `transition::decide` ----
+
+static TABLE: std::sync::LazyLock<StateTable> =
+    std::sync::LazyLock::new(|| StateTable::registered().unwrap());
+
+/// Submit (row 4) over `a.inputs`, every row-4 guard bound to pass except the composite gate,
+/// bound to `Fail(primary.reason)` as S3-12 binds it (the `gate_assess.rs` harness).
+fn settle(a: &Assessment) -> Result<Decision<'static>, DecisionError> {
+    let table: &'static StateTable = &TABLE;
+    let registry = GuardRegistry::registered(table).unwrap();
+    let primary = a.primary.as_ref().and_then(|o| o.reason);
+    let mut bindings = GuardBindings::new();
+    for g in registry.row_guards(RowId::of(4)) {
+        bindings = match (g.name == GATE_COMPOSITE, primary) {
+            (true, Some(reason)) => bindings.bind(g.name, move |_: &GuardSubject<'_>| {
+                GuardVerdict::Fail(reason)
+            }),
+            _ => bindings.bind(g.name, |_: &GuardSubject<'_>| GuardVerdict::Pass),
+        };
+    }
+    let t0 = OffsetDateTime::from_unix_timestamp(1_790_000_000).unwrap();
+    let facts = AggregateFacts {
+        order_id: Uuid::from_u128(1),
+        state: OrderState::Draft,
+        state_entered_at: t0,
+        current_version: 2,
+        version_allocation_high_water: 2,
+        draft_revision: 4,
+        pre_hold_state: None,
+        resume_count: 0,
+        amendment_count: 0,
+        fulfillment_control_generation: 0,
+        fulfillment_control_pending: None,
+        spawn_signal_at: None,
+        authorization_failure_tolerated_at: None,
+        compensation_evidence: None,
+        resource_tenant_id: RESOURCE,
+        seller_tenant_id: Uuid::from_u128(20),
+        payer_tenant_id: PAYER,
+        category: "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1".into(),
+        contract_id: None,
+    };
+    decide(
+        table,
+        &registry,
+        Trigger::Submit,
+        &facts,
+        2,
+        DraftRevisions::Draft {
+            client: Some(4),
+            prepared: 4,
+        },
+        &bindings,
+        &a.inputs,
+        t0 + time::Duration::seconds(100),
+    )
+}
+
+/// `answered(b)` as the shell asks it when line 1 is not composed: no overlap key and no
+/// occupancy for line 1 (keys are asked only for composed lines), and no Rating call.
+fn uncomposed_line_1(b: &Basket) -> Answers {
+    let mut a = answered(b);
+    let key = format!("k{}", line_id(1).as_u128());
+    if let Some(PortAnswer::Answered(keys)) = &mut a.overlap_keys {
+        keys.retain(|k| k.line_id != line_id(1));
+    }
+    if let Some(PortAnswer::Answered(occupancy)) = &mut a.occupancy {
+        occupancy.retain(|(q, _)| q.overlap_scope_key != key);
+    }
+    a.evaluation = None;
+    a
+}
+
+/// D-265 (review I-1): a billing-terms answer that omits a line it was asked for leaves that
+/// line's required pin unevaluable for want of terms. The answer is unusable: the port takes the
+/// unavailable path, so the pin-composition outage settles its own 503
+/// (`catalog-pin-composition-unavailable`, on the Evaluation input the gate declares first),
+/// never a gate refusal the composite guard does not admit (`DecisionError::GuardReason`, 500).
+#[test]
+fn billing_terms_omitting_a_line_settle_the_pin_composition_outage() {
+    let b = basket(Operation::Submit, two_lines());
+    let mut a = answered(&b);
+    a.evaluation = None;
+    if let Some(PortAnswer::Answered(terms)) = &mut a.billing_terms {
+        terms.retain(|t| t.line_id != line_id(2));
+    }
+    let input = assemble(&b, a);
+    assert_eq!(
+        input.evaluation,
+        PortAnswer::Skipped(Reason::CatalogPinCompositionUnavailable)
+    );
+    let out = assess(&input).unwrap();
+    let unavailable = InputState::Unresolvable(Reason::CatalogPinCompositionUnavailable);
+    assert_eq!(out.inputs.get(InputPort::PinComposition), Some(unavailable));
+    assert_eq!(out.inputs.get(InputPort::Evaluation), Some(unavailable));
+    assert_eq!(
+        settle(&out),
+        Ok(Decision::Unevaluable {
+            guard: GATE_COMPOSITE,
+            reason: Reason::CatalogPinCompositionUnavailable,
+            assessment: true,
+        })
+    );
+}
+
+/// D-240 item 9 / D-265 (review I-2): the shell also skips Rating when line 1 is not composed
+/// because it failed locally, and then asks no overlap key or occupancy for it. The skip's
+/// reason is one the Evaluation input does not register (`catalog-predicate-failed`: predicate 1,
+/// the requested revision is not current; `pin-unresolvable`: the selected cell's binding is
+/// missing). That is no outage: the Evaluation input is `Resolved` and the engine settles the
+/// composite gate's own primary refusal (here `overlap-key-unresolvable`, 400, for the line the
+/// shell asked no key for; and `catalog-predicate-unevaluable` for the unbound slot's SKU rows),
+/// never a fictitious `evaluation-unavailable` (503).
+#[test]
+fn a_skipped_evaluation_for_a_local_failure_settles_the_gate_refusal() {
+    for (case, skip, local) in [
+        (
+            "revision-not-current",
+            Reason::CatalogPredicateFailed,
+            PredicateId::CatalogRevisionCurrent,
+        ),
+        (
+            "selected-cell-unbound",
+            Reason::PinUnresolvable,
+            PredicateId::PinComposition,
+        ),
+    ] {
+        let b = basket(Operation::Submit, two_lines());
+        let mut a = uncomposed_line_1(&b);
+        let cat = a.catalog.get_mut(&line_id(1)).unwrap();
+        if case == "revision-not-current" {
+            if let Ok(current) = &mut cat.current {
+                current.revision_id = Uuid::from_u128(0xbad);
+                current.revision_no = 2;
+            }
+        } else {
+            for cell in &mut Arc::make_mut(cat.resolved.as_mut().unwrap()).cells {
+                if cell.selection.item_id == ITEM_B {
+                    cell.binding = None;
+                }
+            }
+        }
+        let input = assemble(&b, a);
+        assert_eq!(input.evaluation, PortAnswer::Skipped(skip), "{case}");
+        let out = assess(&input).unwrap();
+        assert!(
+            out.vector
+                .outcomes()
+                .iter()
+                .any(|o| o.key.predicate == local
+                    && o.key.line_id == Some(line_id(1))
+                    && o.verdict == Verdict::Failed
+                    && o.reason == Some(skip)),
+            "{case}: the local failure is in the vector"
+        );
+        assert_eq!(
+            out.inputs.get(InputPort::Evaluation),
+            Some(InputState::Resolved),
+            "{case}"
+        );
+        let primary = out.primary.as_ref().and_then(|o| o.reason).unwrap();
+        assert_ne!(primary, Reason::EvaluationUnavailable, "{case}");
+        assert_eq!(
+            settle(&out),
+            Ok(Decision::Guard {
+                guard: GATE_COMPOSITE,
+                reason: primary,
+                assessment: true,
+            }),
+            "{case}"
+        );
+    }
+}
+
+/// D-265: an unasked evaluation with nothing failing and no outage (the codec-defect path of
+/// `infra::gate::orchestrate::build_evaluation_request`) has no primary for the gate to settle:
+/// the Evaluation input keeps the skip's registered reason, so the attempt settles that 503
+/// (`catalog-pin-composition-unavailable`) and never reaches the gate as a pass.
+#[test]
+fn an_unasked_evaluation_with_nothing_failing_settles_its_skip_reason() {
+    let b = basket(Operation::Submit, two_lines());
+    let mut a = answered(&b);
+    a.evaluation = None;
+    let input = assemble(&b, a);
+    let out = assess(&input).unwrap();
+    assert_eq!(
+        out.inputs.get(InputPort::Evaluation),
+        Some(InputState::Unresolvable(
+            Reason::CatalogPinCompositionUnavailable
+        ))
+    );
+    assert_eq!(
+        settle(&out),
+        Ok(Decision::Unevaluable {
+            guard: GATE_COMPOSITE,
+            reason: Reason::CatalogPinCompositionUnavailable,
+            assessment: true,
+        })
+    );
 }
 
 /// D-246 (C6 × B3): a refused purchase shape (items stating different quantities) is never

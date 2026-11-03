@@ -1,6 +1,7 @@
-//! Read contracts (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`; `models.json`
-//! `ListOrders`, `OrderPage`, `LineList`, `LinePage`). Draft and submitted reads with S6-04
-//! access logging.
+//! Read contracts (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`, and the S4-06 history
+//! reads `list_versions`, `get_version`, `get_acceptance`; `models.json` `ListOrders`,
+//! `OrderPage`, `LineList`, `LinePage`, `VersionList`, `VersionPage`, `OrderVersionView`,
+//! `AcceptanceList`, `AcceptancePage`). Draft and submitted reads with S6-04 access logging.
 //!
 //! Every collection is paged (08 §2.2) in the shared list format (DNA REST `PAGINATION.md`,
 //! D-212): `limit` defaults to 50 and is bounded 1–200; the continuation `cursor` is an opaque
@@ -9,7 +10,7 @@
 //! [`OrderFilters`]; clients cannot select a sort. A read carries no expected version or idempotency key; the only call metadata
 //! is the supplied delegation proof reference, forwarded unvalidated to the PDP and recorded as
 //! *supplied* on the access log (08 §4.4, D-202).
-use crate::authoring::{DraftLine, OrderHeader};
+use crate::authoring::{Category, Currency, DraftLine, OrderHeader, SalesPath};
 use crate::catalog::OrderState;
 use crate::models::{DelegationProofRef, DraftRevision, InvalidBoundaryValue, OrderVersion};
 use serde::{Deserialize, Serialize};
@@ -207,6 +208,269 @@ pub struct LinePage {
     pub current_version: OrderVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<DraftRevision>,
+}
+
+/// The version-history request (`models.json` `VersionList`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionList {
+    /// Absent means the default of 50.
+    pub limit: Option<PageSize>,
+    pub cursor: Option<Cursor>,
+}
+
+/// The consent-history request (`models.json` `AcceptanceList`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptanceList {
+    /// Absent means the default of 50.
+    pub limit: Option<PageSize>,
+    pub cursor: Option<Cursor>,
+}
+
+/// Why a committed version was appended (`orders_order_version.reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionReason {
+    /// Version 1, the empty draft.
+    Create,
+    /// The version a submit committed.
+    Submit,
+    /// A version an amendment committed.
+    Amendment,
+}
+impl VersionReason {
+    /// The reason a stored token names; `None` for any other spelling.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "create" => Some(Self::Create),
+            "submit" => Some(Self::Submit),
+            "amendment" => Some(Self::Amendment),
+            _ => None,
+        }
+    }
+}
+
+/// One committed version of the order's history, read from the stored version row (never a
+/// chain or event reconstruction). Reserved or burned candidate numbers are never items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionRecord {
+    pub version: OrderVersion,
+    pub reason: VersionReason,
+    /// The trusted subject that appended the version.
+    pub actor: String,
+    /// The appending subject's tenant.
+    pub actor_tenant_id: Uuid,
+    /// The engine instant the version was appended.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// The caller's explanation; present exactly on an amendment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_reason: Option<String>,
+    /// The predecessor; absent exactly on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<OrderVersion>,
+}
+
+/// Why consent was required when it was recorded (`orders_acceptance.requirement_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementSource {
+    Contract,
+    Seller,
+    PlatformDefault,
+    /// Recorded although no requirement applied.
+    Volunteered,
+}
+impl RequirementSource {
+    /// The source a stored token names; `None` for any other spelling.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "contract" => Some(Self::Contract),
+            "seller" => Some(Self::Seller),
+            "platform_default" => Some(Self::PlatformDefault),
+            "volunteered" => Some(Self::Volunteered),
+            _ => None,
+        }
+    }
+}
+
+/// One recorded consent: the committed version it accepts, the engine instant, the trusted
+/// recording subject, the recording path copied from the order's sales path and the source of
+/// the requirement. Internal recovery evidence is never part of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceRecord {
+    pub accepted_version: OrderVersion,
+    #[serde(with = "time::serde::rfc3339")]
+    pub accepted_at: OffsetDateTime,
+    pub recorded_by: String,
+    pub recording_path: SalesPath,
+    pub requirement_source: RequirementSource,
+}
+
+/// One authorized keyset page of the committed version history in `version` order
+/// (`models.json` `VersionPage`). `current_version` and `current_acceptance` come from the same
+/// consistent snapshot as the items; an absent `current_acceptance` means the current version has
+/// no recorded consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionPage {
+    pub items: Vec<VersionRecord>,
+    pub page_info: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<OrderVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<AcceptanceRecord>,
+}
+
+/// The consent read (`models.json` `AcceptancePage`): the current version, its consent (absent
+/// when none is recorded) and one keyset page of the prior versions' consent records in
+/// `accepted_version` order, all from one consistent snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptancePage {
+    /// Consent records of versions before the current one.
+    pub items: Vec<AcceptanceRecord>,
+    pub page_info: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<OrderVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<AcceptanceRecord>,
+}
+
+/// One role subject of a version (D-260): the stored `actor` and `actor_tenant_id` of the
+/// version row that defines the role, spelled as [`VersionRecord`] spells the same pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Response type: no `deny_unknown_fields`, as on `OrderView`, so an older decoder (Orders
+// Workflow in a rolling deploy) still reads a response that gained members.
+pub struct VersionActor {
+    /// The trusted subject that appended the role's version (D-103: an opaque reference).
+    pub actor: String,
+    /// That subject's tenant.
+    pub actor_tenant_id: Uuid,
+}
+
+/// The role actors of the requested version (D-260; 04 §4.5): the subjects the
+/// recording-party bar reads and Orders Workflow bars from the version's approval gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Response type: no `deny_unknown_fields`, as on `OrderView`, so an older decoder (Orders
+// Workflow in a rolling deploy) still reads a response that gained members.
+pub struct VersionActors {
+    /// Version 1's appender (reason `create`); always present.
+    pub creator: VersionActor,
+    /// The order's one `submit` version's appender; present when the requested version is that
+    /// version or later, absent on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitter: Option<VersionActor>,
+    /// The requested version's own appender when its reason is `amendment`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amender: Option<VersionActor>,
+}
+
+/// The market a committed version was gated against (`orders_order_version.market_*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Response type: no `deny_unknown_fields`, as on `OrderView`, so an older decoder (Orders
+// Workflow in a rolling deploy) still reads a response that gained members.
+pub struct VersionMarket {
+    pub currency: Currency,
+    /// The market region, when the payer's profile names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+/// The commercial header at the requested version (D-262; 04 flow 2.2 step 4, §4.5): the
+/// frozen tenant axes and the version row's own payer, category, contract and market, so an
+/// amended payer or contract reads as it was at that version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Response type: no `deny_unknown_fields`, as on `OrderView`, so an older decoder (Orders
+// Workflow in a rolling deploy) still reads a response that gained members.
+pub struct VersionHeader {
+    pub category: Category,
+    pub resource_tenant_id: Uuid,
+    pub seller_tenant_id: Uuid,
+    pub payer_tenant_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_id: Option<Uuid>,
+    /// Absent exactly on version 1, the empty draft, which was never gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market: Option<VersionMarket>,
+}
+
+/// The current administrative values of the order (`orders_order_admin`, D-263). Mutable and
+/// last-write-wins (04 §4.6); an absent member is a value that is not set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Part of a stored response (`OrderView`): unknown fields are tolerated for replay across
+// builds, as on `OrderView`.
+pub struct AdministrativeValues {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_notes: Option<String>,
+}
+
+/// One line's current administrative values (`orders_order_line_admin`, D-263).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Part of a stored response (`OrderView`): unknown fields are tolerated, as on `OrderView`.
+pub struct LineAdministrativeValues {
+    pub line_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_notes: Option<String>,
+}
+
+/// The separate mutable administrative projection (`admin` on `OrderView` and
+/// `OrderVersionView`, D-263): the **current** values, never the values at a past version, and
+/// never part of accepted-binding verification. Present when the order or one of the composed
+/// lines has an administrative row, absent when no row is stored or every value is cleared; `lines` lists the composed lines that have one, in line
+/// order. The administrative history is the audit trail, not this projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Part of a stored response (`OrderView`): unknown fields are tolerated, as on `OrderView`.
+pub struct AdministrativeView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<AdministrativeValues>,
+    #[serde(default)]
+    pub lines: Vec<LineAdministrativeValues>,
+}
+
+/// One exact committed version (`models.json` `OrderVersionView`): the version row's metadata
+/// (the members of its [`VersionRecord`], D-262), its commercial header and role actors
+/// (D-260), its lines with their immutable commercial evidence and its persisted producer
+/// totals, composed at that version, plus the order's current administrative projection
+/// (D-263). Version 1 (the empty draft) has no lines, no totals and no market.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Response type: no `deny_unknown_fields`, as on `OrderView`, so an older decoder (Orders
+// Workflow in a rolling deploy) still reads a response that gained members.
+pub struct OrderVersionView {
+    pub order_id: Uuid,
+    pub version: OrderVersion,
+    pub reason: VersionReason,
+    /// The trusted subject that appended the version.
+    pub actor: String,
+    /// The appending subject's tenant.
+    pub actor_tenant_id: Uuid,
+    /// The engine instant the version was appended.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// The caller's explanation; present exactly on an amendment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_reason: Option<String>,
+    /// The predecessor; absent exactly on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<OrderVersion>,
+    pub header: VersionHeader,
+    pub actors: VersionActors,
+    pub lines: Vec<DraftLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_total: Option<Vec<CommittedTotal>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<AdministrativeView>,
 }
 
 /// Immutable commercial evidence selected by the committed version, never a live quotation.

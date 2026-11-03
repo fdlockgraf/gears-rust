@@ -188,6 +188,7 @@
   - [Dispatch identity and receiver linearization](#dispatch-identity-and-receiver-linearization)
   - [Internal draft-rebuild continuation (D-201)](#internal-draft-rebuild-continuation-d-201)
   - [Staged hold/cancel/failure without new public states](#staged-holdcancelfailure-without-new-public-states)
+  - [Supersede-by-revoke terminal for a pending pause control (D-259)](#supersede-by-revoke-terminal-for-a-pending-pause-control-d-259)
   - [Engine persistence and recovery](#engine-persistence-and-recovery)
   - [Required evidence before production](#required-evidence-before-production)
   - [Commercial prerequisites: owner contracts and delivery evidence (D-199)](#commercial-prerequisites-owner-contracts-and-delivery-evidence-d-199)
@@ -1320,8 +1321,9 @@ boundary validation and engine ordering as REST; context is never synthesized fr
 | `workflow_cancel` | `OrderRef`, `cancel_reason`, `CompensationEvidence`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/workflow-cancel` |
 | `hold` | `OrderRef`, optional `reason`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/hold` |
 | `resume` | `OrderRef`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/resume` |
-| `get` | `order_id` | `OrderView` | Authorized composed current-order read |
-| `get_version` | `order_id`, `version` | `OrderVersionView` | Authorized immutable-version read |
+| `supersede_fulfillment_control` (D-259, internal) | `OrderRef`, `control_id`, `ControlRevokeEvidence`, `CallMeta` | `ControlSupersedeResult { control_id, outcome, audit_id? }` | None: internal SDK IdempotentWrite, [06](#contract-06-supersede-fulfillment-control) |
+| `get` | `order_id` | `OrderView` (with `order.pre_hold_state`, D-261) | Authorized composed current-order read |
+| `get_version` | `order_id`, `version` | `OrderVersionView` (with `actors`, D-260) | Authorized immutable-version read |
 
 Paths use `/bss-orders/v1` as their prefix. All mutation methods carry
 `OrderRef { order_id: Uuid, expected_version: positive integer }` and
@@ -1332,7 +1334,7 @@ existing bounds and authorized-principal idempotency namespace. State names, rea
 version semantics and errors come from Foundation, not a second SDK registry.
 
 **Alignment with the Workflow branch (`bss/orders-workflow` @ `3ccf7793c`, D-193…D-199).** Workflow
-calls all nine methods as specified here. `hold` and `resume` are reserved: holds are driven by
+calls all nine methods as specified here; the D-259 internal `supersede_fulfillment_control` row answers a later Workflow ask and is designed, not implemented. `hold` and `resume` are reserved: holds are driven by
 Lifecycle events, and the branch declares both and calls neither. `get_version` is also the read
 Subscriptions performs for committed receipt selection at activation (D-158, D-190), granted to
 `bss-subscriptions.system` over the same finite order set as Workflow's (08 §4.3). Idempotency
@@ -1387,10 +1389,49 @@ including selections, pins, assessment identity, market and received totals/excl
 the requested version even after amendment, subject to current authorization and documented retention;
 An absent or undiscoverable parent returns `order-not-found`; after current-parent authorization,
 a missing committed version returns `version-not-found` (the shared version-read wrapper in §6).
-Neither case substitutes the current version. Administrative projections
-are separately marked mutable and do not enter accepted-binding verification. Workflow obtains
+Neither case substitutes the current version. It also carries the version row's metadata
+(`reason`, `actor`, `actor_tenant_id`, `created_at`, `amendment_reason?`, `supersedes_version?`)
+and `header` at that version (payer, category, contract, market; D-262). Administrative projections
+(`admin`, the **current** values, D-263) are separately marked mutable and do not enter
+accepted-binding verification. Workflow obtains
 current state/version separately through `get` before acting; possession of an event/version reference
 grants no authority. Implementation must reuse the existing version-read permission boundary.
+
+<a id="orders-workflow-sdk-version-actors"></a>
+
+**Version role actors (D-260; Workflow ask `…-upreq-lifecycle-version-actors`).**
+`OrderVersionView` carries a required `actors` member, `VersionActors { creator, submitter?,
+amender? }`, each a `VersionActor { actor, actor_tenant_id }` spelled exactly as `VersionRecord`
+spells the same stored pair. They are the three role subjects the recording-party bar reads
+([05 §3.6](features/05-preconditions.md#contract-05-3-6) *Record Acceptance* step 4, D-130 as
+amended by D-146), all copied from stored `orders_order_version` rows of this order:
+
+| Member | Source row | Present when |
+|---|---|---|
+| `creator` | version 1 (reason `create`) | always |
+| `submitter` | the order's one committed version with reason `submit` (the sparse candidate C > 1 that the one `draft → submitted` transition commits, D-188) | the requested version is that version or later; absent on version 1 of a submitted order and on a draft |
+| `amender` | the requested version itself | the requested version's reason is `amendment`; absent otherwise |
+
+The submitter is therefore durable today: no new column, audit read or backfill is needed, and
+the row is immutable. `amender` is the actor of the **requested** version only, which is the
+`expected_version` amender the bar compares when that version is current; amenders of earlier
+versions are not role subjects of this version and are not returned. A missing version-1 or
+submit row on a version that requires it is an integration failure (as D-256 item 9), never an
+absent member. The subject ids are the engine's `AuditActor::reference()` (D-103), never names or
+caller labels, and are exposed under the same rule `list_versions` already applies to
+`VersionRecord.actor` (D-255): every principal the PDP lets read the order (`order × read`) sees
+them, with no per-principal redaction, as [08 §4.2](#contract-08-4-2) states. The member is
+additive under the compatibility rule above; Workflow forms its approval-gate barred set from it.
+
+<a id="orders-workflow-sdk-pre-hold-state"></a>
+
+**Pre-hold state on the order read (D-261; Workflow ask `…-upreq-lifecycle-order-read-pre-hold-state`).**
+`OrderView.order` (`OrderHeader`) carries optional `pre_hold_state`, the stored
+`orders_order.pre_hold_state` (D-80, D-138) read in the same snapshot as `state`: present exactly
+when `state = on_hold`, absent otherwise (the column's CHECK, §3.7). A D-198 staged pause that is
+still pending changes neither `state` nor `pre_hold_state` (§6 *Staged hold/cancel/failure*), so
+the read never shows a hold that is not effective. The field is additive and read-only; no write
+accepts it.
 
 **Contract examples.** `required` with authority `orders-policy:v1` is representable; omitting authority
 is `verdict-authority-missing`. A completion `[line-B → sub-2, line-A → sub-1]` maps by IDs, not position.
@@ -1762,7 +1803,7 @@ and their mutability. Platform producer/outbox tables are not Orders-owned table
 | `orders_audit_checkpoint` | `bss_orders__audit_checkpoint` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only tenant roll-up headers; D-100 |
 | `orders_audit_checkpoint_member` | `bss_orders__audit_checkpoint_member` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only expected order-chain heads; D-100 |
 | `orders_fulfillment_grant` | `bss_orders__fulfillment_grant` | [D-198](#contract-06-activation-admission) | engine | Immutable dispatch authority; inserted atomically by spawn/resume or D-201 internal rebuild |
-| `orders_fulfillment_control` | `bss_orders__fulfillment_control` | [D-198](#contract-06-activation-admission) | engine | Immutable coordination intent/roster and conditional fence/evidence/status; not a public lifecycle state |
+| `orders_fulfillment_control` | `bss_orders__fulfillment_control` | [D-198](#contract-06-activation-admission) | engine | Immutable coordination intent/roster and conditional fence/evidence/status, including the D-259 `superseded` terminal and its write-once revoke evidence ([06](#contract-06-supersede-fulfillment-control)); not a public lifecycle state |
 | `orders_commercial_attempt` | `bss_orders__commercial_attempt` | [D-188](#contract-01-commercial-attempt) | engine | Immutable inputs, conditional operational status/lease/receipt updates; no commercial history placeholder |
 | `orders_idempotency` | `bss_orders__idempotency` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | **mutable** — marker settles |
 | `orders_line_fulfillment` | `bss_orders__line_fulfillment` | [01 §3.7](DESIGN.md#contract-01-3-7) | workflow-seam | **mutable** — projection advances |
@@ -2091,7 +2132,12 @@ key material.
 **Classification**: order content and its resolved totals are **commercial-confidential**; actor
 and tenant identifiers in the audit trail are **personal-minimal**; the free-text administrative
 fields — display labels and internal notes — are **personal-minimal** and carry length bounds and
-input validation. No masking requirement arises, because no surface returns another tenant's data.
+input validation. No masking is applied, but the administrative values are not confined to
+their author's tenant: by the user's decision recorded in D-263 (2026-11-02), the current
+administrative projection, `internal_notes` included, is returned to every principal the PDP lets
+read the order (`order × read`), so text one tenant authors (a partner, say) is read by the
+order's other readers (the customer, the seller). Authors **must not** put content there that is
+confidential to their own tenant.
 
 **Local audit ownership (D-97).** Orders retains its authoritative transactional audit store,
 aggregate-scoped hash chains and authorized local retrieval, following Pricing's implemented
@@ -2611,7 +2657,8 @@ are not permission to repair business state or broaden any role's grants.
 
 The registry is request-cache infrastructure with an ordinary **24-hour** retention window.
 D-173 overrides that baseline for the workflow retention class (§4.1: the workflow-class
-triggers plus the D-201 internal `replace-fulfillment-grant` continuation, D-203): retain
+triggers plus the D-201 internal `replace-fulfillment-grant` continuation, D-203, and the D-259
+internal `supersede-fulfillment-control` terminal): retain
 their receipts for **at least 30 days**, covering the issuing Workflow retry horizon. Persist
 the applicable deadline at claim time; retries, reclamation and settlement do not extend it.
 After that deadline, expired keys may name a new execution under the guarded expiry rules;
@@ -3333,11 +3380,11 @@ toolkit outbox's 64 KiB payload limit. Capacity tests cover the largest `OrderSu
 | current_version | integer, **NOT NULL, `1` from creation** | Pointer into the version chain (deferred FK). Creation appends version 1 carrying the empty draft; submit appends its reserved candidate version carrying the gated content (D-188) |
 | version_allocation_high_water | integer, NOT NULL, initially 1 | Greatest permanently reserved candidate; monotonic, never decremented; checked allocation under aggregate lock; independent of current_version (D-188) |
 | draft_revision | bigint, NOT NULL, CHECK >= 0 | Mutable-draft concurrency token; initialized to 0, incremented by every commercial draft edit under the aggregate lock, retained after submit; §3.6 defines snapshot and locked comparisons |
-| pre_hold_state | enum, nullable | Set by a hold, consumed and cleared by a resume |
+| pre_hold_state | enum, nullable | Set by a hold, consumed and cleared by a resume; returned read-only as `OrderView.order.pre_hold_state` (D-261) |
 | resume_count | integer, **NOT NULL, `0` from creation** | Resumes taken on this order. Incremented by row 22 and by nothing else; **no transition decrements or resets it**, which is what makes the resume cap of [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2) a bound rather than a quota. Read by row 22's guard on the already-locked aggregate row, so the cap costs no scan and no index |
 | amendment_count | integer, **NOT NULL, `0` from creation** | Amendments appended to this order. Incremented by rows 18, 19 and 20 and by nothing else; **no transition decrements or resets it**. Read by those rows' guard on the already-locked aggregate row. It is a **separate counter from `resume_count` on purpose** — a resume is a seller-side operational act and an amendment a buyer-side commercial one, so a seller's compliance holds **MUST NOT** consume a buyer's ability to revise the order ([04 §4.1](features/04-versioning.md#contract-04-4-1), [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)) |
 | fulfillment_control_generation | bigint, NOT NULL, initially 0 | Checked monotonic generation for D-198 dispatch/control grants; never inferred from sparse commercial version or worker lease |
-| fulfillment_control_pending | uuid, nullable | Engine-owned D-198 staged control intent; blocks new activation grants until settled; independent of public state |
+| fulfillment_control_pending | uuid, nullable | Engine-owned D-198 staged control intent; blocks new activation grants until settled; independent of public state. Cleared only by the owning control's final commit, its terminal refusal/abandonment, D-182 force-fail supersession or the D-259 supersede-by-revoke terminal, each only while it still equals that control_id |
 | spawn_signal_at | timestamptz, nullable | Written by the spawn-signal transition; never cleared |
 | authorization_failure_tolerated_at | timestamptz, nullable | The tolerated-authorization risk flag; records a decision taken at an instant and is never cleared |
 | compensation_evidence | jsonb, nullable | Workflow-supplied evidence under the closed schema below — drafts voided, activated subscriptions rolled back, whether activation was dispatched, whether at-sale facts were emitted, and the no-active-subscription assertion; recorded only by failure acknowledgement or workflow-mediated cancellation, or — in its forced variant with `unknown` assertions and an operator attestation — by the operator-forced unreconciled failure (rows 28 and 29, D-182) |
@@ -3427,7 +3474,7 @@ indexes are a design baseline, not proof that every combination avoids sorting o
 | payer_tenant_id | uuid | The payer **at this version** — the one tenant axis PRD §6.1 permits an amendment to change, so the aggregate's current value cannot answer who a prior version was gated and approved against |
 | category | text | Same registered GTS well-known instance identifier as the aggregate, captured at this version |
 | contract_id | uuid, nullable | The contract reference at this version |
-| actor | text | Who created this version |
+| actor | text | Who created this version; version 1's is the order's creator, the `submit` version's its submitter, an `amendment` version's its amender, returned as `OrderVersionView.actors` (D-260) |
 | actor_tenant_id | uuid, **NOT NULL** | The appending actor's trusted `SecurityContext.subject_tenant_id` at append, written by the engine with `actor` on every version (create, submit, amendment) and never caller-supplied; the stored fact the recording-party bar of [05 §3.6](features/05-preconditions.md#contract-05-3-6) *Record Acceptance* step 4 compares with `orders_order.resource_tenant_id` (D-146) |
 | reason | text | Registered reason: create, submit or amendment |
 | amendment_reason | text, nullable | Caller explanation, 1–4096 characters on amendment, NULL on create/submit; not a reason code. Engine copies the validated contribution at version insertion |
@@ -3727,7 +3774,7 @@ storable: a nullable column cannot participate in a primary key.
 | created_at | timestamptz | Append instant |
 
 **Committed audit reason tokens (D-148).** The committed-entry vocabulary of `reason` is
-**closed**: one token per §4.3 trigger, equal to the trigger name, plus the D-201 internal writer token `replace-fulfillment-grant` — `create`,
+**closed**: one token per §4.3 trigger, equal to the trigger name, plus the D-201 internal writer token `replace-fulfillment-grant` and the D-259 internal writer token `supersede-fulfillment-control` — `create`,
 `draft-mutate`, `administrative-edit`, `submit`, `cancel`, `auto-void`, `reflect-approval-required`,
 `reflect-approval-not-required`, `reflect-approval-granted`, `reflect-approval-denied`,
 `begin-fulfillment`, `report-spawn-signal`, `acknowledge-completed`, `acknowledge-failed`,
@@ -3974,7 +4021,7 @@ intact rather than delete it. Tenant and sequence must match the owning header.
 | outcome_reason | text, nullable | The registered reason on a refusal |
 | audit_id | uuid, nullable | The transition a settled record produced |
 | settled_response | jsonb, nullable | Immutable versioned response snapshot written at settlement: HTTP status, public body and semantic headers (including returned version/revision); no transport credentials. Includes the assessment result below when gate evaluation was reached; NULL while in flight |
-| created_at, expires_at | timestamptz | On new claim, write fresh database time `t` and `t + retention_window(operation)`: ordinary 24 hours; the workflow retention class (workflow-class triggers and `replace-fulfillment-grant`) at least 30 days (D-173, D-203). Replay, reclamation and settlement do not extend this stored deadline (§4.2) |
+| created_at, expires_at | timestamptz | On new claim, write fresh database time `t` and `t + retention_window(operation)`: ordinary 24 hours; the workflow retention class (workflow-class triggers, `replace-fulfillment-grant` and `supersede-fulfillment-control`) at least 30 days (D-173, D-203, D-259). Replay, reclamation and settlement do not extend this stored deadline (§4.2) |
 
 **Persisted response and assessment binding.** Every settled record requires a non-null
 `settled_response` with `formatVersion = 1`; readers retain decoders for supported versions.
@@ -4316,9 +4363,11 @@ the caller never saw ([DECISIONS.md](DECISIONS.md) D-110; `§3.6` *Attempt Trans
 `force-fail-unreconciled` (rows 28, 29) is **not** in the class: it is a human operator's trigger
 with the ordinary admissibility-then-version order (D-182). The **workflow retention class**
 (§2.2, D-173) is this class plus the D-201 internal `replace-fulfillment-grant` continuation
-([06](DESIGN.md#contract-06-replace-fulfillment-grant)), which Workflow issues and retries under
-one key: its receipts are retained for at least 30 days (D-203). That adds no trigger to the class
-and does not change the continuation's own closed guard order. A
+([06](DESIGN.md#contract-06-replace-fulfillment-grant)) and the D-259 internal
+`supersede-fulfillment-control` terminal ([06](DESIGN.md#contract-06-supersede-fulfillment-control)),
+each of which Workflow issues and retries under one key: their receipts are retained for at least
+30 days (D-203, D-259). That adds no trigger to the class and does not change either writer's own
+closed guard order. A
 slice **MUST NOT** refuse a request before calling the engine, and **MUST NOT** depend on running
 before another slice's guard for the same row.
 
@@ -5029,7 +5078,6 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `indicative-tax-unavailable` | `INDICATIVE_TAX_UNAVAILABLE` | ServiceUnavailable | 503 |
 | `market-divergence` | `MARKET_DIVERGENCE` | FailedPrecondition | 400 |
 | `overlap-collision` | `OVERLAP_COLLISION` | FailedPrecondition | 400 |
-| `payer-rebinding-requires-seller` | `PAYER_REBINDING_REQUIRES_SELLER` | FailedPrecondition | 400 |
 | `tenant-axis-immutable` | `TENANT_AXIS_IMMUTABLE` | FailedPrecondition | 400 |
 | `administrative-field-in-amendment` | `ADMINISTRATIVE_FIELD_IN_AMENDMENT` | InvalidArgument | 400 |
 | `amendment-empty` | `AMENDMENT_EMPTY` | InvalidArgument | 400 |
@@ -5065,6 +5113,10 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `grant-source-mismatch` | `GRANT_SOURCE_MISMATCH` | FailedPrecondition | 400 |
 | `grant-predecessor-unsettled` | `GRANT_PREDECESSOR_UNSETTLED` | FailedPrecondition | 400 |
 | `grant-generation-exhausted` | `GRANT_GENERATION_EXHAUSTED` | FailedPrecondition | 400 |
+| `fulfillment-control-superseded` | `FULFILLMENT_CONTROL_SUPERSEDED` | Aborted | 409 |
+| `control-not-supersedable` | `CONTROL_NOT_SUPERSEDABLE` | FailedPrecondition | 400 |
+| `control-generation-mismatch` | `CONTROL_GENERATION_MISMATCH` | FailedPrecondition | 400 |
+| `control-supersede-evidence-mismatch` | `CONTROL_SUPERSEDE_EVIDENCE_MISMATCH` | FailedPrecondition | 400 |
 | `overdue-window-not-elapsed` | `OVERDUE_WINDOW_NOT_ELAPSED` | FailedPrecondition | 400 |
 | `second-approver-required` | `SECOND_APPROVER_REQUIRED` | FailedPrecondition | 400 |
 | `order-not-found` | `ORDER_NOT_FOUND` | NotFound | 404 |
@@ -7357,7 +7409,7 @@ created. The two-step shape is what makes rows 19 and 20 reachable at all
 
 `payerTenantId` is the only tenant axis with an amendment path, and that path **stops at the
 seller boundary**. A payer change that crosses seller scope **MUST** be refused with
-`payer-rebinding-requires-seller`, because the paired seller rebinding such a move requires
+`payer-relationship-unconfirmed` (gate predicate 1; the amendment-specific reason was removed by D-249), because the paired seller rebinding such a move requires
 cannot be performed here at all: `sellerTenantId` is **commercial-frozen** and **MUST NOT** change
 after `submitted` by any path, amendment included
 ([02-capture — Field classification (normative)](DESIGN.md#contract-02-4-3) *Commercial-frozen*; §4.1;
@@ -7376,7 +7428,7 @@ commercial profile that the identity port already returns from Account Managemen
 (`cpt-cf-bss-orders-upreq-payer-commercial-profile`, `UPSTREAM_REQS.md` §2.4); this
 slice holds no port of its own (§3.5), so *Append Amendment* step 2 resolves it through 03 once
 per run and the gate run reuses it. A confirmed relationship admits the change; an answer that
-does not confirm one is refused with `payer-rebinding-requires-seller`. If the operation is
+does not confirm one is refused with `payer-relationship-unconfirmed` by gate predicate 1 (D-249). If the operation is
 unavailable or misses its deadline, the input is unresolvable and refuses
 `identity-party-unavailable`. No new reason is added
 ([DECISIONS.md](DECISIONS.md) D-128).
@@ -7387,7 +7439,7 @@ claims otherwise. It previously described a paired payer/seller rebinding while 
 both, and a reader could conclude either that the documented payer-transfer path must be rejected
 or that an unintended tenant rebinding must be permitted. This deliberately narrows PRD §6.1's
 paired-rebinding MUST; it is not evidence of conformance. Product/Architecture reconciliation
-remains open under D-62/Q-28. `payer-rebinding-requires-seller` keeps its registered name and its
+remains open under D-62/Q-28. `payer-rebinding-requires-seller` was removed by D-249. The
 authorization requirements are those of `amend` itself: a cross-seller payer change needs no extra
 authority because it is never admitted.
 
@@ -7543,8 +7595,7 @@ and submit publishes `OrderSubmitted`. `OrderAmended` fires only on rows 18, 19 
 six of eight values on the audit row rather than the version row; the split is stated here so the
 two are not read as one vocabulary ([DECISIONS.md](DECISIONS.md) D-82).
 
-**Reasons contributed to the registry**: payer-rebinding-requires-seller,
-tenant-axis-immutable, **administrative-field-in-amendment**, amendment-empty,
+**Reasons contributed to the registry**: tenant-axis-immutable, **administrative-field-in-amendment**, amendment-empty,
 **amendment-reason-invalid**, version-not-found, **amendment-cap-exhausted**,
 **administrative-edit-unchanged**. The shared read wrapper raises version-not-found
 only after current-parent authorization when a requested historical version is absent; it is
@@ -7568,9 +7619,7 @@ the two are distinct names because they refuse on opposite operations and point 
 opposite directions. `amendment-reason-invalid` is registered **here and only here** (D-129): it refuses an amendment
 whose `amendment_reason` is absent or outside 1–4096 characters, and it is a name distinct from
 `amendment-empty`, which refuses an empty delta — two conditions, two names (D-38).
-`payer-rebinding-requires-seller` refuses a payer change that crosses seller
-scope as §2.2 defines it (D-128), which §2.2 and §4.1 establish is never admissible, since `sellerTenantId` cannot be
-rebound to accompany it. An amendment attempted from
+`payer-rebinding-requires-seller` was removed by D-249: the payer relationship is checked once, by gate predicate 1. An amendment attempted from
 `in_fulfillment` or a terminal state resolves to the engine's own `not-admissible`, which carries
 the current state and trigger — no row exists for those pairs, so a slice-local
 `amendment-not-admitted-in-state` was unreachable from every path and is deleted, matching the
@@ -7700,7 +7749,7 @@ carry it — §4.4 says so explicitly rather than leaving a reader to discover i
 | Requirement | Design Response |
 |-------------|------------------|
 | `cpt-cf-bss-orders-fr-order-acceptance` | Acceptance binds to the current immutable commercial version through a state-only transition on a submitted, non-terminal order, publishing `OrderAcceptanceRecorded`; one row per accepted version records the actor and requirement source. Never defaulted. |
-| `cpt-cf-bss-orders-fr-order-payment-auth` | Authorization is a begin-fulfillment guard input, not a stored order fact: a three-valued outcome; only `authorized` and `failed` are expected on begin-fulfillment (a `pending` submission is refused defensively, §4.3, D-131); the seller tolerate-failure election is read at guard time and the resulting risk is flagged and audited. |
+| `cpt-cf-bss-orders-fr-order-payment-auth` | Authorization is a begin-fulfillment guard input, not a stored order fact: a three-valued outcome; only `authorized` and `failed` are expected on begin-fulfillment (a `pending` submission is refused defensively, §4.3, D-131); the seller tolerate-failure election is read at guard time and the resulting risk is flagged on the order (write-once `authorization_failure_tolerated_at`, stamped at the instant of the committed, audited admission: the audit evidence, D-257 item 11). |
 | `cpt-cf-bss-orders-fr-order-create` | On the self-service path, submit by the buyer *is* acceptance and is recorded as such in the submit commit — no separate field, no second call. A submit counts as the buyer's by §4.2's submit-request rule (no proof reference, submitter tenant = resource tenant, D-146), not by `sales_path`. |
 | `cpt-cf-bss-orders-fr-orders-boundary-r3-provisioning` | Nothing here provisions or touches money. The slice supplies guard inputs and records one fact. |
 
@@ -10408,7 +10457,28 @@ It **MUST** state the resolved total's **declared exclusions**, per
 [03-gate-and-pin — What the order-time total excludes (normative)](DESIGN.md#contract-03-4-5): the total omits overlays needing
 subscription-level context and is pre-tax, carrying no tax figure; a response that omitted these exclusions silently would misrepresent itself.
 
-Beyond the fulfillment inputs above, it **MUST NOT** expose guard state, idempotency records,
+It **MUST** carry the order's stored **pre-hold state** (`OrderView.order.pre_hold_state`, D-261)
+while the order is `on_hold`, and the version read **MUST** carry the version's **role actors**
+(`OrderVersionView.actors`: creator, submitter, amender, each with its actor tenant, D-260). Both
+are stored lifecycle facts — the hold record of D-138 and the immutable version rows — not guard
+evaluation state, so the prohibition below does not reach them. Like the fulfillment inputs they
+are restricted by no principal: every principal the PDP lets read the order sees them, and the
+actor ids are the same opaque subject references `VersionRecord.actor` already returns (D-103,
+D-255). A pending D-198 staged control is not exposed.
+
+The version read **MUST** also carry the version row's **metadata** — `reason`, `actor`,
+`actor_tenant_id`, `created_at`, `amendment_reason` (exactly on an amendment) and
+`supersedes_version` (absent exactly on version 1) — and the version's **header at that version**
+(`OrderVersionView.header`: category, the frozen seller and resource axes, and the version's payer,
+contract and market, D-262). The order read and the version read **MUST** carry the order's
+current **administrative projection** (`admin`: the order's and each composed line's
+`external_reference`, `display_label` and `internal_notes`, D-263), absent when no value is set.
+It is current, not historical, also on an older version; the administrative history stays the
+audit read's. Like the facts above these are restricted by no principal: by the user's decision
+(D-263, 2026-11-02) every `order × read` principal sees the administrative values, `internal_notes`
+included ([§4.3 *Classification*](#43-data-protection-residency-and-retention)).
+
+Beyond the fulfillment inputs and the facts above, it **MUST NOT** expose guard state, idempotency records,
 outbox or dead-letter contents, or any engine diagnostic, and no error body **MAY** carry internal diagnostics.
 
 
@@ -11780,10 +11850,11 @@ after commit. Same key/fingerprint replays the same result; changed fingerprint 
 Use existing canonical authorization/version/idempotency errors, `not-admissible` for a wrong
 state and `spawn-signal-not-recorded` before first spawn. Syntactically invalid input is
 `request-invalid` before engine entry. After authorization/version/state checks, the closed
-internal writer guard order is: pending control → `still-processing`; current predecessor,
+internal writer guard order is: pending control → `still-processing`; a fulfillment attempt
+whose control was superseded by revoke (D-259) → `fulfillment-control-superseded`; current predecessor,
 committed source/commercial roster or active-member mismatch → `grant-source-mismatch`;
 missing/incomplete/uncertain predecessor closure → `grant-predecessor-unsettled`; checked
-counter overflow → `grant-generation-exhausted`. These last three are registered business
+counter overflow → `grant-generation-exhausted`. These last four are registered business
 refusals and receive ordinary audit/idempotency settlement; none authorizes an alternate grant.
 They are not Workflow acknowledgement failure reasons.
 
@@ -11865,7 +11936,8 @@ incompleteness keeps coordination pending, not a premature successful terminal. 
 original transition, write normal business audit/event/response, clear the pending pointer and
 mark control settled. Concurrent state/control changes cannot reuse stale evidence. Competing
 ordinary control requests return existing still-processing until the owning operation settles;
-no worker bypasses it. Replayed same-key settled responses remain immutable.
+no worker bypasses it. The one exception is a pending pause control met by an unwind: Workflow's
+revoke evidence settles it through the [supersede-by-revoke terminal](#contract-06-supersede-fulfillment-control) (D-259). Replayed same-key settled responses remain immutable.
 
 **User-visible change:** a post-spawn hold/cancel/failure request is not effective until this
 barrier and final commit complete. While pending, the existing state is returned by reads and
@@ -11900,14 +11972,103 @@ not the ordinary cancel/failure success contract, and its existing operator aler
 Expiry remains barred for fulfillment and holds from fulfillment; no hidden TTL revokes a live
 receiver claim. Pre-fulfillment expiry has no opened activation grant to drain.
 
+<a id="contract-06-supersede-fulfillment-control"></a>
+
+### Supersede-by-revoke terminal for a pending pause control (D-259)
+
+**Why.** An unwind of a spawned order (Workflow's cancel or failure path) can meet a post-spawn
+pause control that step 1 staged and step 5 has not finalized. Workflow's fence then revokes every
+receiver generation of the version, the paused one included, so the pause barrier of step 4 can
+never be proven and the control would stay pending; meanwhile step 5 answers the ordinary
+`acknowledge(failed)` or `workflow-cancel` `still-processing`, leaving the D-182 forced exit as the
+only way out of `in_fulfillment`. This terminal settles that control on Workflow's revoke evidence
+(Workflow ask `…-upreq-lifecycle-control-supersede-by-revoke`, raised by
+Workflow D-248).
+
+**Registration.** Register `supersede_fulfillment_control` as an engine-owned, internal SDK
+IdempotentWrite on the same footing as `replace_fulfillment_grant` above: configured Workflow
+identity plus the existing `order:spawn-signal` PDP action on all tenant axes, over the same
+finite order-ID set; no REST endpoint, no matrix row, no public state-machine row, trigger or
+event. Its registry operation token and its internal audit token are both
+`supersede-fulfillment-control`, in the **workflow retention class** (receipts at least 30 days,
+[01 §4.1](DESIGN.md#contract-01-4-1), D-203). Workflow's key is
+`{tenant}:{orderId}:{orderVersion}:control-supersede:{controlId}`; the key is the caller's and
+Orders never parses it. It is a terminal of the fulfillment-control port Workflow asked for
+(`…-upreq-lifecycle-fulfillment-control-port`), registered on its own, so it does not wait for the
+hand-off/settle operations of that port.
+
+**Request** (beside `OrderRef { order_id, expected_version }` and `CallMeta`): `control_id` and
+`ControlRevokeEvidence { order_id, order_version, fulfillment_attempt_id, generation,
+roster_digest, receivers: [{ receiver_id, fence_id, revoked_generation, revoked_at }] }`, one
+attestation per receiver of the control's frozen roster, each the receiver's own durable revoke
+fence of step 4, assembled by Workflow. Syntactically invalid input (a duplicate receiver, an empty
+list) is `request-invalid` before engine entry. **Result:** `ControlSupersedeResult { control_id,
+outcome, audit_id? }`, `outcome` ∈ `superseded` (this call committed it; `audit_id` names the
+internal audit entry), `already_superseded`, `not_pending { status }` (`settled`, `refused` or
+`abandoned`).
+
+**Order of checks**, under the aggregate then registry/control locks, as D-201's: authorize and
+resolve owned idempotency (a same key/fingerprint replays the stored result; a changed fingerprint
+conflicts), then the version check (`version-conflict` naming the current version), then:
+
+1. Load the control by `control_id` **for this order**. Unknown, or another order's →
+   `control-supersede-evidence-mismatch`.
+2. Control already terminal → answer without writing, auditing or touching the pointer:
+   `already_superseded` when `superseded`, else `not_pending { status }`. This is the idempotent
+   answer for a lost response under another key, a pause that became effective first (the order is
+   then `on_hold` and Workflow unwinds through rows 26/27), and a control a D-182 force-fail already
+   abandoned. The answer settles the caller's key.
+3. Control operation is not `hold` (a staged ordinary cancel or failure control is itself the
+   terminal and is never superseded) → `control-not-supersedable`.
+4. `generation` differs from the control's `generation` → `control-generation-mismatch`.
+5. `order_id`, `order_version`, `fulfillment_attempt_id` or `roster_digest` differs from the
+   control's immutable values, or the attestations do not cover exactly the control's roster
+   receivers with a revoke (not a pause) fence at the control's generation or a later one →
+   `control-supersede-evidence-mismatch`.
+
+The order is necessarily `in_fulfillment` with `fulfillment_control_pending = control_id` when a
+pending pause control exists; any other combination is an integration failure, never a settled
+refusal. Steps 3–5 are registered business refusals with ordinary audit and idempotency
+settlement; none clears the pointer or changes the control.
+
+**Commit**, in one transaction: set the control `status = superseded`, `terminal_at`, and its
+write-once `supersede_evidence` (the request evidence, the audit_id and the superseding
+execution); clear `fulfillment_control_pending` **only if it still equals this control_id**;
+settle the pause's owning `hold` execution (the control's `execution_id`) as a refusal
+`fulfillment-control-superseded`, audited as a refused `hold` attempt, so its same-key retry
+replays that refusal instead of `still-processing`; append the committed internal audit entry
+`supersede-fulfillment-control` (`from_state = to_state = in_fulfillment`, the Workflow actor,
+the version); settle the caller's key. Public state, `state_entered_at`, `pre_hold_state` (still
+NULL), version, caps, `spawn_signal_at`, grants and the aggregate generation are unchanged, and no
+event is emitted. Rollback removes every effect.
+
+**What follows.** The pointer is clear, so the ordinary `acknowledge(failed)` or `workflow-cancel`
+from `in_fulfillment` (rows 14, 16) is no longer answered `still-processing` and proceeds through
+its own staged revoke-and-compensate continuation and evidence guards; supersession proves
+nothing about compensation. The superseded fulfillment attempt is unwinding: a new post-spawn hold
+on it and the D-201 `replace_fulfillment_grant` writer refuse `fulfillment-control-superseded`,
+and no resume can issue a successor grant, because no hold became effective. Supersession never
+reopens a receiver generation or erases fence evidence.
+
+**D-182 interaction.** Supersession and two-person `force-fail-unreconciled` serialize on the
+aggregate lock. Force-fail first: it abandons the pending control as today, and a later
+supersession answers `not_pending { abandoned }`. Supersession first: the control is terminal and
+force-fail finds no pending control to fence; it remains available on its own guards. Neither
+asserts compensation for the other.
+
+**Status:** designed, not yet implemented (D-259) — follow-up: SDK operation and types, engine
+writer and guards, the `superseded` status and `supersede_evidence` column (migration), the four
+reasons, the D-201 guard, tests below.
+
 ### Engine persistence and recovery
 
 **Table contract:** `cpt-cf-bss-orders-dbtable-fulfillment-control`. Add engine-owned `orders_fulfillment_control` (`bss_orders__fulfillment_control`), PK control_id,
 FK order_id; unique idempotency execution_id; immutable operation/fingerprint, expected version,
 fulfillment_attempt_id/generation, original actor/proof/fact fingerprint, exact receiver/line/
 create-key roster and digest, and created_at. Operational columns are status (prepared, awaiting,
-barrier_ready, settled, refused, abandoned), owner token/fencing generation/lease, per-receiver
-command IDs and immutable first outcomes/evidence, error classification and terminal_at. Index
+barrier_ready, settled, refused, abandoned, and the D-259 terminal superseded), owner token/fencing generation/lease, per-receiver
+command IDs and immutable first outcomes/evidence, error classification, write-once
+`supersede_evidence` (jsonb, nullable; set only with status superseded, D-259) and terminal_at. Index
 (status, lease_until, control_id) supports bounded recovery. A partial unique constraint allows
 only one nonterminal control per order; force-fail supersession is atomic under the aggregate
 lock. Engine runtime alone may INSERT and conditionally UPDATE operational columns; no input
@@ -11939,6 +12100,13 @@ failures for existing monitoring/escalation. SDK adapters, migrations and tests 
 - D-182 unknown forced exit retains uncertainty and claims; no false successful compensation.
 - Selected committed receipt/version/attempt mismatch, cross-tenant grant and reserved-only candidate refuse.
 - Supersedes exemption cannot admit multiple unbounded successors.
+- D-259 supersede-by-revoke: a pending pause control met by an unwind settles `superseded` on
+  complete revoke evidence, clears only its own pointer, settles the hold's key as
+  `fulfillment-control-superseded`, and the following `acknowledge(failed)`/`workflow-cancel` is
+  no longer `still-processing`; partial attestations, a pause fence, another generation, a
+  cancel/failure control and an unknown control refuse without effect; a settled, refused,
+  abandoned or already superseded control answers idempotently; force-fail versus supersession
+  has one winner; a superseded attempt cannot be rebuilt (D-201) or held again.
 
 Primary engineering basis: [PostgreSQL row locking](https://www.postgresql.org/docs/current/explicit-locking.html)
 and [serializable isolation](https://www.postgresql.org/docs/current/transaction-iso.html) provide local
@@ -12002,6 +12170,51 @@ Pending evidence for the configured production scopes:
 - [ ] Pricing receipt, customer consent and policy approval are independently required where applicable; amendment invalidates old-version consent/verdicts.
 - [ ] Lost/pending payment replies recover the same request across restart; failure, outage and pending never collapse, and amounts are independently sourced.
 - [ ] Workflow amendment reapproval, committed spawn-signal recovery, exact current-version line roster, overdue handling and superseded-work cancellation pass actual-provider integration.
+
+#### Stage 4 readiness register (S4-12, D-258)
+
+One row per Stage 4 operation, at `0ba8d857b` and its successors on `bss/orders-stage4` (re-pinned 2026-11-02; first pinned at `44aa09ef3`, 2026-10-29). "Missing" means no provider
+SDK or runtime exists in this repository; a double named here is a test or development double
+and is **never** evidence. Every gate stays unchecked: no row is passed because its double works.
+Scope: *production* (mounted in every build), *development* (`gate-dev-stubs` feature **and**
+`gate.dev_stubs`, D-235), *engine-only* (no route; driven through the Stage 5 seam driver
+`infra::fulfillment::begin_fulfillment` in tests, D-257 item 9).
+
+| Operation | Providers: SDK revision or missing | Double used | Principal / grants | Evidence (identity, freshness) | Enabled scope | Gate |
+|---|---|---|---|---|---|---|
+| Amend (`amend`, D-254) | Pricing `bss-pricing-sdk` (in-repo, same revision); Account Management payer profile: missing; Contracts: missing; Subscriptions occupancy/overlap: missing; Rating evaluation: missing; PDP: platform `authz-resolver-sdk` (no deployed policy verified) | Development gate stubs over `gate.dev_stub_fixture` (`infra/gate/stubs.rs`); Pricing development acceptance double; tests: `Scripted` acceptance wrapper, the gear-local `FakePdp` (D-248) | Caller `order × amend` on the target; the proposed payer through the proposed-arrangement decision (D-215); Pricing commands under the configured `gate.commercial_identities[]` client | In-crate PostgreSQL `infra/storage/tests/amend.rs`, `stage4.rs`; no real-provider run | development | [ ] |
+| Record acceptance (`record_acceptance`, D-256) | Contracts `acceptance_required`: missing; policy-election store: Orders-owned (D-251); PDP as above | Development contract stub (`ContractsStub`); outside the development build the fail-closed `ContractsUnavailable` | Resource-tenant user with `acceptance × record`; the recording-party bar on stored version actors. The bar stops only role actors (creator, submitter, amender), so production PDP policy **must** restrict `acceptance × record` to resource-tenant members (D-256 item 10); the e2e rule `e2e-partner-acceptance` is intentionally over-broad to exercise the bar | `infra/storage/tests/acceptance.rs`, `signals.rs`; no real-provider run | development | [ ] |
+| History reads (`list_versions`, `get_version`, `get_acceptance`, D-255) | None (stored rows only); PDP as above | None | `order × read` on the current parent | `infra/storage/tests/history.rs`; p95 < 200 ms at 20 versions unmeasured (S6-06) | production | [ ] PDP policy and latency evidence |
+| Administrative edit (`patch_order`, `patch_line` admin fields, S4-05) | None; PDP as above; audit minimization key (D-204) | None | `order × edit` | `infra/storage/tests/administrative.rs`, `signals.rs` | production | [ ] PDP policy evidence |
+| Begin-fulfillment guard (row 11, D-257) | Payments authorization: missing (Workflow presents the outcome; Lifecycle has no payment port); Contracts `acceptance_required`: missing; Orders Workflow runtime: missing (specification only); policy-election store: Orders-owned | Development contract stub; S5-04 binding-deadline guard bound passing (`deadline_double`); approval reflection by owner SQL (`approve`) | Configured Workflow service principal with `order × begin-fulfillment` restricted to finite order ids (D-182, D-226) | `infra/storage/tests/fulfillment.rs`, `signals.rs`; no route | engine-only | [ ] |
+
+**Production scope (S4-12).** Provision-then-collect only. Not implemented here: checkout
+capture, strong customer authentication, alternate-instrument reauthorization UI,
+refund/chargeback and credit scoring. A declined authorization leaves the order `approved`
+(`authorization-failed`) for manual remediation with bounded expiry; there is no new payment
+state. Partner-placed scope requires a customer acceptance surface (Q-30). A promoted seller
+election `acceptance_required: false` helps only orders whose referenced contract is silent on
+acceptance or that reference no contract: a contract's stated `acceptance_required` decides
+before any election (`RequirementResolver::requirement_for`, D-252, D-256 item 5), so a
+contract-bound order whose contract requires acceptance still needs the surface. There is no
+automatic scope downgrade.
+The four Stage 4 DoDs stay open until real providers exist; the operations are locally complete
+with doubles, not production-ready.
+**Production prerequisites not done in Stage 4 (D-266).** Before submit or amendment is
+delivered to production, the self-service consent election read must move ahead of the Pricing
+holds and the `FrozenOrder` decoder must stop being strict (D-252 item 9). The amended-`submitted`
+dwell signal against Workflow's reflection lead time is Stage 5's. The D-258 alert thresholds stay
+documentation baselines until ratified (S4-12), so the four DoDs above stay open.
+
+**Workflow asks folded into Stage 4 (D-259…D-261).** The D-259 and D-261 rows are design only:
+no code, migration, route or test exists for them, and none is in any enabled scope. The D-260
+row is implemented (2026-11-02, with D-262 and D-263).
+
+| Change | Workflow ask (Workflow decision) | Lifecycle decision and contract | Code follow-up | Gate |
+|---|---|---|---|---|
+| `supersede_fulfillment_control` internal IdempotentWrite, `superseded` control status, four reasons | `…-upreq-lifecycle-control-supersede-by-revoke` (Workflow D-248) | D-259, [06 supersede-by-revoke](#contract-06-supersede-fulfillment-control) | SDK operation and types; engine writer, guards and pointer clear; migration (status value, `supersede_evidence`); reasons; D-201 guard; tests | [ ] designed, not implemented |
+| `OrderVersionView.actors` (creator, submitter, amender with actor tenants) | `…-upreq-lifecycle-version-actors` (Workflow D-267) | D-260, [Workflow SDK contract](#orders-workflow-sdk-version-actors) | SDK DTO member; role-row reads in `get_version` composition; tests; no migration | [x] implemented 2026-11-02 (Task C1; D-262 metadata and header, D-263 `admin` with it) |
+| `OrderView.order.pre_hold_state` | `…-upreq-lifecycle-order-read-pre-hold-state` (Workflow D-255) | D-261, [Workflow SDK contract](#orders-workflow-sdk-pre-hold-state) | SDK header member; read projection; tests; no migration | [ ] designed, not implemented |
 
 BSS Approvals may serve a UI source adapter after the order owner contracts exist; its present
 Pricing/Products inbox does not supply order policy. Reciprocal Workflow amendments remain

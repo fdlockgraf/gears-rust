@@ -9,7 +9,7 @@
 //! `gate-dev-stubs`. In-crate: runs in the `orders-pg` CI lane with `gate-dev-stubs`.
 use super::capture::{BUYER, T, buyer, create_meta, key, s, view, write};
 use super::*;
-use crate::authz::test_pdp::{FakePdp, Grant, service, user};
+use crate::authz::test_pdp::{FakePdp, Grant, service, user, with_proof};
 use crate::authz::{Action, Caller};
 use crate::domain::dates::{
     DateBasis, DatePolicySnapshot, PLATFORM_DEFAULT_POLICY_ID, PolicyRow, SuppliedDates,
@@ -30,7 +30,7 @@ use crate::infra::gate::preview::PreviewDates;
 use crate::infra::gate::stubs::{SellabilityStub, StubBindings, StubFixture};
 use crate::infra::gate::submit::SubmitService;
 use crate::infra::gate::tests::orchestrate::{
-    Catalog, Harness, ITEM, PAYER, PLAN, REVISION, fixture, harness,
+    CONTRACT, Catalog, Harness, ITEM, PAYER, PLAN, REVISION, fixture, harness,
 };
 use crate::infra::read::ReadService;
 use crate::infra::storage::entity::commercial_attempt;
@@ -62,10 +62,12 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbTx;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
-const RESOURCE: u128 = 10;
-const SELLER: u128 = 20;
+pub(super) const RESOURCE: u128 = 10;
+pub(super) const SELLER: u128 = 20;
 /// The seller's configured Orders service principal (D-194).
 const SERVICE: (u128, u128) = (700, 701);
+/// The configured Workflow service principal (`capture::identities`).
+pub(super) const WORKFLOW: (u128, u128) = (106, 99);
 /// A principal no rule names.
 const STRANGER: (u128, u128) = (104, 10);
 
@@ -77,6 +79,7 @@ fn policy_with(submit: bool) -> Arc<FakePdp> {
         Action::OrderWrite,
         Action::OrderEdit,
         Action::OrderRead,
+        Action::OrderAmend,
     ];
     if submit {
         actions.push(Action::OrderSubmit);
@@ -125,10 +128,13 @@ impl AuthZResolverApi for Revocable {
 }
 
 /// The frozen basis over the platform default (no date required), on today's UTC date, so the
-/// engine's date-basis guard sees the proposed date it transitions on.
+/// engine's date-basis guard sees the proposed date it transitions on. With `yesterday` set the
+/// basis is prepared on the previous UTC day: a preparation that ran before a UTC midnight the
+/// commit falls after (the clock the date preparer would have read, injected).
 #[derive(Default)]
-struct TodayDates {
-    prepared: AtomicUsize,
+pub(super) struct TodayDates {
+    pub(super) prepared: AtomicUsize,
+    pub(super) yesterday: AtomicBool,
 }
 #[async_trait]
 impl PreviewDates for TodayDates {
@@ -147,14 +153,24 @@ impl PreviewDates for TodayDates {
         };
         let policy = DatePolicySnapshot::effective(resource_tenant_id, &[row])?;
         let today = OffsetDateTime::now_utc().date();
-        Ok(DateBasis::resolve(resource_tenant_id, policy, today, lines))
+        let proposed = if self.yesterday.load(Ordering::SeqCst) {
+            today.previous_day().unwrap()
+        } else {
+            today
+        };
+        Ok(DateBasis::resolve(
+            resource_tenant_id,
+            policy,
+            proposed,
+            lines,
+        ))
     }
 }
 
 /// The seller's service principal, counted.
 #[derive(Default)]
-struct Authority {
-    calls: AtomicUsize,
+pub(super) struct Authority {
+    pub(super) calls: AtomicUsize,
     rotated: AtomicBool,
     /// The exchange never answers (a hung `IdP`).
     stall: AtomicBool,
@@ -181,16 +197,38 @@ impl CommercialAuthority for Authority {
 
 /// The harness catalog's bindings: what the double accepts on.
 #[derive(Default)]
-struct FixedBindings {
+pub(super) struct FixedBindings {
     kinds: Mutex<BTreeMap<Uuid, bss_pricing_sdk::read::ChargeKind>>,
     multikey: bool,
+    /// The second item is answered only on a line that selects it (`0x21`): a line selecting
+    /// the fixture's item alone has one overlap scope, a line selecting both has two.
+    by_selection: bool,
     /// When set, every binding's SKU name (an oversized pin).
     sku_name: Option<String>,
 }
 impl FixedBindings {
-    fn answer(&self, line: Uuid) -> crate::domain::gate::pricing_map::CatalogAnswer {
+    /// Bindings answering a second item on every line (two overlap scopes).
+    pub(super) fn multikey() -> Arc<Self> {
+        Arc::new(Self {
+            multikey: true,
+            ..Default::default()
+        })
+    }
+    /// Bindings answering the second item (and its overlap scope) only on the lines that select
+    /// it, so lines of one order can hold different overlap scopes.
+    pub(super) fn by_selection() -> Arc<Self> {
+        Arc::new(Self {
+            by_selection: true,
+            ..Default::default()
+        })
+    }
+    /// Whether a line selecting `items` is answered the second item.
+    fn second(&self, mut items: impl Iterator<Item = Uuid>) -> bool {
+        self.multikey || (self.by_selection && items.any(|item| item == u(0x21)))
+    }
+    fn answer(&self, line: Uuid, second: bool) -> crate::domain::gate::pricing_map::CatalogAnswer {
         let mut answer = Catalog::answer();
-        if self.multikey {
+        if second {
             let resolved = Arc::make_mut(answer.resolved.as_mut().unwrap());
             let mut second = resolved.cells[0].clone();
             second.selection.item_id = u(0x21);
@@ -252,7 +290,10 @@ impl crate::infra::gate::pricing_read::CatalogReads for FixedBindings {
         _run: &crate::infra::gate::budget::RunBudget,
         _cancel: &CancellationToken,
     ) -> crate::domain::gate::pricing_map::CatalogAnswer {
-        self.answer(req.line_id)
+        self.answer(
+            req.line_id,
+            self.second(req.items.iter().map(|item| item.item_id)),
+        )
     }
 }
 #[async_trait]
@@ -262,27 +303,31 @@ impl StubBindings for FixedBindings {
         _ctx: &SecurityContext,
         query: &NewSaleQuery,
     ) -> Result<ResolvedBindings, CanonicalError> {
-        self.answer(query.line_id)
-            .resolved
-            .map(|rb| ResolvedBindings::clone(&rb))
-            .map_err(|_| CanonicalError::service_unavailable().create())
+        self.answer(
+            query.line_id,
+            self.second(query.selections.iter().map(|item| item.item_id)),
+        )
+        .resolved
+        .map(|rb| ResolvedBindings::clone(&rb))
+        .map_err(|_| CanonicalError::service_unavailable().create())
     }
 }
 
 /// The development double behind a script: per-line refusals, lost replies (the double issues
 /// and records its receipt, then the reply is lost), an already lapsed receipt, and a hook run
 /// on every call. Every call is counted with its command key.
-struct Scripted {
+pub(super) struct Scripted {
     stub: SellabilityStub,
     bindings: Arc<FixedBindings>,
     calls: Mutex<Vec<(String, Uuid)>>,
-    refuse: Mutex<BTreeMap<Uuid, CommercialReason>>,
-    lose_replies: AtomicUsize,
-    lapsed: AtomicBool,
-    on_call: Mutex<Option<OnCall>>,
+    pub(super) refuse: Mutex<BTreeMap<Uuid, CommercialReason>>,
+    pub(super) lose_replies: AtomicUsize,
+    pub(super) lapsed: AtomicBool,
+    /// Run on every call with the running call count, outside every lock of the double.
+    pub(super) on_call: Mutex<Option<OnCall>>,
 }
 /// A hook run with the call number on every scripted acceptance call.
-type OnCall = Box<dyn Fn(usize) + Send + Sync>;
+pub(super) type OnCall = Arc<dyn Fn(usize) + Send + Sync>;
 impl Scripted {
     fn new(bindings: Arc<FixedBindings>) -> Arc<Self> {
         Arc::new(Self {
@@ -295,10 +340,10 @@ impl Scripted {
             on_call: Mutex::new(None),
         })
     }
-    fn calls(&self) -> usize {
+    pub(super) fn calls(&self) -> usize {
         self.calls.lock().len()
     }
-    fn keys(&self) -> Vec<String> {
+    pub(super) fn keys(&self) -> Vec<String> {
         self.calls.lock().iter().map(|(k, _)| k.clone()).collect()
     }
 }
@@ -315,7 +360,8 @@ impl SellabilityV1 for Scripted {
             calls.push((meta.idempotency_key.clone(), query.line_id));
             calls.len()
         };
-        if let Some(hook) = self.on_call.lock().as_ref() {
+        let hook = self.on_call.lock().clone();
+        if let Some(hook) = hook {
             hook(n);
         }
         if let Some(reason) = self.refuse.lock().get(&query.line_id) {
@@ -352,22 +398,25 @@ impl SellabilityV1 for Scripted {
     }
 }
 
-struct Fixture {
-    t: T,
-    capture: CaptureService,
+pub(super) struct Fixture {
+    pub(super) t: T,
+    pub(super) capture: CaptureService,
     submit: SubmitService,
-    h: Harness,
-    dates: Arc<TodayDates>,
-    authority: Arc<Authority>,
+    pub(super) h: Harness,
+    pub(super) dates: Arc<TodayDates>,
+    pub(super) authority: Arc<Authority>,
     pdp: Arc<Revocable>,
-    acceptance: Arc<Scripted>,
-    engine: Arc<Engine>,
+    pub(super) acceptance: Arc<Scripted>,
+    pub(super) engine: Arc<Engine>,
 }
 
 // Multi-line commercial scenarios intentionally admit both lines on the fixture's shared SKU.
 // Cardinality refusal itself remains covered by the dedicated gate/overlap tests.
-fn two_line_fixture() -> StubFixture {
-    let mut f = fixture();
+pub(super) fn two_line_fixture() -> StubFixture {
+    admit_two(fixture())
+}
+/// `f` with its occupancy limit raised to two, so two lines on the fixture's one SKU are admitted.
+pub(super) fn admit_two(mut f: StubFixture) -> StubFixture {
     for occupancy in f.occupancy.values_mut() {
         let crate::domain::gate::answers::OccupancyObservation::LegacyActiveV1(occupancy) =
             occupancy
@@ -386,11 +435,11 @@ async fn setup(stubs: StubFixture, per_minute: u32) -> Fixture {
 }
 
 /// The service over a fresh container; `bound` binds the scripted acceptance double.
-async fn setup_with(stubs: StubFixture, per_minute: u32, bound: bool) -> Fixture {
+pub(super) async fn setup_with(stubs: StubFixture, per_minute: u32, bound: bool) -> Fixture {
     setup_with_bindings(stubs, per_minute, bound, None).await
 }
 
-async fn setup_with_bindings(
+pub(super) async fn setup_with_bindings(
     stubs: StubFixture,
     per_minute: u32,
     bound: bool,
@@ -429,6 +478,7 @@ async fn setup_with_bindings(
         limiter,
         200,
     )
+    .with_policy_store(t.env.db.clone())
     .with_acceptance(bound.then_some(port));
     Fixture {
         t,
@@ -443,8 +493,15 @@ async fn setup_with_bindings(
     }
 }
 
+impl Fixture {
+    /// The fixture's policy fake (buyer grants), for a test that wraps it.
+    pub(super) fn pdp(&self) -> Arc<dyn AuthZResolverApi> {
+        self.pdp.clone()
+    }
+}
+
 /// The same service with the scripted double bound (a later process after a crash).
-fn rebind(f: &Fixture) -> SubmitService {
+pub(super) fn rebind(f: &Fixture) -> SubmitService {
     let port: Arc<dyn SellabilityV1> = f.acceptance.clone();
     SubmitService::new(
         Arc::new(ArcSwapOption::from(Some(Arc::clone(&f.engine)))),
@@ -461,11 +518,12 @@ fn rebind(f: &Fixture) -> SubmitService {
         ),
         200,
     )
+    .with_policy_store(f.t.env.db.clone())
     .with_acceptance(Some(port))
 }
 
 /// The same service over `engine` (a fault-injecting one), with the scripted double bound.
-fn service_over(f: &Fixture, engine: Engine) -> SubmitService {
+pub(super) fn service_over(f: &Fixture, engine: Engine) -> SubmitService {
     let port: Arc<dyn SellabilityV1> = f.acceptance.clone();
     SubmitService::new(
         Arc::new(ArcSwapOption::from(Some(Arc::new(engine)))),
@@ -482,13 +540,48 @@ fn service_over(f: &Fixture, engine: Engine) -> SubmitService {
         ),
         200,
     )
+    .with_policy_store(f.t.env.db.clone())
+    .with_acceptance(Some(port))
+}
+
+/// The same service over a gate whose ports `replace` substitutes after the fixture's counted
+/// stubs are bound (an outage: `gate::unavailable`), sharing the fixture's engine, dates,
+/// authority and Pricing double.
+pub(super) fn service_with_ports(
+    f: &Fixture,
+    stubs: StubFixture,
+    replace: impl FnOnce(&mut crate::infra::gate::GatePorts),
+) -> SubmitService {
+    let h = crate::infra::gate::tests::orchestrate::harness_with(
+        stubs,
+        false,
+        Arc::new(crate::infra::gate::budget::Budget::baseline()),
+        replace,
+    );
+    let port: Arc<dyn SellabilityV1> = f.acceptance.clone();
+    SubmitService::new(
+        Arc::new(ArcSwapOption::from(Some(Arc::clone(&f.engine)))),
+        Arc::new(f.t.reads_with(f.pdp.clone())),
+        h.orchestrator,
+        f.dates.clone(),
+        f.authority.clone(),
+        PerCallerLimiter::new(
+            CallerLimiter::Submit,
+            CallerLimitSettings {
+                per_minute: NonZeroU32::new(60).unwrap(),
+                max_keys: 100,
+            },
+        ),
+        200,
+    )
+    .with_policy_store(f.t.env.db.clone())
     .with_acceptance(Some(port))
 }
 
 /// Fails the commit at one named persistence boundary (`FaultPoint`), every time it is reached.
-struct FailAt {
-    point: FaultPoint,
-    hits: AtomicUsize,
+pub(super) struct FailAt {
+    pub(super) point: FaultPoint,
+    pub(super) hits: AtomicUsize,
 }
 #[async_trait]
 impl FaultHook for FailAt {
@@ -561,7 +654,7 @@ async fn accepted_result(f: &Fixture, attempt: &commercial_attempt::Model) -> (S
 }
 
 /// Committed version numbers of `order`, ascending, with their `supersedes_version`.
-async fn versions(f: &Fixture, order: Uuid) -> Value {
+pub(super) async fn versions(f: &Fixture, order: Uuid) -> Value {
     f.t.json(&format!(
         "SELECT coalesce(jsonb_agg(jsonb_build_array(version, supersedes_version) \
          ORDER BY version), '[]'::jsonb) AS j FROM bss_orders__order_version \
@@ -571,7 +664,7 @@ async fn versions(f: &Fixture, order: Uuid) -> Value {
 }
 
 /// A rolling monthly line on the fixture's plan revision.
-fn line() -> AddLine {
+pub(super) fn line() -> AddLine {
     AddLine {
         plan_id: PLAN,
         plan_revision_id: REVISION,
@@ -590,16 +683,31 @@ fn line() -> AddLine {
 }
 
 /// A draft of `lines` lines (draft revision = `lines`), as the buyer; `tag` keeps keys distinct.
-async fn draft_tagged(f: &Fixture, lines: usize, tag: &str) -> OrderView {
+pub(super) async fn draft_tagged(f: &Fixture, lines: usize, tag: &str) -> OrderView {
     draft_tagged_items(f, lines, tag, false).await
 }
-async fn draft_tagged_items(f: &Fixture, lines: usize, tag: &str, multikey: bool) -> OrderView {
+pub(super) async fn draft_tagged_items(
+    f: &Fixture,
+    lines: usize,
+    tag: &str,
+    multikey: bool,
+) -> OrderView {
+    draft_on(f, lines, tag, multikey, None).await
+}
+/// [`draft_tagged_items`] on `contract`.
+async fn draft_on(
+    f: &Fixture,
+    lines: usize,
+    tag: &str,
+    multikey: bool,
+    contract: Option<Uuid>,
+) -> OrderView {
     let order = CreateOrder {
         resource_tenant_id: u(RESOURCE),
         payer_tenant_id: PAYER,
         seller_tenant_id: u(SELLER),
         category: Category::NewSale,
-        contract_id: None,
+        contract_id: contract,
     };
     let created = view(
         f.capture
@@ -628,7 +736,7 @@ async fn draft_tagged_items(f: &Fixture, lines: usize, tag: &str, multikey: bool
     }
     f.t.reads().get(&buyer(), id).await.unwrap()
 }
-async fn draft(f: &Fixture, lines: usize) -> OrderView {
+pub(super) async fn draft(f: &Fixture, lines: usize) -> OrderView {
     draft_tagged(f, lines, "m26").await
 }
 
@@ -641,7 +749,7 @@ fn meta(text: &str) -> CallMeta {
     }
 }
 
-async fn submit_with(
+pub(super) async fn submit_with(
     svc: &SubmitService,
     caller: &Caller,
     v: &OrderView,
@@ -660,7 +768,7 @@ async fn submit_with(
     .await
     .map_err(OrdersError::from)
 }
-async fn submit(
+pub(super) async fn submit(
     f: &Fixture,
     caller: &Caller,
     v: &OrderView,
@@ -669,7 +777,7 @@ async fn submit(
     submit_with(&f.submit, caller, v, text).await
 }
 
-async fn attempts(f: &Fixture, order: Uuid) -> i64 {
+pub(super) async fn attempts(f: &Fixture, order: Uuid) -> i64 {
     f.t.n(&format!(
         "SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE order_id='{order}'"
     ))
@@ -681,14 +789,14 @@ async fn attempt_status(f: &Fixture, order: Uuid) -> Value {
     ))
     .await
 }
-async fn high_water(f: &Fixture, order: Uuid) -> i64 {
+pub(super) async fn high_water(f: &Fixture, order: Uuid) -> i64 {
     f.t.n(&format!(
         "SELECT version_allocation_high_water::bigint AS n FROM bss_orders__order WHERE order_id='{order}'"
     ))
     .await
 }
 /// Committed versions, line rows, pinned lines and totals rows of `order`.
-async fn committed(f: &Fixture, order: Uuid) -> (i64, i64, i64, i64) {
+pub(super) async fn committed(f: &Fixture, order: Uuid) -> (i64, i64, i64, i64) {
     let n = async |sql: String| f.t.n(&sql).await;
     (
         n(format!(
@@ -710,7 +818,7 @@ async fn committed(f: &Fixture, order: Uuid) -> (i64, i64, i64, i64) {
     )
 }
 /// Lapse the lease of every in-flight marker and attempt of `order` (a crashed owner).
-async fn lapse_leases(f: &Fixture, order: Uuid) {
+pub(super) async fn lapse_leases(f: &Fixture, order: Uuid) {
     f.t.env
         .pg
         .sql(&format!(
@@ -1412,7 +1520,7 @@ async fn revoked_authority_before_the_commit_records_the_denial_and_commits_noth
     let v = draft(&f, 1).await;
     let order = v.order.order_id;
     let pdp = Arc::clone(&f.pdp);
-    *f.acceptance.on_call.lock() = Some(Box::new(move |_| pdp.revoke()));
+    *f.acceptance.on_call.lock() = Some(Arc::new(move |_| pdp.revoke()));
     let answer = submit(&f, &buyer(), &v, "m26-revoked").await.unwrap_err();
     // The buyer still reads the order, so the denial names the operation, not the order.
     assert!(
@@ -1827,7 +1935,8 @@ async fn a_reclaimed_attempt_fences_out_the_old_owner_and_the_new_owner_complete
         ReceiptOutcome::Recorded(Recorded::New)
     );
     // The old owner's commit is refused under the new owner's live lease; nothing commits.
-    let preparation = SubmitPreparation::for_attempt(&attempt, 200).unwrap();
+    let preparation =
+        SubmitPreparation::for_attempt(&attempt, 200, Some(f.t.env.db.clone())).unwrap();
     let refused = f
         .engine
         .transition(
@@ -2439,7 +2548,7 @@ async fn explicit_components_and_non_recurring_tcv_carriers_commit_on_postgres()
     }
 }
 
-fn multikey_fixture() -> StubFixture {
+pub(super) fn multikey_fixture() -> StubFixture {
     let mut fixture = fixture();
     let mut classification = fixture
         .item_classifications
@@ -3037,4 +3146,301 @@ async fn sdk_preview_and_submit_refuse_a_credential_bearing_proof_before_the_pdp
     assert_eq!(f.pdp.evaluations.load(Ordering::SeqCst), 0, "no PDP call");
     assert_eq!(*f.h.calls.read_lines.lock(), 0);
     assert_eq!(f.dates.prepared.load(Ordering::SeqCst), 0);
+}
+
+// ---- S4-08a: automatic consent on a self-service submit (D-146, D-252) ----
+
+/// The fixture with the referenced contract's `acceptance_required` stated as `required`.
+pub(super) fn contract_fixture(required: Option<bool>) -> StubFixture {
+    let mut stubs = fixture();
+    stubs
+        .contracts
+        .get_mut(&CONTRACT)
+        .expect("the example fixture states the contract")
+        .acceptance_required = required;
+    stubs
+}
+
+/// Every acceptance row of `order`, ascending by version.
+pub(super) async fn acceptances(f: &Fixture, order: Uuid) -> Value {
+    f.t.json(&format!(
+        "SELECT coalesce(jsonb_agg(jsonb_build_object('version', accepted_version, \
+         'accepted_at', accepted_at, 'recorded_by', recorded_by, 'path', recording_path, \
+         'source', requirement_source) ORDER BY accepted_version), '[]'::jsonb) AS j \
+         FROM bss_orders__acceptance WHERE order_id='{order}'"
+    ))
+    .await
+}
+
+/// The `data` of the newest outbox event.
+pub(super) async fn last_event(f: &Fixture) -> Value {
+    let envelope =
+        f.t.json(
+            "SELECT convert_from(payload, 'UTF8')::jsonb AS j FROM toolkit_outbox_body \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .await;
+    envelope["data"].clone()
+}
+
+/// The engine's transition instant of the committed `version` (the version row's `created_at`,
+/// also the order's `state_entered_at`), as stored.
+pub(super) async fn transition_instant(f: &Fixture, order: Uuid, version: i64) -> Value {
+    let t =
+        f.t.json(&format!(
+            "SELECT to_jsonb(v.created_at) AS j FROM bss_orders__order_version v \
+             WHERE order_id='{order}' AND version={version}"
+        ))
+        .await;
+    assert_eq!(
+        t,
+        f.t.json(&format!(
+            "SELECT to_jsonb(state_entered_at) AS j FROM bss_orders__order WHERE order_id='{order}'"
+        ))
+        .await
+    );
+    t
+}
+
+/// Store an `acceptance_required` election (the policy channel's write, as the admin).
+pub(super) async fn elect(f: &Fixture, seller: Option<Uuid>, elected: bool) {
+    let (scope, scope_id) = match seller {
+        Some(id) => ("seller", format!("'{id}'")),
+        None => ("platform", "NULL".to_owned()),
+    };
+    f.t.env
+        .pg
+        .sql(&format!(
+            "INSERT INTO bss_orders__policy_election VALUES('{}','acceptance_required','{scope}',\
+             {scope_id},{elected},'test',clock_timestamp())",
+            Uuid::new_v4()
+        ))
+        .await
+        .unwrap();
+}
+
+/// D-146/S4-08a: a customer submitting its own order without a delegation proof consents to the
+/// version the submit actually commits (sparse after a burned candidate), in the same engine
+/// transaction: `self_service`, recorded by the trusted subject, at the engine's transition
+/// time, sourced from the live contract. Only `OrderSubmitted` is emitted, carrying the
+/// acceptance.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn self_service_submit_records_consent_on_the_committed_sparse_version() {
+    let f = setup_with(contract_fixture(Some(true)), 10, true).await;
+    let v = draft_on(&f, 1, "s408-sparse", false, Some(CONTRACT)).await;
+    let order = v.order.order_id;
+    let line_id = v.lines[0].line_id;
+    f.acceptance
+        .refuse
+        .lock()
+        .insert(line_id, CommercialReason::NotSellable);
+    let burned = submit(&f, &buyer(), &v, "s408-sparse-1").await.unwrap();
+    assert_eq!(
+        burned.outcome,
+        SettledOutcome::Refused(Some(Reason::CatalogPredicateFailed))
+    );
+    assert_eq!(acceptances(&f, order).await, json!([]));
+    f.acceptance.refuse.lock().clear();
+    let outbox = f.t.outbox().await;
+    let settled = submit(&f, &buyer(), &v, "s408-sparse-2").await.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(settled.response.body()["version"], json!(3));
+    assert_eq!(versions(&f, order).await, json!([[1, null], [3, 1]]));
+    let t = transition_instant(&f, order, 3).await;
+    assert_eq!(
+        acceptances(&f, order).await,
+        json!([{"version": 3, "accepted_at": t, "recorded_by": u(BUYER.0).to_string(),
+                "path": "self_service", "source": "contract"}])
+    );
+    assert_eq!(f.t.outbox().await, outbox + 1, "exactly one event");
+    let event = last_event(&f).await;
+    assert_eq!(event["acceptance"]["acceptedVersion"], json!(3), "{event}");
+    let accepted_at = OffsetDateTime::parse(
+        event["acceptance"]["acceptedAt"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let stored = OffsetDateTime::parse(
+        t.as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(accepted_at, stored, "the event carries the stored instant");
+}
+
+/// A contract that does not state the requirement falls through to the elections: the seller's
+/// election, then the platform's, then unset = required (`platform_default`); a consent nothing
+/// requires is `volunteered`. A contract stating `false` beats a seller election requiring it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn consent_source_follows_contract_then_seller_then_platform() {
+    // Each case on its own order of a fresh store: one in-flight order per overlap key.
+    let source = async |elections: &[(Option<Uuid>, bool)], contract: Option<Uuid>| {
+        let f = setup_with(contract_fixture(Some(false)), 10, true).await;
+        for (seller, elected) in elections {
+            elect(&f, *seller, *elected).await;
+        }
+        let v = draft_on(&f, 1, "s408-source", false, contract).await;
+        let settled = submit(&f, &buyer(), &v, "s408-source").await.unwrap();
+        assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+        acceptances(&f, v.order.order_id).await[0]["source"].clone()
+    };
+    let seller = Some(u(SELLER));
+    assert_eq!(source(&[], None).await, json!("platform_default"));
+    assert_eq!(
+        source(&[(None, true)], None).await,
+        json!("platform_default")
+    );
+    assert_eq!(source(&[(None, false)], None).await, json!("volunteered"));
+    assert_eq!(
+        source(&[(None, false), (seller, true)], None).await,
+        json!("seller")
+    );
+    assert_eq!(
+        source(&[(None, true), (seller, false)], None).await,
+        json!("volunteered")
+    );
+    assert_eq!(
+        source(&[(seller, true)], Some(CONTRACT)).await,
+        json!("volunteered"),
+        "the live contract decides before the seller"
+    );
+}
+
+/// A delegation proof on an own-tenant request suppresses automatic consent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delegated_submit_records_no_consent() {
+    let f = setup_with(fixture(), 10, true).await;
+    let v = draft(&f, 1).await;
+    let order = v.order.order_id;
+    let outbox = f.t.outbox().await;
+    let settled = submit(&f, &with_proof(&buyer(), "proof-1"), &v, "s408-proof")
+        .await
+        .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(acceptances(&f, order).await, json!([]));
+    assert_eq!(f.t.outbox().await, outbox + 1);
+    let event = last_event(&f).await;
+    assert!(event["lines"].is_array(), "{event}");
+    assert!(event.get("acceptance").is_none(), "{event}");
+}
+
+/// A subject of another tenant (a partner) submitting never consents for the customer.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn partner_submit_records_no_consent() {
+    let f = setup_with(fixture(), 10, true).await;
+    let v = draft(&f, 1).await;
+    let order = v.order.order_id;
+    let outbox = f.t.outbox().await;
+    let partner = user(BUYER.0, 11);
+    let settled = submit(&f, &partner, &v, "s408-partner").await.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(acceptances(&f, order).await, json!([]));
+    assert_eq!(f.t.outbox().await, outbox + 1);
+    let event = last_event(&f).await;
+    assert!(event["lines"].is_array(), "{event}");
+    assert!(event.get("acceptance").is_none(), "{event}");
+}
+
+/// A same-key replay returns the stored commit: no second consent, no second event.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn replayed_submit_does_not_duplicate_consent() {
+    let f = setup_with(fixture(), 10, true).await;
+    let v = draft(&f, 1).await;
+    let order = v.order.order_id;
+    let outbox = f.t.outbox().await;
+    let settled = submit(&f, &buyer(), &v, "s408-replay").await.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    let recorded = acceptances(&f, order).await;
+    assert_eq!(recorded.as_array().unwrap().len(), 1);
+    let replay = submit(&f, &buyer(), &v, "s408-replay").await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.response, settled.response);
+    assert_eq!(acceptances(&f, order).await, recorded);
+    assert_eq!(f.t.outbox().await, outbox + 1);
+}
+
+/// A failed election read is `unavailable`, never a default: nothing commits, no consent, no
+/// event, the attempt stays reserved; once the store answers, the same-key retry commits with
+/// the consent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn policy_read_failure_refuses_submit_as_unavailable() {
+    let f = setup_with(fixture(), 10, true).await;
+    let v = draft(&f, 1).await;
+    let order = v.order.order_id;
+    let outbox = f.t.outbox().await;
+    f.t.env
+        .pg
+        .sql("REVOKE SELECT ON bss_orders__policy_election FROM bss_orders_runtime")
+        .await
+        .unwrap();
+    let answer = submit(&f, &buyer(), &v, "s408-policy-down")
+        .await
+        .unwrap_err();
+    assert!(matches!(answer, OrdersError::Unavailable), "{answer:?}");
+    assert_eq!(committed(&f, order).await, (1, 0, 0, 0));
+    assert_eq!(acceptances(&f, order).await, json!([]));
+    assert_eq!(f.t.outbox().await, outbox);
+    assert_ne!(attempt_status(&f, order).await, json!("committed"));
+    f.t.env
+        .pg
+        .sql("GRANT SELECT ON bss_orders__policy_election TO bss_orders_runtime")
+        .await
+        .unwrap();
+    lapse_leases(&f, order).await;
+    let settled = submit(&f, &buyer(), &v, "s408-policy-down").await.unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(
+        acceptances(&f, order).await[0]["source"],
+        json!("platform_default")
+    );
+    assert_eq!(f.t.outbox().await, outbox + 1);
+}
+
+/// D-188 recovery: an attempt reserved by one process and continued by another through
+/// `recover_commercial_attempt` records the consent from the frozen attempt (principal, proof
+/// and the contract's requirement), without re-running the gate.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn recovered_attempt_records_the_same_consent() {
+    let f = setup(contract_fixture(Some(true)), 10).await;
+    let v = draft_on(&f, 1, "s408-recover", false, Some(CONTRACT)).await;
+    let order = v.order.order_id;
+    let candidate = high_water(&f, order).await + 1;
+    let answer = submit(&f, &buyer(), &v, "s408-recover").await.unwrap_err();
+    assert!(matches!(answer, OrdersError::Unavailable), "{answer:?}");
+    assert_eq!(attempt_status(&f, order).await, json!("prepared"));
+    assert_eq!(
+        f.t.json(&format!(
+            "SELECT line_requests->'order'->'contract_acceptance_required' AS j \
+             FROM bss_orders__commercial_attempt WHERE order_id='{order}'"
+        ))
+        .await,
+        json!(true),
+        "the contract's requirement is frozen with the attempt"
+    );
+    let contracts = f.h.calls.of(GatePort::ContractResolution);
+    lapse_leases(&f, order).await;
+    let later = rebind(&f);
+    let settled = submit_with(&later, &buyer(), &v, "s408-recover")
+        .await
+        .unwrap();
+    assert_eq!(settled.outcome, SettledOutcome::Committed, "{settled:?}");
+    assert_eq!(f.h.calls.of(GatePort::ContractResolution), contracts);
+    let t = transition_instant(&f, order, candidate).await;
+    assert_eq!(
+        acceptances(&f, order).await,
+        json!([{"version": candidate, "accepted_at": t,
+                "recorded_by": u(BUYER.0).to_string(), "path": "self_service",
+                "source": "contract"}])
+    );
+    assert_eq!(
+        last_event(&f).await["acceptance"]["acceptedVersion"],
+        json!(candidate)
+    );
 }

@@ -64,7 +64,7 @@ Record actual buyer acceptance against an immutable commercial version and contr
 - **Dependencies**: [Foundation](01-foundation.md), [Capture](02-capture.md), [Gate and Pin](03-gate-and-pin.md).
 - **Consumer**: [Workflow Seam](06-workflow-seam.md).
 
-Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed contract acceptance SDK, Payments read-by-request contract and Workflow durable-execution prerequisites. Version-bound acceptance remains the proposed OL-26 PRD reconciliation. [DECISIONS.md](../DECISIONS.md) Q-08 (Payments limitations) and Q-30 (reachable customer acceptance) remain open, and Q-27 (unset TTL) is closed by D-181's provisional TTLs; this feature does not supply a payment system or acceptance UI.
+Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed contract acceptance SDK, Payments read-by-request contract and Workflow durable-execution prerequisites. Version-bound acceptance is stated in PRD §6.1 (OL-26, reconciled by D-250). [DECISIONS.md](../DECISIONS.md) Q-08 (Payments limitations) and Q-30 (reachable customer acceptance) remain open, and Q-27 (unset TTL) is closed by D-181's provisional TTLs; this feature does not supply a payment system or acceptance UI.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -92,13 +92,25 @@ Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_RE
 **Actor**: A resource-tenant principal authorized for `acceptance × record` and not barred by stored placing-party facts.
 
 1. [ ] Call `POST /bss-orders/v1/orders/{orderId}/acceptance` with expected version and idempotency key; the actor and instant are never accepted from caller claims.
-2. [ ] Apply Foundation boundary validation, authorization, idempotency, admissibility and version checks. Reject `draft` and terminal orders with `not-admissible`.
+2. [ ] Apply Foundation boundary validation, authorization, idempotency, admissibility and version checks. Reject `draft` and terminal orders with `not-admissible`. A present, well-formed `If-Match` that is not the current version is refused `precondition-failed` (HTTP 412, D-212), not `version-conflict`.
 3. [ ] Resolve the live requirement and recording-party inputs under §3.1–§3.2. Allow voluntary recording when policy does not require it.
 4. [ ] Contribute one append-only acceptance row and request the state-only engine transition. Atomically audit and enqueue `OrderAcceptanceRecorded` with version, instant, actor and source.
 5. [ ] Return the stored outcome. Same-key replay reuses it; an independent attempt for an already accepted version refuses `acceptance-already-recorded`.
 6. [ ] Serve `GET /orders/{orderId}/acceptance` through Read and Authorization's common wrapper under `order × read`, with access logging, showing the current version's acceptance or absence and historical records.
 
-**Success**: Both initial partner-path and renewed post-amendment acceptance can be recorded by an eligible customer. **Errors**: Missing permissions, barred recording actor, stale version, existing current-version record or unavailable policy input never manufacture acceptance.
+**Success**: Both initial partner-path and renewed post-amendment acceptance can be recorded by an eligible customer. **Errors**: Missing permissions, barred recording actor, stale version (`precondition-failed`, 412, D-212), existing current-version record or unavailable policy input never manufacture acceptance.
+
+**Implementation note (S4-08b, D-256).** Delivered in the development delivery only (D-235):
+`AcceptanceService` (`infra/acceptance.rs`) behind `POST /orders/{orderId}/acceptance` and
+`OrdersV1::record_acceptance`; steps 1 to 5 are implemented, step 6 is S4-06's read (D-255). The
+body is exactly `{}`, so a caller-supplied instant or actor is a boundary `request-invalid`. The
+recording-party bar reads the stored role versions and sales path from the engine's authorized
+snapshot and compares the engine's trusted actor reference per role (§3.2); the live requirement
+comes from the one resolver (D-252), unavailable answering `acceptance-requirement-unevaluable`.
+Whether the current version already has a consent is read under the aggregate lock, so of two
+independent recordings only one commits. One transaction writes the consent row at the engine's
+transition time, the audit entry, the settlement and one `OrderAcceptanceRecorded`; no state or
+version changes. Production delivery remains open.
 
 ### 2.3 Attempt fulfillment with a payment outcome
 
@@ -153,7 +165,20 @@ Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_RE
 2. [ ] If acceptance is required and the current version lacks its record, refuse `acceptance-required-not-recorded`.
 3. [ ] For `authorized`, admit. For defensive `pending` input, refuse `authorization-pending` without a state change.
 4. [ ] For `failed`, resolve `tolerate_authorization_failure` from seller scope then platform scope, with unset meaning false. Refuse `authorization-failed` unless elected.
-5. [ ] If elected, contribute the tolerance decision; the engine writes `authorization_failure_tolerated_at` and audits the admission under the `begin-fulfillment` transition reason. `authorization-failed-tolerated` identifies the admission risk, not a refusal or a replacement audit reason. Never clear the flag or store the authorization outcome, instrument or token as an order fact.
+5. [ ] If elected, contribute the tolerance decision; the engine writes the write-once `authorization_failure_tolerated_at` in the admitting transaction, at the same instant as the committed `begin-fulfillment` audit entry, which records the admission under the `begin-fulfillment` transition reason. That column is the audit evidence of the tolerance; a dedicated audit member is deferred to the next audit encoding version (Stage 6, D-257 item 11). `authorization-failed-tolerated` identifies the admission risk, not a refusal or a replacement audit reason. Never clear the flag or store the authorization outcome, instrument or token as an order fact.
+
+**Implementation note (S4-10, D-257).** Steps 1 to 5 are implemented as row 11's preparation,
+`BeginFulfillmentPreparation` (`infra/fulfillment.rs`), and engine-tested only: the public
+operation stays an undelivered Workflow seam until Stage 5, and `gate.binding-deadline` is
+S5-04's. The outcome is the SDK `AuthorizationOutcome` (`authorized | pending | failed`, no other
+member), so an unknown outcome never reaches tolerance. The live requirement is resolved before
+the transaction through the one resolver (unavailable: `acceptance-requirement-unevaluable`);
+the tolerance election is read only for `failed`, and its outage is the payment guard's
+unresolvable input `acceptance-requirement-unevaluable` (settled 503, after the consent guard),
+never a default. Whether the current version has a consent is read under the aggregate lock, so consent
+on a superseded version never admits; any consent counts, `volunteered` included. The order
+column `authorization_failure_tolerated_at`, set once at the admission's transition time, is the
+tolerance evidence: the committed `begin-fulfillment` audit entry has no member that shows it. By the user's decision (2026-11-02, D-257 item 11) the column, stamped in the same transaction and at the same instant as that entry, is the audit evidence; a dedicated audit member waits for the next audit encoding version (Stage 6).
 
 ### 3.4 Pending authorization integration contract
 
@@ -188,11 +213,22 @@ This process is **owned by Workflow and must be implemented there**, not a new L
 
 A declined instrument's only automatic exit is the `approved` TTL, provisionally 30 days and never unset in production (D-181). Only provision-then-collect is expressible; payment capture, SCA, reauthorization UI, refunds and chargebacks remain outside this feature.
 
+**Implementation note (S4-08a, D-252).** The first row is delivered in the submit commit
+(`infra/gate/commit.rs`, step 7). The decision reads the frozen commercial attempt (its original
+principal's tenant and proof reference) against the resource tenant the engine locked, so a
+recovered attempt decides as the fresh one did. The requirement source comes from the order
+contract's `acceptance_required`, frozen with the attempt from the passing gate run, then the
+seller and platform `acceptance_required` elections; unset is `platform_default`. A failed
+election read answers `unavailable` and commits nothing. The row and the `OrderSubmitted`
+`acceptance` member both carry the engine's transition time `t`.
+
 ## 5. Definitions of Done
 
 ### 5.1 Acceptance implementation
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-acceptance`
+
+> **Status (2026-10-29): locally complete; record-acceptance in the development delivery (D-235, D-256), consent on submit with submit, history reads in production (D-255); open pending real providers.** Unchecked on purpose. Open gates: the Contracts `acceptance_required` SDK (missing; development stub or fail-closed); Q-30 acceptance surface for partner-placed orders (a seller election helps only contract-silent or contract-less orders); production PDP policy restricting `acceptance × record` to resource-tenant members (D-256 item 10); submit's production delivery (D-252 item 9, D-266 item 1); consent p95 < 1 s unmeasured (S6-06); the alerts are documentation only and unratified (D-266 item 3). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-258).
 
 The system **MUST** implement both acceptance flows, current-version uniqueness, stored-actor checks and authorized history without inferred consent.
 
@@ -204,6 +240,8 @@ The system **MUST** implement both acceptance flows, current-version uniqueness,
 ### 5.2 Policy and money-guard implementation
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-preconditions-money-gate`
+
+> **Status (2026-10-29): locally complete, engine-only (D-257); open pending Stage 5 and real providers.** Unchecked on purpose. Open gates: the Stage 5 route calling the `begin_fulfillment` driver with the outcome in the fingerprinted document (D-257 items 9, 10); S5-04's `gate.binding-deadline` (a test double now); the Payments owner (none assigned) and the Orders Workflow runtime that presents the outcome; durable execution for pending-payment continuation (Workflow Q-10); the Contracts `acceptance_required` SDK; the alerts are documentation only and unratified (D-258 item 4, D-266 item 3). See the [Stage 4 readiness register](../DESIGN.md) (D-199, extended by D-258).
 
 The system **MUST** implement policy precedence, safe unset values and fail-closed outages, with the risk flag written only by admitted begin-fulfillment. Deliver policy rows through deployment promotion requested via platform operations; no runtime write endpoint or new PDP action exists. Enforce platform-key uniqueness with `NULLS NOT DISTINCT` and the scope/nullability rules in the design. Instrument authorization outcomes separately, tolerated admissions, acceptance latency and recording-party/unevaluable refusals with the design's alerts.
 
@@ -325,7 +363,7 @@ Output: admit, admit-with-risk-flag, or a registered refusal
    3. [ ] - `p1` - **WHEN** failed: - `inst-bg-when-failed`
       1. [ ] - `p1` - Read the seller tolerate-failure election - `inst-bg-read-tolerate-election`
       2. [ ] - `p1` - **IF** tolerate-failure is not elected: **RETURN** authorization-failed refusal - `inst-bg-if-not-tolerated`
-      3. [ ] - `p1` - **RETURN** admit-with-risk-flag, to be recorded on the order and audited - `inst-bg-return-tolerated`
+      3. [ ] - `p1` - **RETURN** admit-with-risk-flag, recorded on the order (`authorization_failure_tolerated_at`, the audit evidence, D-257 item 11) in the transaction of the audited admission - `inst-bg-return-tolerated`
 
 **Description**: Pending and failed are genuinely different answers and collapsing them would
 either stall silently or provision a non-paying tenant. Neither refusal changes order state —
@@ -421,8 +459,8 @@ of mutable `draft` content is inadmissible (`not-admissible`). Every separately 
 Workflow ignores a historical version's acceptance when considering current fulfillment.
 
 This version-bound rule changes the earlier PRD/design wording of one instant per order and
-partner-only separate recording. It is the proposed correction for OL-26; reconciliation of
-the Lifecycle and Workflow PRDs remains an upstream requirement, not a claim of Product approval.
+partner-only separate recording. It is the OL-26 correction; the Lifecycle PRD §6.1 states it (D-250, a representation reconciliation with no business change). Reconciliation of
+the Workflow PRD remains an upstream requirement, not a claim of Product approval.
 
 On the **partner-placed** path, acceptance **MUST** be recorded as a separate first-class
 instant, publishing `OrderAcceptanceRecorded`. The instant **MUST** be the engine's single
@@ -535,8 +573,11 @@ integration, not a reusable durable payment timer. These upstream gaps remain la
 for a functioning pending-authorization path.
 
 Where tolerate-failure is elected and authorization failed, begin-fulfillment **MAY** proceed and
-the risk **MUST** be flagged on the order and audited. The flag records a decision taken at an
-instant and **MUST NOT** be cleared later.
+the risk **MUST** be flagged on the order, in the transaction of the audited admission. The flag records a decision taken at an
+instant and **MUST NOT** be cleared later. The write-once flag, stamped at the same instant as the
+committed `begin-fulfillment` audit entry, is the audit evidence of the tolerance; a dedicated
+audit member is deferred to the next audit encoding version (Stage 6), by the user's decision
+recorded in D-257 item 11.
 
 **Where the election is stored.** Both begin-fulfillment policy inputs are **policy rows, not
 code defaults**, held in `orders_policy_election` (this slice, §3.7) keyed

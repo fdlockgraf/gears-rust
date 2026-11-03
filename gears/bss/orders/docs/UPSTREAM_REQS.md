@@ -528,7 +528,7 @@ owned by Contracts (§2.11).
 The profile **must also state the payer's commercial relationship with a named seller tenant**:
 whether the payer is in a commercial relationship with the order's `sellerTenantId`. An amendment
 that changes `payerTenantId` reads this answer to decide whether the change crosses seller scope
-([04 §2.2](DESIGN.md#contract-04-2-2)), and refuses `payer-rebinding-requires-seller` unless the
+([04 §2.2](DESIGN.md#contract-04-2-2)), and the gate refuses `payer-relationship-unconfirmed` (D-249 removed `payer-rebinding-requires-seller`) unless the
 relationship is confirmed. It **must likewise state the payer's commercial relationship with the
 order's resource tenant** (D-215): Preview, submit and amendment refuse `payer-relationship-unconfirmed`
 unless the payer may pay for that resource tenant, before any payer-related fact is disclosed.
@@ -566,6 +566,41 @@ Authorized | Pending { request_ref } | Failed { reason }` and `get(request_ref)`
 separately from TCV (Workflow D-199). The worktree's `admission-control` gear is platform policy
 admission, not this capability; Seam Atlas N4/D05 use the word admission for both, and its
 `AdmissionReadV1` is not consumed by this gear (D-175).
+
+**Refresh (2026-10-29, Stage 4 S4-09/S4-11).** There is no Payments gear, no design PR and no
+assigned owner, so this block is the requirement a future Payments specification must meet. Workflow
+presents the outcome; Lifecycle has no payment port (D-175, D-257). Nothing here is delivered or
+evidenced by a development double.
+
+1. **Idempotent authorize and read-by-request.** `authorize` is idempotent on `request_ref`: a
+   repeat with the same binding returns the original outcome and never submits a second charge. A
+   read `get(request_ref)` returns the current outcome without side effects, so a lost reply
+   (including after the provider committed) is recovered by reading, not by re-authorizing.
+2. **`request_ref` binding.** The request is bound to the Workflow intent key, the order id, the
+   order version, the payer tenant and the currency. A repeat naming any different bound value is
+   refused as a conflict (item 5), never silently accepted or re-bound.
+3. **Authoritative amount.** The amount to authorize carries its provenance (the source and
+   revision that produced it) and is never the order's TCV or any total Orders computed for
+   display. Where the offer is postpaid there is **no amount**: the request states an explicit
+   `postpaid` policy and Payments answers per its own rule. An amount without provenance is refused.
+4. **States.** `authorized`, `pending`, `failed { reason }` and **`unknown`** (the provider outcome
+   is not known: transport lost, provider timeout or unreconciled). `unknown` is neither `failed`
+   nor `pending`; it is never forwarded as a decline and the same request is read again until it
+   resolves into one of the other three or the caller escalates.
+5. **Conflict and replacement.** A request for an order version whose earlier request is not
+   conclusive is not issued as a new request: the earlier one is read first. A replacement
+   authorization is a new `request_ref` and is permitted only after the earlier request is
+   conclusively `failed` or explicitly cancelled by Payments; the earlier request is then closed
+   and never later reported `authorized` for the same binding. A different amendment version is a
+   different binding.
+6. **Grants.** Authorize and read are separate permissions held by the Workflow service principal
+   only; a read must not disclose instrument or account detail beyond the outcome, the reason class
+   and the bound identifiers. Orders and Lifecycle hold no grant on this capability.
+7. **Audit.** Every authorize, read that changes the observed outcome, replacement and closure
+   is recorded with `request_ref`, the bound order/version, the requesting principal and the
+   outcome, and is retrievable by `request_ref`.
+8. **Owner.** Unassigned. Until a Payments capability exists with this contract, the begin-fulfillment
+   payment guard has no real provider, and the S4-09/S4-11 gates stay open.
 
 ### 2.6 Orders Workflow
 
@@ -665,6 +700,19 @@ terminates only on `OrderCancelled`, `OrderExpired` and `OrderRejected`, because
 cause, and its "process deadline is the overdue window" row names no escalation owner or
 forced-failure handling. Both need a Workflow PRD amendment by its owner; this document does not
 edit that gear or represent the amendment as agreed.
+
+**Asks received from Orders Workflow (reverse direction; Lifecycle is the provider).** Orders
+Workflow (PR #4787, its `UPSTREAM_REQS.md` "Orders Lifecycle") raised these asks of this gear.
+They are recorded here so this register shows both directions of the seam; each is answered by a
+Lifecycle decision and is **designed, not implemented** (Stage 4 readiness register, DESIGN).
+Ask ids are abbreviated; each full id carries the Workflow gear's own id prefix
+and is defined in that gear, not on this branch (DECISIONS D-259…D-261 spell them out):
+
+| Workflow ask | Priority | Workflow decision | Lifecycle answer | Status |
+|---|---|---|---|---|
+| `…-upreq-lifecycle-control-supersede-by-revoke` | `p1` | D-248 | D-259: internal `supersede_fulfillment_control` IdempotentWrite settling a pending pause control `superseded` on revoke evidence, workflow retention class ([DESIGN](DESIGN.md#contract-06-supersede-fulfillment-control)) | designed, not implemented |
+| `…-upreq-lifecycle-version-actors` | `p1` | D-267 | D-260: `OrderVersionView.actors` — creator, submitter, amender with actor tenants, from stored version rows ([DESIGN](DESIGN.md#orders-workflow-sdk-version-actors)) | implemented 2026-11-02 (with D-262 version metadata and header, D-263 `admin`) |
+| `…-upreq-lifecycle-order-read-pre-hold-state` | `p2` | D-255 | D-261: `OrderView.order.pre_hold_state` on the authorized order read ([DESIGN](DESIGN.md#orders-workflow-sdk-pre-hold-state)) | designed, not implemented |
 
 **Owners:** Orders Workflow maintainers.
 
@@ -951,6 +999,25 @@ the shared follow-up above, not to a new Orders-built mechanism. See
 values are a keyed `hmac-sha256:v1:<key_id>:<hex>` under required Orders configuration, replacing
 the S2-06 unkeyed digest. Privacy/Legal still owns whether a keyed pseudonym of that content may
 be retained and for how long; the minimizer is one replaceable function if that answer changes it.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-acceptance-surface`
+
+**Q-30 acceptance surface for partner-placed orders (open; refreshed 2026-10-29).** Orders bars
+the placing and selling parties from recording acceptance on a partner-placed order
+([05 §4.2](features/05-preconditions.md#contract-05-4-2)), so only a principal of the order's
+`resourceTenantId` can record it. **Open question for the platform and identity owners: who
+presents the acceptance action to that resource-tenant principal, and how does the principal get a
+credential when the end customer has none at the point of sale?** Orders owns neither the surface
+nor the onboarding. Nothing in this repository provides one. Orders offers **no operator workaround**:
+no delegated, operator-attested or elevated recording route exists, deliberately (D-31). Until an
+owner answers, partner-placed scope is **not releasable**: such an order rests in `approved` until
+its TTL expires it, unless the seller's scope is promoted with the election
+`acceptance_required: false` (D-133), which is an explicit commercial decision about evidence and
+not a fallback. That election helps only orders whose referenced contract is silent on acceptance
+or that reference no contract: a contract's stated `acceptance_required` decides before any
+election (D-252, D-256 item 5), so an order under a contract requiring acceptance still needs the
+surface. The authz-pdp design PR raises the same question. Tracked as Q-30 in
+[`DECISIONS.md`](./DECISIONS.md); Stage 4 readiness register (DESIGN, D-258).
 
 ### 2.9 Platform authorization policy
 

@@ -1,8 +1,9 @@
 //! The Orders gear: the transition engine, draft authoring and draft reads (Stage 2).
 //!
-//! Eight catalog operations are delivered over REST and the local SDK (`OrdersV1`): the five
-//! draft authoring writes (`create`, `patch_order`, `add_line`, `patch_line`, `remove_line`) and
-//! the three draft reads (`get`, `list`, `list_lines`); see [`api::rest::DELIVERED_OPERATIONS`].
+//! Eleven catalog operations are delivered over REST and the local SDK (`OrdersV1`): the five
+//! draft authoring writes (`create`, `patch_order`, `add_line`, `patch_line`, `remove_line`), the
+//! three reads (`get`, `list`, `list_lines`) and the three S4-06 history reads (`list_versions`,
+//! `get_version`, `get_acceptance`); see [`api::rest::DELIVERED_OPERATIONS`].
 //! Every other catalog operation stays registered but undelivered: REST does not mount it and the
 //! local SDK answers unavailable. The Orders-owned maintenance workers run when configured.
 #![forbid(unsafe_code)]

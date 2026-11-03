@@ -3,7 +3,8 @@
 //! is generated from them. Each request body converts into its SDK authoring type with
 //! `TryFrom`, so the SDK serde shape (kept for in-process callers and stored data) is not the HTTP
 //! contract (TOOLKIT-CORE-001). The read responses ([`OrdersOrderView`], [`OrdersOrderPage`],
-//! [`OrdersLinePage`]) are converted from the SDK read results with `TryFrom` and serialized; every
+//! [`OrdersLinePage`] and the S4-06 history responses [`OrdersVersionPage`],
+//! [`OrdersOrderVersionView`], [`OrdersAcceptancePage`]) are converted from the SDK read results with `TryFrom` and serialized; every
 //! scalar is spelled by the SDK's own serializer, so the bytes are the SDK serialization's
 //! (`orders/tests/rest_responses.rs` pins that). The write responses are not converted: a settled
 //! write answers its stored SDK snapshot byte for byte, so a same-key replay is identical to the
@@ -19,6 +20,7 @@
     clippy::option_option,
     reason = "a PATCH body distinguishes an omitted field, a null that clears it and a new value"
 )]
+use bss_orders_sdk::amend::{AmendLine, AmendOrder};
 use bss_orders_sdk::authoring::{
     AddLine, AuthoredTerm, AuthoringInvalid, BillingCycle, CalendarDate, Category, CreateOrder,
     Currency, DraftLine, HeaderPatch, LinePatch, OrderHeader, OrderView, Quantity, SelectedItem,
@@ -29,7 +31,11 @@ use bss_orders_sdk::preview::{
     DiscountView, ExactMoneyView, MoneyView, PinOutcomeView, PreviewBasket, PreviewLine,
     PreviewResult,
 };
-use bss_orders_sdk::reads::{LinePage, OrderPage, OrderSummary, PageInfo};
+use bss_orders_sdk::reads::{
+    AcceptancePage, AcceptanceRecord, AdministrativeView, LinePage, OrderPage, OrderSummary,
+    OrderVersionView, PageInfo, VersionActor, VersionActors, VersionHeader, VersionPage,
+    VersionRecord,
+};
 use serde::Deserialize as _;
 use uuid::Uuid;
 
@@ -340,6 +346,69 @@ pub struct SubmitBody {
     pub expected_draft_revision: bss_orders_sdk::models::DraftRevision,
 }
 
+/// A line added by an amendment: the shape of [`OrdersAddLine`] without the draft revision (an
+/// amendment targets a committed version, not a draft).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAmendAddLine {
+    pub plan_id: Uuid,
+    pub plan_revision_id: Uuid,
+    pub selected_items: Vec<OrdersSelectedItem>,
+    pub currency: String,
+    #[serde(default)]
+    pub contract_effective_date: Option<String>,
+    #[serde(default)]
+    pub service_activation_date: Option<String>,
+    #[serde(default)]
+    pub acceptance_due_date: Option<String>,
+    #[serde(default)]
+    pub term_duration: Option<OrdersAuthoredTerm>,
+    #[serde(default, deserialize_with = "cycle")]
+    pub billing_cycle: Option<String>,
+}
+
+/// One amendment line operation, selected by `op`: `add`, `change` or `remove`.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(tag = "op", deny_unknown_fields)]
+pub enum OrdersAmendLine {
+    /// Add a line.
+    Add { line: OrdersAmendAddLine },
+    /// Change the named fields of a retained line of the committed version.
+    Change {
+        line_id: Uuid,
+        patch: OrdersLineFields,
+    },
+    /// Remove a line of the committed version.
+    Remove { line_id: Uuid },
+}
+
+/// Amendment body (S4-03). `If-Match` names the committed version amended; the reason is
+/// guarded by the engine (`amendment-reason-invalid`), so an absent one decodes as empty.
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAmendOrder {
+    /// Explanation, 1-4096 characters.
+    #[serde(default)]
+    pub reason: String,
+    /// Order-level fields to change.
+    #[serde(default)]
+    pub header: Option<OrdersHeaderFields>,
+    /// Line operations by stable line id; a line id is named at most once.
+    #[serde(default)]
+    pub lines: Vec<OrdersAmendLine>,
+}
+
+/// Record-acceptance body (S4-08b, `models.json` `Acceptance`): an empty object. The instant
+/// and the recording actor are server facts; the route decodes the body with the SDK's strict
+/// `Acceptance`, so this type only documents the schema.
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "the OpenAPI schema of an empty JSON object; a unit struct documents `null`"
+)]
+pub struct OrdersAcceptance {}
+
 /// Optional line `DELETE` body.
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]
@@ -410,6 +479,54 @@ impl TryFrom<OrdersAddLine> for AddLine {
             acceptance_due_date: date(body.acceptance_due_date, "acceptance_due_date")?,
             term_duration: body.term_duration.map(AuthoredTerm::from),
             billing_cycle: billing_cycle(body.billing_cycle)?,
+        })
+    }
+}
+
+impl TryFrom<OrdersAmendAddLine> for AddLine {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersAmendAddLine) -> Result<Self, Self::Error> {
+        Ok(Self {
+            plan_id: body.plan_id,
+            plan_revision_id: body.plan_revision_id,
+            selected_items: items(body.selected_items)?,
+            currency: Currency::try_from(body.currency)?,
+            contract_effective_date: date(body.contract_effective_date, "contract_effective_date")?,
+            service_activation_date: date(body.service_activation_date, "service_activation_date")?,
+            acceptance_due_date: date(body.acceptance_due_date, "acceptance_due_date")?,
+            term_duration: body.term_duration.map(AuthoredTerm::from),
+            billing_cycle: billing_cycle(body.billing_cycle)?,
+        })
+    }
+}
+
+impl TryFrom<OrdersAmendLine> for AmendLine {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersAmendLine) -> Result<Self, Self::Error> {
+        Ok(match body {
+            OrdersAmendLine::Add { line } => Self::Add {
+                line: AddLine::try_from(line)?,
+            },
+            OrdersAmendLine::Change { line_id, patch } => Self::Change {
+                line_id,
+                patch: LinePatch::try_from(patch)?,
+            },
+            OrdersAmendLine::Remove { line_id } => Self::Remove { line_id },
+        })
+    }
+}
+
+impl TryFrom<OrdersAmendOrder> for AmendOrder {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersAmendOrder) -> Result<Self, Self::Error> {
+        Ok(Self {
+            reason: body.reason,
+            header: body.header.map(HeaderPatch::try_from).transpose()?,
+            lines: body
+                .lines
+                .into_iter()
+                .map(AmendLine::try_from)
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -535,6 +652,88 @@ pub struct OrdersOrderView {
     pub lines: Vec<OrdersDraftLine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<i64>,
+    /// The current administrative values (D-263); absent when no row is stored or every value is cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<OrdersAdministrativeView>,
+}
+
+/// The current administrative values of the order (D-263); an absent member is not set.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAdministrativeValues {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_notes: Option<String>,
+}
+
+/// One line's current administrative values (D-263).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersLineAdministrativeValues {
+    pub line_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_notes: Option<String>,
+}
+
+/// The separate mutable administrative projection (D-263): the current values of the order and
+/// of the composed lines that have any, never the values at a past version.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAdministrativeView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<OrdersAdministrativeValues>,
+    pub lines: Vec<OrdersLineAdministrativeValues>,
+}
+
+/// One role subject of a version (D-260).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionActor {
+    pub actor: String,
+    pub actor_tenant_id: Uuid,
+}
+
+/// The role actors of the requested version (D-260): the creator always, the submitter from the
+/// submit version on, the amender on an amendment.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionActors {
+    pub creator: OrdersVersionActor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitter: Option<OrdersVersionActor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amender: Option<OrdersVersionActor>,
+}
+
+/// The market a committed version was gated against (D-262).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionMarket {
+    pub currency: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+/// The commercial header at the requested version (D-262).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionHeader {
+    pub category: String,
+    pub resource_tenant_id: Uuid,
+    pub seller_tenant_id: Uuid,
+    pub payer_tenant_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_id: Option<Uuid>,
+    /// Absent exactly on version 1, the empty draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market: Option<OrdersVersionMarket>,
 }
 
 /// One order-list element: the header at its current version (early S6-01 draft subset).
@@ -580,6 +779,96 @@ pub struct OrdersLinePage {
     pub current_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<i64>,
+}
+
+/// One committed version of the history (S4-06): the stored version row only.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionRecord {
+    pub version: i64,
+    /// `create`, `submit` or `amendment`.
+    pub reason: String,
+    /// The trusted subject that appended the version.
+    pub actor: String,
+    pub actor_tenant_id: Uuid,
+    /// The engine instant the version was appended.
+    pub created_at: String,
+    /// The caller's explanation; present exactly on an amendment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_reason: Option<String>,
+    /// The predecessor; absent exactly on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<i64>,
+}
+
+/// One recorded consent (S4-06); never internal recovery evidence.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAcceptanceRecord {
+    pub accepted_version: i64,
+    pub accepted_at: String,
+    pub recorded_by: String,
+    /// `self_service` or `partner_placed`, copied from the order's sales path.
+    pub recording_path: String,
+    /// `contract`, `seller`, `platform_default` or `volunteered`.
+    pub requirement_source: String,
+}
+
+/// One authorized keyset page of the committed version history in version order, with the
+/// current version and its consent (absent: none recorded) from the same snapshot.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersVersionPage {
+    pub items: Vec<OrdersVersionRecord>,
+    pub page_info: OrdersPageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<OrdersAcceptanceRecord>,
+}
+
+/// The consent read: the current version, its consent (absent: none recorded) and one keyset
+/// page of the prior versions' consent records.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersAcceptancePage {
+    pub items: Vec<OrdersAcceptanceRecord>,
+    pub page_info: OrdersPageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_acceptance: Option<OrdersAcceptanceRecord>,
+}
+
+/// One exact committed version composed at that version: the version row's metadata (D-262),
+/// its commercial header and role actors (D-260), its lines with their immutable evidence, its
+/// persisted totals (absent on version 1, the empty draft) and the order's current
+/// administrative projection (D-263).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersOrderVersionView {
+    pub order_id: Uuid,
+    pub version: i64,
+    /// `create`, `submit` or `amendment`.
+    pub reason: String,
+    /// The trusted subject that appended the version.
+    pub actor: String,
+    pub actor_tenant_id: Uuid,
+    /// The engine instant the version was appended.
+    pub created_at: String,
+    /// The caller's explanation; present exactly on an amendment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment_reason: Option<String>,
+    /// The predecessor; absent exactly on version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_version: Option<i64>,
+    pub header: OrdersVersionHeader,
+    pub actors: OrdersVersionActors,
+    pub lines: Vec<OrdersDraftLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_total: Option<Vec<OrdersCommittedTotal>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<OrdersAdministrativeView>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -730,6 +1019,70 @@ impl TryFrom<OrderView> for OrdersOrderView {
             version: view.version.try_into()?,
             lines: lines(view.lines)?,
             draft_revision: view.draft_revision.map(i64::from),
+            admin: view.admin.map(Into::into),
+        })
+    }
+}
+
+impl From<AdministrativeView> for OrdersAdministrativeView {
+    fn from(view: AdministrativeView) -> Self {
+        Self {
+            order: view.order.map(|values| OrdersAdministrativeValues {
+                external_reference: values.external_reference,
+                display_label: values.display_label,
+                internal_notes: values.internal_notes,
+            }),
+            lines: view
+                .lines
+                .into_iter()
+                .map(|values| OrdersLineAdministrativeValues {
+                    line_id: values.line_id,
+                    external_reference: values.external_reference,
+                    display_label: values.display_label,
+                    internal_notes: values.internal_notes,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<VersionActor> for OrdersVersionActor {
+    fn from(pair: VersionActor) -> Self {
+        Self {
+            actor: pair.actor,
+            actor_tenant_id: pair.actor_tenant_id,
+        }
+    }
+}
+
+impl From<VersionActors> for OrdersVersionActors {
+    fn from(actors: VersionActors) -> Self {
+        Self {
+            creator: actors.creator.into(),
+            submitter: actors.submitter.map(Into::into),
+            amender: actors.amender.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<VersionHeader> for OrdersVersionHeader {
+    type Error = ResponseUnencodable;
+    fn try_from(header: VersionHeader) -> Result<Self, Self::Error> {
+        Ok(Self {
+            category: spelled(&header.category, "category")?,
+            resource_tenant_id: header.resource_tenant_id,
+            seller_tenant_id: header.seller_tenant_id,
+            payer_tenant_id: header.payer_tenant_id,
+            contract_id: header.contract_id,
+            market: header
+                .market
+                .map(|market| -> Result<_, ResponseUnencodable> {
+                    Ok(OrdersVersionMarket {
+                        currency: spelled(&market.currency, "currency")?,
+                        region: market.region,
+                    })
+                })
+                .transpose()?,
         })
     }
 }
@@ -777,6 +1130,100 @@ impl TryFrom<LinePage> for OrdersLinePage {
             page_info: page.page_info.into(),
             current_version: page.current_version.into(),
             draft_revision: page.draft_revision.map(i64::from),
+        })
+    }
+}
+
+impl TryFrom<VersionRecord> for OrdersVersionRecord {
+    type Error = ResponseUnencodable;
+    fn try_from(record: VersionRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            version: record.version.into(),
+            reason: spelled(&record.reason, "reason")?,
+            actor: record.actor,
+            actor_tenant_id: record.actor_tenant_id,
+            created_at: instant(record.created_at, "created_at")?,
+            amendment_reason: record.amendment_reason,
+            supersedes_version: record.supersedes_version.map(i64::from),
+        })
+    }
+}
+
+impl TryFrom<AcceptanceRecord> for OrdersAcceptanceRecord {
+    type Error = ResponseUnencodable;
+    fn try_from(record: AcceptanceRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            accepted_version: record.accepted_version.into(),
+            accepted_at: instant(record.accepted_at, "accepted_at")?,
+            recorded_by: record.recorded_by,
+            recording_path: spelled(&record.recording_path, "recording_path")?,
+            requirement_source: spelled(&record.requirement_source, "requirement_source")?,
+        })
+    }
+}
+
+fn consents(
+    records: Vec<AcceptanceRecord>,
+) -> Result<Vec<OrdersAcceptanceRecord>, ResponseUnencodable> {
+    records
+        .into_iter()
+        .map(OrdersAcceptanceRecord::try_from)
+        .collect()
+}
+
+impl TryFrom<VersionPage> for OrdersVersionPage {
+    type Error = ResponseUnencodable;
+    fn try_from(page: VersionPage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: page
+                .items
+                .into_iter()
+                .map(OrdersVersionRecord::try_from)
+                .collect::<Result<_, _>>()?,
+            page_info: page.page_info.into(),
+            current_version: page.current_version.map(i64::from),
+            current_acceptance: page
+                .current_acceptance
+                .map(OrdersAcceptanceRecord::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<AcceptancePage> for OrdersAcceptancePage {
+    type Error = ResponseUnencodable;
+    fn try_from(page: AcceptancePage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: consents(page.items)?,
+            page_info: page.page_info.into(),
+            current_version: page.current_version.map(i64::from),
+            current_acceptance: page
+                .current_acceptance
+                .map(OrdersAcceptanceRecord::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<OrderVersionView> for OrdersOrderVersionView {
+    type Error = ResponseUnencodable;
+    fn try_from(view: OrderVersionView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            order_id: view.order_id,
+            version: view.version.into(),
+            reason: spelled(&view.reason, "reason")?,
+            actor: view.actor,
+            actor_tenant_id: view.actor_tenant_id,
+            created_at: instant(view.created_at, "created_at")?,
+            amendment_reason: view.amendment_reason,
+            supersedes_version: view.supersedes_version.map(i64::from),
+            header: view.header.try_into()?,
+            actors: view.actors.into(),
+            lines: lines(view.lines)?,
+            resolved_total: view
+                .resolved_total
+                .map(|rows| rows.into_iter().map(Into::into).collect()),
+            admin: view.admin.map(Into::into),
         })
     }
 }

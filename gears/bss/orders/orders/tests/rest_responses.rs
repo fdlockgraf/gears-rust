@@ -15,7 +15,7 @@
               test in the file unwraps or expects"
 )]
 use bss_orders::api::rest::dto::{
-    OrdersLinePage, OrdersOrderPage, OrdersOrderView, ResponseUnencodable,
+    OrdersLinePage, OrdersOrderPage, OrdersOrderVersionView, OrdersOrderView, ResponseUnencodable,
 };
 use bss_orders_sdk::authoring::{
     AuthoredTerm, BillingCycle, CalendarDate, Category, Currency, DraftLine, OrderHeader,
@@ -24,7 +24,9 @@ use bss_orders_sdk::authoring::{
 use bss_orders_sdk::catalog::OrderState;
 use bss_orders_sdk::models::{DraftRevision, OrderVersion};
 use bss_orders_sdk::reads::{
-    CommittedTotal, Cursor, LinePage, OrderPage, OrderSummary, PageInfo, PageSize,
+    AdministrativeValues, AdministrativeView, CommittedTotal, Cursor, LineAdministrativeValues,
+    LinePage, OrderPage, OrderSummary, OrderVersionView, PageInfo, PageSize, VersionActor,
+    VersionActors, VersionHeader, VersionMarket, VersionReason,
 };
 use serde::Serialize;
 use time::{Date, Month, OffsetDateTime};
@@ -282,6 +284,186 @@ fn committed_totals() -> Vec<Vec<CommittedTotal>> {
     ]
 }
 
+/// The administrative projection (D-263): absent, order-only, lines-only, and every member set
+/// with text JSON must escape.
+fn admins() -> Vec<Option<AdministrativeView>> {
+    let text = "na\u{ef}ve \"quoted\" \\ back\nline \u{1F600}";
+    vec![
+        None,
+        Some(AdministrativeView {
+            order: Some(AdministrativeValues {
+                external_reference: Some("PO-1".into()),
+                display_label: None,
+                internal_notes: None,
+            }),
+            lines: Vec::new(),
+        }),
+        Some(AdministrativeView {
+            order: None,
+            lines: vec![LineAdministrativeValues {
+                line_id: u(9),
+                external_reference: None,
+                display_label: Some(text.into()),
+                internal_notes: None,
+            }],
+        }),
+        Some(AdministrativeView {
+            order: Some(AdministrativeValues {
+                external_reference: Some(String::new()),
+                display_label: Some(text.into()),
+                internal_notes: Some(text.into()),
+            }),
+            lines: vec![
+                LineAdministrativeValues {
+                    line_id: u(9),
+                    external_reference: Some("x".into()),
+                    display_label: Some("y".into()),
+                    internal_notes: Some(text.into()),
+                },
+                LineAdministrativeValues {
+                    line_id: u(u128::MAX),
+                    external_reference: None,
+                    display_label: None,
+                    internal_notes: None,
+                },
+            ],
+        }),
+    ]
+}
+
+/// The role actors of every version kind (D-260).
+fn actor_sets() -> Vec<VersionActors> {
+    let pair = |subject: u128, tenant: u128| VersionActor {
+        actor: u(subject).to_string(),
+        actor_tenant_id: u(tenant),
+    };
+    vec![
+        VersionActors {
+            creator: pair(102, 10),
+            submitter: None,
+            amender: None,
+        },
+        VersionActors {
+            creator: pair(102, 10),
+            submitter: Some(pair(111, 11)),
+            amender: None,
+        },
+        VersionActors {
+            creator: pair(102, 10),
+            submitter: Some(pair(111, 11)),
+            amender: Some(pair(u128::MAX, u128::MAX)),
+        },
+    ]
+}
+
+/// The version header at its edges (D-262): no contract or market, a market without a region,
+/// and every member set.
+fn version_headers() -> Vec<VersionHeader> {
+    let base = VersionHeader {
+        category: Category::NewSale,
+        resource_tenant_id: u(10),
+        seller_tenant_id: u(20),
+        payer_tenant_id: u(30),
+        contract_id: None,
+        market: None,
+    };
+    let eur = || Currency::try_from("EUR".to_owned()).unwrap();
+    vec![
+        base.clone(),
+        VersionHeader {
+            category: Category::Change,
+            market: Some(VersionMarket {
+                currency: eur(),
+                region: None,
+            }),
+            ..base.clone()
+        },
+        VersionHeader {
+            contract_id: Some(u(40)),
+            market: Some(VersionMarket {
+                currency: eur(),
+                region: Some("eu \"west\"".into()),
+            }),
+            ..base
+        },
+    ]
+}
+
+/// D-260, D-262, D-263: the version read's DTO answers exactly the SDK bytes over every reason,
+/// optional metadata, header, actor set, line count, totals and administrative projection, and
+/// refuses what the SDK serializer refuses.
+#[test]
+fn order_version_views_serialize_exactly_as_the_sdk_model() {
+    let v = |n: i64| OrderVersion::try_from(n).unwrap();
+    let totals = committed_totals();
+    let lines = lines();
+    let reasons = [
+        VersionReason::Create,
+        VersionReason::Submit,
+        VersionReason::Amendment,
+    ];
+    let mut count = 0;
+    for (i, at) in instants().into_iter().enumerate() {
+        for (j, reason) in reasons.into_iter().enumerate() {
+            for (k, header) in version_headers().into_iter().enumerate() {
+                let view = OrderVersionView {
+                    order_id: u(1),
+                    version: [v(1), v(4), v(i64::from(i32::MAX))][j],
+                    reason,
+                    actor: ["", "a \"b\"", "00000000-0000-0000-0000-000000000066"][(i + k) % 3]
+                        .to_owned(),
+                    actor_tenant_id: u(10),
+                    created_at: at,
+                    amendment_reason: [None, None, Some("bigger \u{1F600}".to_owned())][j].clone(),
+                    supersedes_version: [None, Some(v(1)), Some(v(4))][j],
+                    header,
+                    actors: actor_sets()[j].clone(),
+                    lines: match (i + k) % 3 {
+                        0 => Vec::new(),
+                        1 => vec![lines[(i + k) % lines.len()].clone()],
+                        _ => lines.clone(),
+                    },
+                    resolved_total: match (i + j + k) % 4 {
+                        0 => None,
+                        n => Some(totals[n - 1].clone()),
+                    },
+                    admin: admins()[(i + j + k) % 4].clone(),
+                };
+                same_wire::<_, OrdersOrderVersionView>(&view);
+                count += 1;
+            }
+        }
+    }
+    assert!(count >= 40, "corpus too small: {count}");
+    let mut refused = OrderVersionView {
+        order_id: u(1),
+        version: v(1),
+        reason: VersionReason::Create,
+        actor: String::new(),
+        actor_tenant_id: u(10),
+        created_at: Date::from_calendar_date(-1, Month::December, 31)
+            .unwrap()
+            .midnight()
+            .assume_utc(),
+        amendment_reason: None,
+        supersedes_version: None,
+        header: version_headers()[0].clone(),
+        actors: actor_sets()[0].clone(),
+        lines: Vec::new(),
+        resolved_total: None,
+        admin: None,
+    };
+    assert_eq!(
+        OrdersOrderVersionView::try_from(refused.clone())
+            .err()
+            .unwrap(),
+        ResponseUnencodable("created_at")
+    );
+    same_wire::<_, OrdersOrderVersionView>(&refused);
+    refused.created_at = instants()[0];
+    same_wire::<_, OrdersOrderVersionView>(&refused);
+}
+
 #[test]
 fn order_views_serialize_exactly_as_the_sdk_model() {
     let totals = committed_totals();
@@ -302,6 +484,7 @@ fn order_views_serialize_exactly_as_the_sdk_model() {
                     _ => lines.clone(),
                 },
                 draft_revision: revisions()[(i + j) % 3],
+                admin: admins()[(i + j) % 4].clone(),
             };
             same_wire::<_, OrdersOrderView>(&view);
             count += 1;
@@ -363,6 +546,7 @@ fn values_without_an_sdk_spelling_are_refused_by_both() {
         version: versions()[0].clone(),
         lines: vec![lines()[0].clone()],
         draft_revision: None,
+        admin: None,
     };
     for year in [-1, -9999] {
         view.lines[0].acceptance_due_date = Some(date(year, Month::December, 31));

@@ -531,6 +531,10 @@ The D-201 [internal rebuild writer](../DESIGN.md#contract-06-replace-fulfillment
 is registered separately from these 29 public transition rows: it uses the same authorization,
 owned execution, transactional audit/settlement and rollback machinery. Its only grant mutation
 is append with a checked generation; it changes no public state/timestamp/cap or commercial version.
+The D-259 [supersede-by-revoke writer](../DESIGN.md#contract-06-supersede-fulfillment-control)
+is registered the same way (designed, not implemented): it settles a pending pause control
+`superseded`, clears only its own `fulfillment_control_pending` pointer and writes no grant,
+state, timestamp, cap or version.
 S5-02 must register this contribution before Workflow's S5-08 adapter can use it.
 
 One refusal also carries an engine-allocated value: for `second-approver-required` on rows 28 and
@@ -984,7 +988,8 @@ gate for normal execution, input-resolution refusal and create; no extra order, 
 committed audit entry or producer-outbox message may result.
 
 The ordinary retention window is **24 hours**. **D-173 exception:** workflow-class triggers
-listed in DESIGN §4.1 retain receipts for **at least 30 days**, covering the issuing Workflow
+listed in DESIGN §4.1, and the internal `replace-fulfillment-grant` (D-203) and
+`supersede-fulfillment-control` (D-259) writers of the workflow retention class, retain receipts for **at least 30 days**, covering the issuing Workflow
 process retry horizon; a shorter window is superseded for those triggers. On new claim select
 the operation's window and persist its absolute `expires_at`; replay, reclaim and settlement
 never extend it. Retention must cover the caller retry horizon; only after the applicable
