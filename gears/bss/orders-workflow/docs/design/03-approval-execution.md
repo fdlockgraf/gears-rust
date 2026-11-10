@@ -658,7 +658,7 @@ set is `owf_approval_request.barred_subjects`, captured by `open-gates` from Lif
 `get_version`, never from the decision request body. A version's own `actor` is who appended it,
 which for an amended version is the amender, not the submitter, so the three roles were asked of
 Lifecycle (`cpt-cf-bss-orders-workflow-upreq-lifecycle-version-actors`, `../UPSTREAM_REQS.md` §2.4);
-Lifecycle `bss/orders-stage4` D-260 answers it with `OrderVersionView.actors { creator, submitter?,
+[Lifecycle D-260](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) answers it with `OrderVersionView.actors { creator, submitter?,
 amender? }`, each `{ actor, actor_tenant_id }` ([Lifecycle `DESIGN.md` *Workflow SDK contract*](../../../orders/docs/DESIGN.md#orders-workflow-sdk);
 implemented 2026-11-02, not yet on `main`; decision D-325), whose `actor` is the `subject_id` this
 set holds. Until a Lifecycle build carrying it is deployed `open-gates` cannot form the set, opens **no** gate and parks
@@ -1668,7 +1668,7 @@ a settled success of its round too, and the only way on from it is an operator r
 **Expected version and refusals from Lifecycle.** Every `approval-reflection` call **MUST** carry
 `expected_version = orderVersion`, the process `correlationId`, the `verdict`, one named
 `deciding_authority` and, on `denied` only, the `denial_reason` (§3.6 `inst-rv3-call`). A Lifecycle
-`version-conflict` (Lifecycle `bss/orders-stage4` D-254, *The amendment service runs the submit pipeline over the proposed version*: a result naming a superseded version), and a `not-admissible` refusal of an order the Lifecycle read shows terminal,
+`version-conflict` ([Lifecycle D-254](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md), *The amendment service runs the submit pipeline over the proposed version*: a result naming a superseded version), and a `not-admissible` refusal of an order the Lifecycle read shows terminal,
 mean the order moved on while the reflection was in flight — except the terminal `rejected` a
 `reflect-approval-denied` of this version already reached, which is the reflection applied (below)
 — and they **MUST** answer `moved` with the

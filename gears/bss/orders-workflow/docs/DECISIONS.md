@@ -3,6 +3,14 @@
 
 # Design Decisions — Orders Workflow
 
+> **Source of truth for Orders Lifecycle.** From Stage 4 (Lifecycle D-249 and later), Orders
+> Lifecycle is developed in vhp-core, `crates/gears/bss/orders`
+> ([`DECISIONS.md`](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md)); until vhp-core
+> PR #622 merges, the Stage 4 text is on branch `VHP-3750-bss-orders-stage4`. The gears-rust
+> copy under `gears/bss/orders` stays at Stage 3. A citation in this register of a Lifecycle
+> decision D-249 or later, including the `bss/orders-stage4` D-NNN form, resolves in the vhp-core
+> register (D-377).
+
 <!-- toc -->
 
 - [How to use this document](#how-to-use-this-document)
@@ -229,6 +237,7 @@
   - [D-208 (H) Lifecycle's merged design D-179…D-186 is received: forced failure, overdue owner, resource-tenant tuple, consumer contract](#d-208-h-lifecycles-merged-design-d-179d-186-is-received-forced-failure-overdue-owner-resource-tenant-tuple-consumer-contract)
   - [D-209 (H) Subscriptions' answers in PR #5131 are received: resubmit-then-void, no caller start instant, composition by reference](#d-209-h-subscriptions-answers-in-pr-5131-are-received-resubmit-then-void-no-caller-start-instant-composition-by-reference)
   - [D-210 (M) Four review findings closed: receipt ordinal, publish fence at readiness, 90-day review interval, line counts](#d-210-m-four-review-findings-closed-receipt-ordinal-publish-fence-at-readiness-90-day-review-interval-line-counts)
+  - [D-377 (L) Orders Lifecycle from vhp-core: `contract-not-active` on begin-fulfillment is a permanent failure, and single-owner authorization leaves the seams unchanged](#d-377-l-orders-lifecycle-from-vhp-core-contract-not-active-on-begin-fulfillment-is-a-permanent-failure-and-single-owner-authorization-leaves-the-seams-unchanged)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -10903,6 +10912,8 @@ supersede-by-revoke, pre-hold state, version actors), §3; D-238, D-239, D-240, 
 
 > **Amended by D-334 (2026-11-05)**: item 1's rule is replaced by D-268 item 4's branch qualifier: a Lifecycle Stage 4 decision is cited as Lifecycle `bss/orders-stage4` D-NNN, never as a bare or only "Lifecycle"-prefixed number, because `main`'s Lifecycle register ends at D-248 and Stage 4 may renumber again when it merges; item 1's text stays as the record, and the other items now carry the qualifier. Item 8 gains `header`: like `actors` it exists only on `bss/orders-stage4` (Lifecycle `bss/orders-stage4` D-262), and because `construct-and-freeze-plan` reads every order's market and payer from it, the gear is not ready until a startup probe of `get_version` or a declared SDK capability shows it (`design/01` §3.8, `design/04` `inst-pc-read-order`).
 
+> **Amended by D-377 (2026-11-10)**: item 10's "no refusal table changes" no longer holds. Its reasoning covered only submit and amendment; [Lifecycle D-267](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) adds `contract-not-active` (400 `FailedPrecondition`) to begin-fulfillment as row 11's first guard, `preconditions.fulfillment-contract-active`, settled under the call's key, so this gear's begin-fulfillment table gains a class for it (`design/04` `inst-bf-if-contract-inactive`, D-377). The header's mirror point `875084668` on `bss/orders-stage4` is historical: from Stage 4 the Lifecycle source is vhp-core, `crates/gears/bss/orders` (D-377 item 1).
+
 
 ### D-326 (L) A port's breaker refusal or call deadline counts on that port's re-check ladder; a re-drive of a faulted re-check starts a fresh ladder
 
@@ -11373,6 +11384,8 @@ table); `design/04` §2.1 (continuation item 9), §3.6 (`inst-pa-read-acceptance
 `design/06` §3.6 (revoke sequence); D-238, D-239, D-240, D-267 and D-325 bodies and notes; D-268,
 D-325 notes.
 
+> **Amended by D-377 (2026-11-10)**: item 2's branch qualifier is replaced in the live documents by a link to the vhp-core Lifecycle register, where Stage 4 is now developed; the `bss/orders-stage4` D-NNN citations in this register stay as the record and resolve there (D-377 item 1).
+
 ### D-335 (L) Register and dependency hygiene after #5536 merged: Stage 3 numbers, the contract's tuple and keys, the gear name
 
 **Accepted (2026-11-05).** *(PR #4787 fourth review; amends D-242, D-205, D-209, D-237, D-241; Q-08)*
@@ -11420,6 +11433,75 @@ column, operation or ask.
 paragraph); `design/01` §3.4 dependency table; `design/02` dependency table (name, link text);
 `design/05` dependency table (name, signature); `design/07`, `design/08`, `design/09` dependency
 tables; D-237 header and rationale, D-241 and D-242 headers; D-205, D-209, D-242 and Q-08 notes.
+
+### D-377 (L) Orders Lifecycle from vhp-core: `contract-not-active` on begin-fulfillment is a permanent failure, and single-owner authorization leaves the seams unchanged
+
+**Accepted (2026-11-10).** *(mirrors Lifecycle D-267 and D-269 in vhp-core; amends D-325, D-334)*
+
+**Context**: from Stage 4, Orders Lifecycle is developed in vhp-core (`crates/gears/bss/orders`);
+the gears-rust copy stays at Stage 3. Lifecycle [D-267](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) changes begin-fulfillment: when
+Contracts answers but omits the order's referenced contract, the call settles 400
+`contract-not-active` (`FailedPrecondition`) under its idempotency key, from row 11's first guard
+`preconditions.fulfillment-contract-active`, so a same-key retry replays it; a Contracts outage
+stays 503 `acceptance-requirement-unevaluable`. The same reason refuses record-acceptance. D-325
+item 10 said no refusal table of this gear changes, reasoning only about submit and amendment.
+Lifecycle [D-269](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) adopts single-owner authorization: the buyer owns the order, the seller
+reads nothing of it through the seller relationship and keeps hold, resume and cancel, and the
+resource tenant is fixed from creation.
+
+**Decision**:
+
+1. **Source of truth.** This gear's references to Lifecycle decisions D-249 and later, and to
+   Lifecycle Stage 4 behaviour, point to vhp-core: the live documents link
+   [the vhp-core register](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md), replacing D-334 item 2's `bss/orders-stage4` qualifier there; until
+   vhp-core PR #622 merges, the Stage 4 text is on branch `VHP-3750-bss-orders-stage4`. The
+   `bss/orders-stage4` D-NNN citations in this register stay as the record and resolve there. Stage
+   1–3 links stay relative to the gears-rust copy. `DESIGN.md` and this register carry a *Source of
+   truth* note.
+2. **`contract-not-active` is a permanent failure of begin-fulfillment.** `begin-fulfillment`
+   records the refusal code and settles `permanent-failure` with the new reason
+   `contract-not-active` (`FailedPrecondition`, 400, owner `04-fulfillment-plan`)
+   (`design/04` `inst-bf-if-contract-inactive`). The definition's `catch` takes no 400, so the
+   invocation faults and the liveness pass raises the `invocation-dead` task, where an operator
+   decides the order: a re-drive replays the settled refusal, and a recorded order cancel drives
+   the dead-instance unwind (`design/01` §4.16). This is the route the call's other permanent
+   refusals already take (`version-mismatch`, `idempotency-key-conflict`). The withheld causes are
+   unchanged, and the outage keeps its class: `acceptance-requirement-unevaluable` stays `withheld`
+   (`inst-bf-if-withheld`).
+3. **Record-acceptance.** This gear does not call record-acceptance. There, `contract-not-active`
+   leaves consent unrecorded and emits no `OrderAcceptanceRecorded`, so the acceptance wake-up does
+   not arrive; begin-fulfillment answers `contract-not-active` while Contracts still omits the
+   contract, and once Contracts states it again an order that requires consent stays `withheld` on
+   `acceptance-required-not-recorded` until consent is recorded.
+4. **D-325 item 10 corrected.** Lifecycle D-267 changes begin-fulfillment's refusal set, so this
+   gear's begin-fulfillment table changes (item 2); D-325 carries a dated note.
+5. **Single-owner authorization (Lifecycle D-269).** The seams this gear calls (the approval
+   reflections, begin-fulfillment, the spawn signal, the acknowledgements and Workflow cancel) and
+   Lifecycle's force-fail are unchanged and stay unreachable until Stage 5 adds a root-assigned
+   Orders Workflow service principal with a role limited to them; nothing in this gear's calls
+   changes. The seller no longer reads the order through Lifecycle, its audit included; this gear's
+   own seller-scoped audit read (`design/09` §3.3, *Audit read*) cited Lifecycle's seller audit grant
+   as its precedent, is unchanged here, and its alignment is open. The order's resource tenant is
+   fixed from creation, which this gear already assumes of an admitted order.
+
+**Rationale**: the refusal names a fact this gear cannot change and no wake-up reports: no arm of
+the eligibility wait observes Contracts, so a `withheld` answer with a wake-up arm would re-call
+Lifecycle every eligible round and be refused each time, a silent retry with no operator in the
+loop. Lifecycle settles the refusal under the key, so the transient path would only replay it. A
+permanent failure puts the order in front of an operator through the existing order-scope task,
+with no new definition route. A Contracts outage is still a retryable wait, so the two answers
+stay distinct, as Lifecycle keeps them.
+
+**Consequences**: one new reason (`contract-not-active`) and one new step
+(`inst-bf-if-contract-inactive`); the reason catalogue is recounted. No new column, operation,
+definition route or ask. Seller audit read alignment is open.
+
+**Propagated**: `DESIGN.md` (*Source of truth* note; §3.4 Orders Lifecycle row); `design/04`
+§3.3 (operation table `reasons`), §3.6 (`inst-bf-if-withheld`, `inst-bf-if-contract-inactive`,
+the *Begin Fulfillment* description); `design/01` §4.9 (catalogue row and count); `design/09` §3.3
+(*Audit read* authorization); Lifecycle Stage 4 citations in `DESIGN.md`, `PRD.md`,
+`UPSTREAM_REQS.md`, `design/01`, `design/02`, `design/03`, `design/04`, `design/06`; this register's
+*Source of truth* note; D-325 and D-334 notes.
 
 ## Open Questions
 
@@ -11942,6 +12024,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-333 | 09, 10 (per-order `protocol_arms` from the bound version's document; declared-arm set names each arm's operation; Lifecycle gates per order with a pre-arm path; drain withdrawn, fourth review 4452627489, 2026-11-05) | `design/09` §4.5; `design/10` §4.2, §4.3; `UPSTREAM_REQS.md` §2.4, §3; `ADR/0012`; D-275, D-312, D-319, D-320, D-323 |
 | D-334 | cross-cutting (Lifecycle Stage 4 dependencies: `header` readiness gate, `bss/orders-stage4` citation rule, 2026-11-05) | `design/01` §3.8; `design/04` §3.6; `PRD.md` §6.3; `DESIGN.md` §3.4; `UPSTREAM_REQS.md` §2.4, §3; `design/02` §3.3; `design/06` §3.6; D-268, D-325 |
 | D-335 | cross-cutting (register and dependency hygiene after #5536: Stage 3 numbering, contract tuple and keys, gear `bss-orders`, 2026-11-05) | `UPSTREAM_REQS.md` §1.2, §2.1; `DESIGN.md` §3.2; `design/01`, `design/02`, `design/05`, `design/07`, `design/08`, `design/09` dependency tables; D-205, D-209, D-237, D-241, D-242; Q-08 |
+| D-377 | 04, cross-cutting (Orders Lifecycle from vhp-core: Lifecycle D-267 `contract-not-active` a permanent failure of begin-fulfillment; Lifecycle D-269 single-owner authorization; D-325 item 10 corrected, 2026-11-10) | `DESIGN.md`; `design/01` §4.9; `design/04` §3.3, §3.6; `design/09` §3.3; `PRD.md`; `UPSTREAM_REQS.md`; `design/02`, `design/03`, `design/06`; D-325, D-334 |
 | D-240 | 04 Fulfillment plan (S4-11 pending-payment continuation, 2026-10-29) | `design/04` §2.1 |
 | D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
@@ -12253,6 +12336,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-333 | L `protocol_arms` per order: the declared arms the bound version's document carries (arm = the operation it calls; registry `get`), fixed per binding, no drain or cross-tenant scan; Lifecycle enables per order, pre-arm path otherwise; publish-job refusal kept (supersedes D-312 item 2; amends D-275, D-319, D-320, D-323) | `design/09`, `design/10`; `UPSTREAM_REQS.md`; `ADR/0012` |
 | D-334 | L Stage 4 dependencies: `OrderVersionView.header` is a readiness item (startup probe or SDK capability, as `actors`); Stage 4 decisions cited as Lifecycle `bss/orders-stage4` D-NNN, D-325's prefix rule withdrawn; "this gear's D-194" (amends D-325, D-268) | `design/01`; `design/04`; `PRD.md`; `DESIGN.md`; `UPSTREAM_REQS.md`; `design/02`, `design/06` |
 | D-335 | L After #5536: Stage 3 citations carry new numbers whatever their date (Lifecycle D-247 item 4); Stage 3 "on `main`, merged with PR #5536"; resource tenant a tuple dimension beside `overlap_scope_key`, which is distinct from `catalog_subscription_product_key`; resource-tenant ask answered; contract linked; gear `bss-orders`; `report_spawn_signal` signature (amends D-242, D-205, D-209, D-237, D-241; Q-08) | `UPSTREAM_REQS.md`; `DESIGN.md`; `design/01`, `design/02`, `design/05`, `design/07`, `design/08`, `design/09` |
+| D-377 | L Orders Lifecycle from vhp-core (Stage 4 citations link the vhp-core register; Source of truth notes); Lifecycle D-267 `contract-not-active` on begin-fulfillment settles `permanent-failure` with the new reason `contract-not-active` (invocation-dead task, not `withheld`); record-acceptance leaves consent unrecorded; Lifecycle D-269 seams unchanged, unreachable until Stage 5, seller reads nothing; seller audit read alignment open (amends D-325, D-334) | `DESIGN.md`; `design/01`, `design/04`, `design/09`; `PRD.md`; `UPSTREAM_REQS.md`; `design/02`, `design/03`, `design/06` |
 
-Highest decision number used: **D-335**; highest question number: **Q-15**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-377** (D-336…D-376 are the vhp-core copy's, not used here); highest question number: **Q-15**. Numbering is one continuous sequence across the whole
 register; there are no parts.

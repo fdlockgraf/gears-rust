@@ -2416,7 +2416,7 @@ and `../UPSTREAM_REQS.md` §2.9 point here.
   10. **The version header** (D-334). Lifecycle's `OrderVersionView` exposes `header`, shown by a
       startup probe of `get_version` or a declared SDK capability, as for `actors` (D-281): plan
       construction reads every order's market and payer from it (`04 §3.6` `inst-pc-read-order`),
-      and `main`'s `OrderVersionView` has none until Lifecycle `bss/orders-stage4` D-262 merges.
+      and `main`'s `OrderVersionView` has none until [Lifecycle D-262](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md), developed in vhp-core, merges.
   11. **Overlap keys on the version read** (decision D-327). Lifecycle's `OrderVersionView`
       carries each line's `overlap_item_keys` and legacy scalar `overlap_scope_key` at the version
       (`…-upreq-lifecycle-version-overlap-keys`), shown by a startup probe of `get_version` or a
@@ -3134,6 +3134,7 @@ example — and they are stated once so no slice chooses them again.
 | `self-assignment-barred` | `03-approval-execution` (D-266) | `SELF_ASSIGNMENT_BARRED` | PermissionDenied | 403 |
 | `overlap-read-unevaluable` | `04-fulfillment-plan` | `OVERLAP_READ_UNEVALUABLE` | ServiceUnavailable | 503 |
 | `identity-party-unavailable` | `04-fulfillment-plan` | `IDENTITY_PARTY_UNAVAILABLE` | ServiceUnavailable | 503 |
+| `contract-not-active` | `04-fulfillment-plan` (D-377) | `CONTRACT_NOT_ACTIVE` | FailedPrecondition | 400 |
 | `line-count-exceeded` | `04-fulfillment-plan` | `LINE_COUNT_EXCEEDED` | InvalidArgument | 400 |
 | `wave1-create-failed` | `05-provisioning-intents` | `WAVE1_CREATE_FAILED` | FailedPrecondition | 400 |
 | `wave2-activation-failed` | `05-provisioning-intents` | `WAVE2_ACTIVATION_FAILED` | FailedPrecondition | 400 |
@@ -3159,9 +3160,10 @@ example — and they are stated once so no slice chooses them again.
 | `not-found` | `09-read-and-authz` | `NOT_FOUND` | NotFound | 404 |
 | `authority-withdrawn` | `09-read-and-authz` | `AUTHORITY_WITHDRAWN` | FailedPrecondition | 400 |
 
-The table registers **52** reasons: the engine's ten and 42 contributed by slices 02–09 — three by
-02, seven by 03, nine by 04, seven by 05, five by 06, five by 07, one by 08 and five by 09 (recounted
-by decision D-268 after the eleven later additions: `start-admission-stalled` D-255; `assignee-unresolved`,
+The table registers **53** reasons: the engine's ten and 43 contributed by slices 02–09 — three by
+02, seven by 03, ten by 04, seven by 05, five by 06, five by 07, one by 08 and five by 09 (recounted
+by decision D-377 after `contract-not-active`, the Lifecycle refusal `begin-fulfillment` settles as a
+permanent failure; by decision D-268 after the eleven later additions: `start-admission-stalled` D-255; `assignee-unresolved`,
 `not-assignee` and `stale-generation` D-229; `self-assignment-barred` D-266; `financial-readiness-withdrawn`
 D-226; `payment-wait-expired` D-228; `draft-activated-externally` D-233; `grant-replacement-refused` and
 `receiver-control-abandoned` D-243; `outcome-already-reported` D-251. Earlier: `invocation-dead`,

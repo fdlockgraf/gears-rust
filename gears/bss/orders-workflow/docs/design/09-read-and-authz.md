@@ -852,7 +852,7 @@ returns the order's process audit trail. The shape is Lifecycle's audit read
   from `progress × read`, as Lifecycle asks `audit × read` "not merely `order × read`" (Lifecycle
   `08 §3.6` common read wrapper step 2). Only the Seller Operator is granted it, in seller scope
   (`S`, §4.1), following Lifecycle's matrix, whose audit read grants the Seller Operator in seller
-  scope and no operational or service principal (Lifecycle `08 §4.3`, `08-read-and-authz.md:1042`). The Fulfillment Operator,
+  scope and no operational or service principal (Lifecycle `08 §4.3`, `08-read-and-authz.md:1042`). Lifecycle Stage 4 withdraws that seller grant: the buyer owns the order and the seller reads nothing of it through the seller relationship, its audit included ([Lifecycle D-269](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md)); this gear's audit read is unchanged, and aligning it is open (D-377). The Fulfillment Operator,
   whose needs are the task queue (`PRD.md:142`), reads each task's `failure_reason` and
   `failure_cause` there (`07 §4.5`). The targeted-denial rule of §2.2 applies: an order outside
   the caller's scope is `not-found` (404).

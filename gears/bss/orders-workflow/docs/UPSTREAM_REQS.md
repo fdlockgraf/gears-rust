@@ -916,7 +916,7 @@ projection loses it nothing.
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders`).
 - **Residual ask**: confirm the projection schema of each of the eleven events against the members
   the start trigger and every `listen` keep (`design/10-process-definition.md` §2.2), and confirm that
-  `OrderCompleted`'s per-line line-to-subscription mapping and `OrderSubmitted`'s `acceptance` member (`acceptedVersion`, `acceptedAt` on the wire; present only on a self-service submit, Lifecycle `bss/orders-stage4` D-252, *Self-service consent on submit is decided from the frozen attempt*; decision D-238)
+  `OrderCompleted`'s per-line line-to-subscription mapping and `OrderSubmitted`'s `acceptance` member (`acceptedVersion`, `acceptedAt` on the wire; present only on a self-service submit, [Lifecycle D-252](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md), *Self-service consent on submit is decided from the frozen attempt*; decision D-238)
   stay out of the projection or are accepted in engine history by the data owner. Until confirmed,
   the first route of ADR-0013 *Trigger inputs and consumed events*
   (`…-upreq-serverless-runtime-consumed-event-member-storage`, §2.9) still closes the residual on its
@@ -1105,7 +1105,7 @@ the workflow retention class, atomically with releasing the control pointer, so 
   `in_fulfillment` only through Lifecycle's two-person forced failure (Lifecycle D-182). This is
   the documented residual of `design/06` §3.2 until the ask lands.
 - **Agreement status**: agreed in design, not yet implemented; raised 2026-11-02 (macrocheese review finding #4).
-  Lifecycle `bss/orders-stage4` D-259 (`875084668`, unmerged; designed, not implemented) specifies it as the internal
+  [Lifecycle D-259](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) (Stage 4, now developed in vhp-core; designed, not implemented) specifies it as the internal
   `supersede_fulfillment_control` write (Lifecycle `DESIGN.md#contract-06-supersede-fulfillment-control`).
 - **Use (D-269)**: `report-outcome` calls it before its Lifecycle transition call for every
   superseded control not yet settled there (a control the fence superseded, or one the intake
@@ -1129,7 +1129,7 @@ fact rather than inferring it.
   (`design/02` §3.6 `inst-at-start`). The inference fails only if that invariant is broken by an
   out-of-band transition, which admission would then start on.
 - **Agreement status**: agreed in design, not yet implemented; raised 2026-11-02 (macrocheese review finding #13).
-  Lifecycle `bss/orders-stage4` D-261 (`875084668`, unmerged; designed, not implemented): `OrderView.order.pre_hold_state`,
+  [Lifecycle D-261](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) (Stage 4, now developed in vhp-core; designed, not implemented): `OrderView.order.pre_hold_state`,
   present only while the order is `on_hold`.
 - **Source**: Lifecycle `features/07-hold-and-expiry.md` (hold and resume restore exactly
   `pre_hold_state`); `design/02` §3.1, §3.6 `inst-at-start`.
@@ -1177,8 +1177,8 @@ deciding the version's approval gate (`design/03` §3.2, D-56 as amended by D-26
 A version's stored `actor` is who appended it, which for an amended version is the amender, not
 the submitter.
 
-**Answered by Lifecycle `bss/orders-stage4` D-260 (implemented 2026-11-02 at `875084668`; not yet
-on `main`; decision D-325).** `OrderVersionView.actors { creator, submitter?, amender? }`, each
+**Answered by [Lifecycle D-260](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) (implemented 2026-11-02; Stage 4, now developed in
+vhp-core, not yet on its `main`; decisions D-325, D-377).** `OrderVersionView.actors { creator, submitter?, amender? }`, each
 `{ actor, actor_tenant_id }`: `creator` is version 1's pair, `submitter` the `submit` version's
 (absent on version 1), `amender` the requested version's own pair when its reason is
 `amendment`; a missing role row is an integration failure. The consequence below holds only against
@@ -1191,8 +1191,8 @@ a Lifecycle build without it.
   `library` binding until `OrderVersionView` exposes `actors`, shown by a startup probe of
   `get_version` or a declared SDK capability (`design/03` §3.2, `design/01` §3.8, D-281), so the
   park is a backstop, not the expected path.
-- **Agreement status**: **ANSWERED** by Lifecycle `bss/orders-stage4` D-260 (implemented 2026-11-02 at
-  `875084668`, unmerged); raised 2026-11-02 (macrocheese review finding #33). Closes when Stage 4
+- **Agreement status**: **ANSWERED** by [Lifecycle D-260](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md) (implemented 2026-11-02;
+  Stage 4, now developed in vhp-core, unmerged); raised 2026-11-02 (macrocheese review finding #33). Closes when Stage 4
   merges and a build carrying it is deployed (the D-281 probe).
 - **Source**: Lifecycle `DESIGN.md` *Workflow SDK contract* (`OrderVersionView`), D-130, D-146;
   `design/03` §3.2, §3.7 (`owf_approval_request.barred_subjects`).
@@ -1210,7 +1210,7 @@ different answers. These are the keys Lifecycle's own re-check reads
 `inst-rc-reread-overlap`); new collection rows keep the scalar NULL
 ([`SUBSCRIPTIONS_CONTRACT.md`](../../orders/docs/SUBSCRIPTIONS_CONTRACT.md#proposed-orders-item-key-collection)),
 so a reader of the scalar alone finds no key on a new line and skips the occupancy check. Neither
-`main` nor the Stage 4 `OrderVersionView` (`bss/orders-stage4`, its lines are `DraftLine` with
+`main` nor the Stage 4 `OrderVersionView` (Lifecycle Stage 4 in vhp-core, its lines are `DraftLine` with
 `committed: { commercial_attempt_id, order_pin }`) carries either form today; this gear reads them
 through the version read, never the current-order read (D-193).
 
@@ -2108,7 +2108,7 @@ then have to accept.
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage`, `…-upreq-lifecycle-order-read-pre-hold-state` (open since 2026-11-02, D-255), `…-upreq-lifecycle-protocol-enable-on-arm-capability` (open since 2026-11-03, D-320) |
 | `p1` (critical), **open since 2026-10-21** — the PR #4787 proposal (D-220, D-223–D-225, D-232, D-234); each has a stated fallback the design keeps until the owner answers | `…-upreq-closed-attempt-fence` (`SUB-O17`), `…-upreq-successor-draft-preserves-acquisition` (`SUB-O18`), `…-upreq-aborted-event-on-every-unwind` (`p2`), `…-upreq-financial-readiness-through-billing`, `…-upreq-protected-purchase-before-capture`, `…-upreq-cancellation-reaches-payments`, `…-upreq-approval-named-user-criterion`, `…-upreq-prefulfillment-cancel-arbitration`, `…-upreq-assessment-expiry-vs-protected-coverage`, `…-upreq-approval-valuation-basis` |
 | `p1` (critical), **open since 2026-10-30** — the Lifecycle D-198 / D-201 receiver protocol (D-243); no fallback reaches an effective post-spawn hold without them; all but the `p2` re-pause ask are items of the `design/01-foundation.md` §3.8 release gate (D-261) | `…-upreq-receiver-attempt-ledger`, `…-upreq-lifecycle-fulfillment-control-port`, `…-upreq-lifecycle-current-grant-read`, `…-upreq-lifecycle-repause-after-abandon` (`p2`, D-244), `…-upreq-lifecycle-control-supersede-by-revoke` (open since 2026-11-02, D-248) |
-| `p1` (critical), **answered 2026-11-02 by Lifecycle `bss/orders-stage4` D-260, not yet on `main`** — gates binding the library approval adapter (Q-14), not the `design/01-foundation.md` §3.8 release gate; until a build carrying it is deployed no approval gate opens (D-267, D-325) | `…-upreq-lifecycle-version-actors` |
+| `p1` (critical), **answered 2026-11-02 by [Lifecycle D-260](https://bitbucket.org/virtuozzocore/vhp-core/src/main/crates/gears/bss/orders/docs/DECISIONS.md), not yet on `main`** — gates binding the library approval adapter (Q-14), not the `design/01-foundation.md` §3.8 release gate; until a build carrying it is deployed no approval gate opens (D-267, D-325) | `…-upreq-lifecycle-version-actors` |
 | `p1` (critical), **open since 2026-11-05** — item 11 of the `design/01-foundation.md` §3.8 release gate; without it no re-check can read a line's keys (D-327) | `…-upreq-lifecycle-version-overlap-keys` |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
