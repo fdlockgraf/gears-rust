@@ -32,21 +32,41 @@ let parsed: HashMap<String, String> = serde_saphyr::from_str(&yaml_string)?;
 
 ### Synchronous locks
 
-**Always use `parking_lot::Mutex` and `parking_lot::RwLock` for synchronous locks, not `std::sync::Mutex` / `std::sync::RwLock`.**
+**Use `std::sync::Mutex` and `std::sync::RwLock` by default for synchronous locks.**
 
-- **Reason**: `parking_lot` locks are faster (no syscall on uncontended path), have smaller lock metadata than `std`, never poison on panic, and return the guard directly from `lock()` — no `Result` unwrapping needed.
-- **Workspace dep**: `parking_lot` is already declared in the workspace `Cargo.toml`.
+- **Reason**: since Rust 1.62 the `std` locks are futex-based on Linux (and use SRW locks on Windows). They take no syscall on the uncontended path, need no heap allocation, and perform on par with `parking_lot` for typical workloads. `Mutex::new` / `RwLock::new` are `const` (Rust 1.63+), so they work in `static`s without `LazyLock`. Using `std` also keeps one less dependency in the crate.
+- **Poisoning**: `std` locks return `LockResult`, and the workspace denies `clippy::unwrap_used` / `clippy::expect_used`, so handle the poison case explicitly. Choose how based on the data being protected:
+  - **The data stays valid even if a holder panicked midway** (counters, caches, maps where every update is a single call): recover the guard with `PoisonError::into_inner`.
+  - **A panic midway could leave the data inconsistent** (multi-step updates that must happen together): turn the poison into an error and propagate it. Don't silently continue.
 
 ```rust
-use parking_lot::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 let data = Mutex::new(Vec::new());
-// Blocking lock — returns MutexGuard directly, no unwrap needed
-data.lock().push(42);
+
+// Data stays valid after a panic: recover the guard
+data.lock().unwrap_or_else(PoisonError::into_inner).push(42);
+
+// Data could be inconsistent after a panic: surface it as an error
+let mut guard = data.lock().map_err(|_| MyError::StatePoisoned)?;
+guard.push(43);
 ```
+
+### When to use `parking_lot` instead
+
+`parking_lot` (declared in the workspace `Cargo.toml`) is allowed when you need something `std` does not provide on stable:
+
+- upgradable read locks (`RwLock::upgradable_read`)
+- timed acquisition (`try_lock_for` / `try_lock_until`)
+- owned guards held through an `Arc` (`arc_lock` feature) or mapped guards (`MutexGuard::map`)
+- `ReentrantMutex`
+- fair unlocking or the `deadlock_detection` feature
+- `RwLock` behaviour that is the same on every platform (`std`'s `RwLock` fairness and writer preference depend on the OS)
+
+Write down which of these you need in a comment next to the dependency in the crate's `Cargo.toml`. Existing `parking_lot` usage does not need to be migrated. Within a single module, use one lock family consistently.
 
 ### When to use `tokio::sync` instead
 
-Use `tokio::sync::Mutex` or `tokio::sync::RwLock` only when you need to **hold the lock across an `.await` point**. If the critical section is purely synchronous (no `.await` inside), prefer `parking_lot` even in async code — it avoids the overhead of the async mutex and won't block the executor as long as the critical section is short.
+Use `tokio::sync::Mutex` or `tokio::sync::RwLock` only when you need to **hold the lock across an `.await` point**. If the critical section is purely synchronous (no `.await` inside), prefer a synchronous lock (`std::sync`, or `parking_lot` per the rules above) even in async code. It avoids the overhead of the async mutex and won't block the executor as long as the critical section is short. Never hold a `std::sync::MutexGuard` across an `.await`: the guard is `!Send`, so the future won't be `Send`.
 
 If a synchronous lock guard must be held while performing blocking I/O or expensive computation, wrap the call in `tokio::task::spawn_blocking()` to avoid stalling the async executor.
