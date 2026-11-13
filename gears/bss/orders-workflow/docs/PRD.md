@@ -137,7 +137,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 
 **ID**: `cpt-cf-bss-orders-workflow-actor-owf-approver`
 
-**Role**: An individual (partner admin, seller operator, or named approver) who receives an approval request for an order and provides an approve or reject decision. May be part of a multi-party gate.
+**Role**: An individual holding the approver role at one level of the order relationships (the customer, the customer's channel partner, the payer, or Virtuozzo finance) who receives an approval request for an order and provides an approve or reject decision. May be part of a multi-party gate.
 **Needs**: Receive approval inbox notifications; view order context for a pending approval request; submit an approve/reject decision with a reason; view escalation status.
 
 #### Fulfillment Operator
@@ -167,7 +167,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 
 **ID**: `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
 
-**Role**: The owner of approval **policy** — routing, multi-party gate evaluation, and approval-requirement/threshold evaluation over the submitted request context. Since D-197 (Lifecycle D-166) it **MUST** be reached only through this gear's **approval policy adapter**, a port whose contract is §9.2: Orders Workflow submits `OrderApprovalRequest` instances (carrying order context, including the stored valuation for the basis the policy owner chooses, and the named-user condition) and receives `OrderApprovalDecision` responses, and queries the approval-requirement verdict keyed on order + version. The routing and threshold configuration (who approves, under what conditions) lives behind the adapter — not in the orchestration. Escalation timers are scheduled, persisted, and fired by Orders Workflow (§6.2); the adapter provides the escalation path and receives/routes the escalation command. The phase-1 implementation is a stand-in behind the §9.2 contract that returns `approval not required` (audited), except for a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265, AC 0c); the intended implementation embeds the shared `cf-gears-bss-approval` library as Pricing and Products do (`DECISIONS.md` Q-14). No separate approval service is expected.
+**Role**: The owner of approval **policy** — routing, multi-party gate evaluation, and approval-requirement/threshold evaluation over the submitted request context. Since D-197 (Lifecycle D-166) it **MUST** be reached only through this gear's **approval policy adapter**, a port whose contract is §9.2: Orders Workflow submits `OrderApprovalRequest` instances (carrying order context, including the stored valuation for the basis the policy owner chooses, and the named-user condition) and receives `OrderApprovalDecision` responses, and queries the approval-requirement verdict keyed on order + version. The routing and threshold configuration (who approves, under what conditions) lives behind the adapter — not in the orchestration. Escalation timers are scheduled, persisted, and fired by Orders Workflow (§6.2); the adapter provides the escalation path and receives/routes the escalation command. The phase-1 implementation is a stand-in behind the §9.2 contract that returns `approval not required` (audited), except for a seller with `approval_required = true`, whose orders it parks `approval-adapter-not-bound` (D-265, AC 0c); the intended implementation embeds the shared `cf-gears-bss-approval` library as Pricing and Products do (`DECISIONS.md` Q-14). No separate approval service is expected this phase; the role **MAY** later move to the Approval Service (gears PR #5570) behind the same §9.2 contract, for the policies listed as out of scope in §5.2.
 **Integration direction**: In-process port called from inside step operations (verdict query, request submission, read by key, decision read); inbound decision event on this gear's own topic.
 
 #### Subscriptions
@@ -233,6 +233,7 @@ No module-specific deviations — project defaults apply.
 - **Operator migration of a running process onto a new definition version** → out of scope; the instance runs the definition it started with.
 - **Approver delegation of an open gate** → deferred (§15); interim answer is escalation. **Reassignment** of an open gate's named approver is in scope: an RBAC-controlled assign route that bumps the gate's generation and grants the assigning subject no approval authority (AC 4b; D-229, D-266, D-282).
 - **Approval routing configuration authoring** → the approval policy adapter's library implementation (Open Questions §15; `DECISIONS.md` Q-14).
+- **Approval policies beyond amount thresholds** (a policy for a specific user, thresholds on quantity or units, mandatory approval of orders that contain a scarce resource) → expected from the Approval Service; not this phase (§6.2 Approval Policy Configuration).
 - **Change-category orders** (`category = change`) — out of scope for this phase. Lifecycle rejects that category until its path ships; this gear defines process only for `new_sale`.
 - **System-driven subscription transitions** (renewal, trial conversion, dunning-driven suspension) → remain owned by Subscriptions; they produce no order. Commercially initiated changes are inside the Orders boundary, phased per the Lifecycle PRD (§1.1, §15 there).
 
@@ -307,6 +308,39 @@ On consuming a terminal order state event from Orders Lifecycle (`OrderCancelled
 On `OrderSubmitted`, Orders Workflow **MUST** obtain the approval-**requirement** verdict from the approval policy owner (this gear's approval policy adapter, evaluating the order context — including the stored valuation for the basis the policy owner chooses: the full contractual commitment, the first installment, an authorized budget, a forecast or the annualised net pre-tax TCV, forwarded with its currency, term and provenance, or explicitly `unavailable`, which **MUST NOT** be read as zero; the basis is the policy owner's choice and never a seller-policy setting) and reflect it into Orders Lifecycle (`submitted → pending_approval` or `submitted → approved`) — the verdict is determined by the policy owner and computed by neither Workflow nor Lifecycle. Until the library adapter lands, Workflow **MUST** invoke a **stand-in behind the same §9.2 expectations contract** (not a second policy author): the stand-in **MUST** return `approval not required` and the reflection **MUST** be audited as stand-in, except for a seller with `approval_required = true`: for that seller's orders the stand-in **MUST NOT** return `approval not required`, and the process **MUST** park `approval-adapter-not-bound` with the order remaining in `submitted`, fail-closed, as AC 0c states (D-265, D-307). Once the stand-in is replaced, unavailability of the policy owner behind the adapter **MUST** park the process with the order remaining in `submitted` (fail-closed) — Workflow **MUST NOT** fail-open to `approved`. The park **MUST NOT** suspend the Lifecycle `submitted` TTL: expiry is the bound (Lifecycle §6.3); Workflow **MUST** escalate to the fulfillment-operator / operator queue **before** that TTL elapses. The verdict query **MUST** be keyed on `orderId` + `orderVersion`; the result **MUST** be cached against that version; a later query that disagrees with an already-reflected verdict **MUST** be treated as stale and **MUST NOT** be re-reflected. For an order entering `pending_approval`, Orders Workflow **MUST** create an `OrderApprovalRequest` and submit it to the approval policy adapter. The Workflow **MUST** support multi-party gate configuration: an order **MAY** require sequential or parallel approvals from multiple parties as defined by the approval routing configuration in the approval policy adapter. Each party constitutes one gate; all gates **MUST** be satisfied before the order is considered approved. For the predefined order-approval stage the gate **MUST** carry a **named-user condition** — the one approver the routing configuration names in the seller's tenant scope, with the gate's generation — so that another user's decision, however broadly permitted, does not satisfy it, and a decision made under an earlier generation is refused after reassignment. Reassignment **MUST** be a separately authorized action that grants no approval authority. A gate whose named approver is missing or ineligible **MUST** park the order as `assignee-unresolved`, never auto-approve. **Assumption pending owner agreement** (§14): the shared approval library enforces the condition on the owner-side decision path, and Orders approvals are surfaced through the common BSS Approvals Inbox with no second authoritative queue; Rating computes the figure for each basis and Lifecycle stores it. On consuming `OrderAmended` (a new order version was created), Orders Workflow **MUST** cancel any open approval gates for the prior version and, if the amended order requires approval, open new `OrderApprovalRequest`(s) keyed to the new `orderVersion` — re-approval is event-driven, per the Lifecycle amendment contract. Before that "if" is answered, Orders Workflow **MUST** obtain a fresh approval-requirement verdict for the new `orderVersion` and reflect it from `submitted`, exactly as on `OrderSubmitted`; it **MUST NOT** carry the prior version's verdict forward (D-238).
 
 **Rationale**: Commercial acquisitions often require financial authorization, legal review, or partner-channel sign-off; multi-party gating is a business requirement for these flows.
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-approver`, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
+
+#### Approval Policy Configuration
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-approval-policy-config`
+
+The approval policy applied to orders **MUST** be configurable by the parties that approve, and the product **MUST NOT** ship a fixed approval rule or a fixed threshold value. The policy **MUST** support one approval step per level of the order relationships, executed as the multi-party gate of `cpt-cf-bss-orders-workflow-fr-owf-approval-request`, in this order:
+
+1. **Customer**: an internal approval inside the customer tenant (for example, one department places the order and the customer's finance approves it).
+2. **Channel partner of the customer**.
+3. **Payer**, where the payer is neither the customer nor its channel partner. Where the payer is the customer or the channel partner, this step **MUST** merge with that level's step and **MUST NOT** run twice.
+4. **Virtuozzo finance**.
+
+Each level **MUST** be able to set its own amount threshold for its own step, per currency, compared with the stored valuation figure of the order (§6.2 Approval Request and Multi-Party Gate) in the order's own currency: an order below that level's threshold skips that level's step. Thresholds **MUST** be independent of each other: an order may skip the partner step and still require the Virtuozzo step. Each level manages its own threshold; no level sets another level's threshold. Where the thresholds are stored is a design decision. A rejection at any step **MUST** stop the order (`pending_approval → rejected`); later steps **MUST NOT** be opened.
+
+The same person **MAY** both place or submit an order and approve it at a step where that person holds the approver role, including the person's own order. Separation of duties **MUST** be achieved through the roles each tenant grants to its own users, not through a product rule that bars the submitter.
+
+A threshold value **MAY** appear in documentation, prototypes and demo data only as an example configuration (for instance EUR 10,000), never as a default of the product. A verdict of `approval not required` and every skipped step **MUST** carry the reasons that produced them (for example: valuation below the partner's threshold for EUR; payer is the customer).
+
+This phase, the policy **MUST** support amount thresholds as above and nothing else. More complex policies are expected from the Approval Service and are out of scope for this phase (§5.2), for example: a policy for a specific user (always approve, or always auto-approve, regardless of amount); thresholds on quantity or units; mandatory approval of every order that contains a scarce resource.
+
+**Rationale**: Sellers, partners and customers differ in who must sign off and from what order value; a fixed rule or number would be wrong for some of them and would need a release to change. Each level owns its own risk, so each level sets its own limit. The step order follows the order relationships, from the party closest to the purchase to the platform.
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-approver`, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
+
+#### Approval Default and Enablement
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-fr-owf-approval-default`
+
+Where a level has not configured a threshold for the order's currency, that level's step **MUST** apply to every order, at every level including the customer. This default **MUST** take effect together with the real approval policy owner and not before: while the stand-in is bound, the stand-in behaviour of §6.2 applies unchanged (a seller with `approval_required = false` gets `approval not required`, AC 0a), so orders are not held for approval. Once the real policy owner is bound, no setting left empty **MAY** let an order pass without approval.
+
+**Rationale**: If a party gets too many approvals, it notices at once and adjusts its configuration. If orders pass automatically, the gap shows only after a serious problem. Switching the default on before a real approval owner exists would hold every order.
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-approver`, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
 
@@ -569,7 +603,7 @@ Orders Workflow **MUST NOT** publish order-**state** events — the state-event 
 
 Every Orders Workflow operation **MUST** be authorized by the acting actor's role and scope:
 
-- Approver **MAY** submit an approve or reject decision for approval requests assigned to them; **MUST NOT** act on approval requests for orders outside their assigned scope.
+- Approver **MAY** submit an approve or reject decision for approval requests assigned to them, including for an order they created or submitted (§6.2 Approval Policy Configuration); **MUST NOT** act on approval requests for orders outside their assigned scope.
 - Fulfillment Operator **MAY** view the manual task queue within their seller scope; **MAY** submit task resolutions (retry, override, escalate); **MUST NOT** modify commercial order content.
 - Seller Operator **MAY** cancel a running workflow with compensation and **MAY** resolve or cancel manual tasks for orders within their seller scope, with every action recorded in the audit log; **MUST NOT** cancel or act on workflows for orders outside their seller scope; **MUST NOT** modify commercial order content.
 - Orders Lifecycle (system actor) **MAY** trigger Workflow on state events it emits; **MUST NOT** be impersonated by other actors.
@@ -768,7 +802,7 @@ Completed process records (this gear's saga log, process audit, and manual-task 
 
 **Direction**: Required by Orders Workflow (expectations toward the approval policy adapter).
 
-**Description**: Orders Workflow REQUIRES the approval policy adapter to satisfy the following expectations contract: (a) accept an `OrderApprovalRequest` carrying order context (including the stored valuation for the policy owner's chosen basis, with currency, term and provenance, or `unavailable`), the named-user condition with the gate's generation, gate identifier, idempotency key, and process `correlationId`; (b) evaluate the approval requirement and thresholds per its policy configuration and support multi-party gates; (c) accept and route the escalation command issued by Orders Workflow on timer expiry (escalation timers are owned by Workflow, §6.2); (d) return an `OrderApprovalDecision` (approved/rejected) with a reason, echoing the `correlationId`; (e) be idempotent by request key for the request's acceptance — a re-submit under the same key is absorbed and never changes the condition, which only (k) does; (f) answer the approval-**requirement** verdict query keyed on `orderId` + `orderVersion`, cacheable per version; (g) name, with the routing configuration, the valuation basis and the named approver per gate; (h) refuse a decision from a subject outside the condition or under a stale generation; (i) refuse a decision from the creator, the submitter or the amender of the gated version (separation of duties, Lifecycle D-130; this gear refuses it locally at the decision endpoint, D-56 as amended by D-267); (j) withdraw a held request by its request key when this gear cancels the gate (D-266); (k) re-condition a held request on a new named-user condition at a new gate generation when this gear reassigns the gate, idempotent per (request key, generation), the generation mapped onto the implementation's own and a withdrawn predecessor never answered by the key lookup (D-282, D-286). Clauses (g) and (h) on the library implementation are an assumption pending owner agreement (§14). Until the service exists, a stand-in behind this same contract **MUST** return `approval not required` (audited), except for a seller that declares approval required (`approval_required`), whose orders it **MUST** leave unobtainable so they park, never exempted (D-265). The approval policy adapter has no canonical spec today (see §15 Open Questions and §16 Risks); this expectations contract is the normative interface until that spec exists.
+**Description**: Orders Workflow REQUIRES the approval policy adapter to satisfy the following expectations contract: (a) accept an `OrderApprovalRequest` carrying order context (including the stored valuation for the policy owner's chosen basis, with currency, term and provenance, or `unavailable`), the named-user condition with the gate's generation, gate identifier, idempotency key, and process `correlationId`; (b) evaluate the approval requirement and the per-level thresholds per the policy configuration (§6.2, `cpt-cf-bss-orders-workflow-fr-owf-approval-policy-config`, `cpt-cf-bss-orders-workflow-fr-owf-approval-default`) and support multi-party gates; (c) accept and route the escalation command issued by Orders Workflow on timer expiry (escalation timers are owned by Workflow, §6.2); (d) return an `OrderApprovalDecision` (approved/rejected) with a reason, echoing the `correlationId`; (e) be idempotent by request key for the request's acceptance — a re-submit under the same key is absorbed and never changes the condition, which only (k) does; (f) answer the approval-**requirement** verdict query keyed on `orderId` + `orderVersion`, cacheable per version; (g) name, with the routing configuration, the valuation basis and the named approver per gate; (h) refuse a decision from a subject outside the condition or under a stale generation; (i) refuse a decision from the creator, the submitter or the amender of the gated version (separation of duties, Lifecycle D-130; this gear refuses it locally at the decision endpoint, D-56 as amended by D-267); (j) withdraw a held request by its request key when this gear cancels the gate (D-266); (k) re-condition a held request on a new named-user condition at a new gate generation when this gear reassigns the gate, idempotent per (request key, generation), the generation mapped onto the implementation's own and a withdrawn predecessor never answered by the key lookup (D-282, D-286). Clauses (g) and (h) on the library implementation are an assumption pending owner agreement (§14). Until the service exists, a stand-in behind this same contract **MUST** return `approval not required` (audited), except for a seller that declares approval required (`approval_required`), whose orders it **MUST** leave unobtainable so they park, never exempted (D-265). The approval policy adapter has no canonical spec today (see §15 Open Questions and §16 Risks); this expectations contract is the normative interface until that spec exists.
 
 **Compatibility**: Governed by this gear's design (`DECISIONS.md` D-197, Q-14); the embedded library's own contract governs the library implementation.
 
@@ -894,7 +928,7 @@ Completed process records (this gear's saga log, process audit, and manual-task 
 - **And** **MUST NOT** record `approval not required` or fail-open to `approved`
 - **And** the park **MUST NOT** suspend the Lifecycle `submitted` TTL, and Workflow **MUST** escalate it to the operator queue **before** that TTL elapses, per order (D-265)
 
-Until the library adapter replaces the stand-in, criteria **0b** and **1–4a** (including **2a**) are **deferred** (the stand-in returns `approval not required` for every seller that does not declare approval required; the gate paths are unreachable, and 0b's precondition — an adapter whose policy owner can be unavailable — does not yet exist). Criteria **0**, **0a** and **0c** apply now: **0c** is the fail-closed park of **0b** reached through the stand-in, live in phase 1 (D-265, D-281).
+Until the library adapter replaces the stand-in, criteria **0b** and **1–4a** (including **2a**) are **deferred** (the stand-in returns `approval not required` for every seller that does not declare approval required; the gate paths are unreachable, and 0b's precondition — an adapter whose policy owner can be unavailable — does not yet exist). Criteria **0**, **0a**, **0c** and **1e** apply now: **0c** is the fail-closed park of **0b** reached through the stand-in, live in phase 1 (D-265, D-281).
 
 **1. Multi-party gate routing**
 - **Given** an order whose requirement verdict has been reflected to `pending_approval` with a two-party approval gate configured
@@ -902,6 +936,34 @@ Until the library adapter replaces the stand-in, criteria **0b** and **1–4a** 
 - **Then** the system **MUST** create one `OrderApprovalRequest` per gate party and submit each to the approval policy adapter
 - **And** `OrderApprovalRequested` **MUST** be published for each submission
 - **And** the order **MUST NOT** transition to `approved` until all gate parties have submitted approved decisions
+
+**1a. Independent thresholds per level**
+- **Given** a partner threshold of EUR 5,000 and a Virtuozzo threshold of EUR 1,000 configured, and an order in EUR whose customer has a channel partner, pays for itself and has its own step configured with a threshold above the order's valuation
+- **When** the order's valuation is EUR 2,000
+- **Then** the gate set **MUST** be the Virtuozzo step only
+- **And** the verdict **MUST** record that the customer and partner steps were skipped as below their thresholds
+
+**1b. Unconfigured level approves every order**
+- **Given** the real policy owner is bound and a level has no threshold configured for the order's currency
+- **When** an order of any valuation is submitted
+- **Then** that level's step **MUST** be in the gate set
+
+**1c. Rejection stops the order**
+- **Given** an order with customer, partner and Virtuozzo steps
+- **When** the partner step is rejected
+- **Then** the order **MUST** move to `rejected`
+- **And** the Virtuozzo step **MUST NOT** be opened
+
+**1d. Submitter may approve**
+- **Given** a user who submitted an order and holds the approver role for the customer step
+- **When** that user approves the customer step
+- **Then** the decision **MUST** be accepted and recorded with that user as both submitter and approver
+
+**1e. Default not active under the stand-in**
+- **Given** the stand-in is bound, the seller has `approval_required = false`, and no level has configured a threshold
+- **When** an order is submitted
+- **Then** criterion 0a applies (`approval not required`, audited as stand-in)
+- **And** the order **MUST NOT** be held for approval
 
 **2. Escalation timer fires**
 - **Given** an open approval gate with default 72-hour escalation window
@@ -1352,6 +1414,14 @@ Until the library adapter replaces the stand-in, criteria **0b** and **1–4a** 
 | Typed custom properties (§5.3): adopters will carry their own data on orders, tasks and intents. This phase offers only the opaque caller-owned reference. Should the platform adopt a typed characteristic model — schema-validated, authorized, indexed, propagated on APIs and events — and if so, which gear owns the schema registry? This is a platform-wide decision; Orders is one consumer of it, not its author. | Architecture (with Product) | 2026-12-15 | — | — |
 | Preview and explainability (§5.3): with one active definition and six seller-policy settings there is little to preview. Should a seller-facing "which definition and policy applies to this order" surface or a dry-run exist, and does the answer change if definition fragments (Q-10) ever open? Staged rollout is not part of this question: it is wanted and depends on the platform's scoped trigger binding (D-207). | Product | 2026-12-15 | — | — |
 | Line model alignment with PriceBook (§13): PriceBook is upstream since 2026-10-02. Confirm against the published pricing PRD that an add-on is an optional item of the same plan revision and that nothing links one revision to another, which is what makes lines independent (§6.3, D-196); the Orders Lifecycle PRD's two remaining *catalog price pin* headings are that gear's to rename. | Architecture (with pricing) | 2026-11-15 | — | — |
+| Approval policy and the design (§6.2 Approval Policy Configuration): the requirement lets the submitter approve their own order, gives each level its own threshold and has customer and partner steps decided in their own tenants. How are §9.2 (i), AC 4b and the decision endpoint (D-56, D-267), the §5.3 rule that thresholds stay unreachable through seller policy, and the named-user condition in the seller's tenant scope reconciled with it? | Architecture | — | — | — |
+| Threshold unit: is the threshold an amount of money only, or may a level also set it in quantity or units (this phase: money only, §6.2)? | Product | — | — | — |
+| Virtuozzo threshold basis: is the Virtuozzo threshold compared with the customer's price on the order, or with what the partner pays Virtuozzo for it? | Product | — | — | — |
+| Usage-only orders: a valuation that excludes usage (such as TCV) never reaches any threshold for an order with only usage lines. Should such orders be approved by another rule, and whose? | Product | — | — | — |
+| Re-approval scope after amendment: an amended version gets a fresh verdict (§6.2, D-238). Does every step approve again, or only steps whose threshold or content is affected? | Product | — | — | — |
+| Approver on leave: is reassignment (AC 4b) enough, or is time-bound delegation needed this phase? | Product | — | — | — |
+| Customer view while pending: what the customer sees while the order waits for approval (which step, who, since when). | Product | — | — | — |
+| Approval history: what each step writes to the order history (approver, decision, reason, threshold in force, skipped steps and why). | Product | — | — | — |
 
 ## 16. Risks
 
